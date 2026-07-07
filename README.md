@@ -185,7 +185,7 @@ Also confirm no service unintentionally binds `0.0.0.0` on the host — `network
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
 
 ## Donations
-If you found this software helpful please support by buying me a cup of coffee or something. YOU DO NOT HAVE TO DONATE TO ENJOY!!! 
+If you found this software helpful please support by buying me a cup of coffee, or a beer, or two/three. YOU DO NOT HAVE TO DONATE TO ENJOY!!! 
 
 Anything is appreciated! 
 
