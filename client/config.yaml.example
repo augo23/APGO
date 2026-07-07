@@ -4,7 +4,7 @@
 
 network_name: "home-lab-overlay"
 node_private_key: "/config/node.key"
-psk: "base64:mJ7l7nqL2I8lv6i9vh23gwKygBvdo7R3GjFs8NTvF1A="
+psk: "base64:r5D9QBcJw5ToR+Aq68aL/eSZzq6Cm7IWkW+T/ozzUaU="
 
 # Overlay subnet. Each node derives its own stable IP inside this range from
 # its public key — no per-node addressing needed. Can also be set with the

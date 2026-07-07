@@ -45,6 +45,22 @@ func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 	defer t.mu.Unlock()
 	t.m[ip] = &entry{addr: addr, seen: time.Now()}
 }
+
+// ForgetAddr removes every overlay-IP mapping that points at addr. Called
+// when a session to addr is evicted or when a send-path lookup discovers the
+// mapping is stale — routing to an endpoint with no live session silently
+// blackholes traffic even after a fresh session exists elsewhere.
+func (t *IPLearning) ForgetAddr(addr *net.UDPAddr) {
+	key := addr.String()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for ip, e := range t.m {
+		if e.addr.String() == key {
+			delete(t.m, ip)
+		}
+	}
+}
+
 func (t *IPLearning) Lookup(ip string) *net.UDPAddr {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

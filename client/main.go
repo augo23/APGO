@@ -932,9 +932,10 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 		GlobalSessions.RecordSuccess(addr)
 		return
 	}
-	// Lost a race to another goroutine: not our problem, not a real
-	// failure. Stay silent and don't increment back-off.
-	if errors.Is(err, ErrHandshakeInProgress) {
+	// Lost a race to another goroutine, or lost the simultaneous-init
+	// tiebreak (the responder path is completing the handshake): not a
+	// real failure. Stay silent and don't increment back-off.
+	if errors.Is(err, ErrHandshakeInProgress) || errors.Is(err, ErrHandshakeAborted) {
 		return
 	}
 	log.Printf("handshake to %s failed: %v", annPeer, err)
@@ -1206,6 +1207,13 @@ func main() {
 	}
 	tunIF = globalTunIF
 
+	// This node's own overlay IP, used to (a) tag keepalives and (b) filter
+	// inbound packets: only traffic addressed to us goes to the TUN.
+	myOverlayIP := ""
+	if ip, _, err := net.ParseCIDR(cfg.Tun.AddressCIDR); err == nil && ip.To4() != nil {
+		myOverlayIP = ip.To4().String()
+	}
+
 	udpConn, port, err := udpListener(cfg.UDPListenPort)
 	if err != nil {
 		log.Fatalf("udp listen: %v", err)
@@ -1239,53 +1247,74 @@ func main() {
 				continue
 			}
 
-		// Demux: run dispatchSTUN on every packet first — even if
-		// byte[0] overlaps with overlay types (0x01 is both PktMsg1
-		// and the high byte of STUN 0x0101), dispatchSTUN verifies
-		// the magic cookie at bytes 4-7 before claiming a packet.
-		// If dispatchSTUN says "not STUN", fall through to overlay
-		// type check.
-		if dispatchSTUN(buf[:n]) {
-			continue
-		}
-		if !IsOverlayPacket(buf[0]) {
-			continue
-		}
+			// Demux: run dispatchSTUN on every packet first — even if
+			// byte[0] overlaps with overlay types (0x01 is both PktMsg1
+			// and the high byte of STUN 0x0101), dispatchSTUN verifies
+			// the magic cookie at bytes 4-7 before claiming a packet.
+			// If dispatchSTUN says "not STUN", fall through to overlay
+			// type check.
+			if dispatchSTUN(buf[:n]) {
+				continue
+			}
+			if !IsOverlayPacket(buf[0]) {
+				continue
+			}
 
-		typ := buf[0]
-		body := buf[1:n]
+			typ := buf[0]
+			body := buf[1:n]
 
-		delivered := GlobalSessions.Deliver(raddr, typ, body, kp, psk)
-		if delivered {
-			continue
-		}
+			delivered := GlobalSessions.Deliver(raddr, typ, body, kp, psk)
+			if delivered {
+				continue
+			}
 
-		// Not consumed by the handshake layer → it's data destined
-		// for an established session.
-		s := GlobalSessions.GetByAddr(raddr)
-		if s == nil || !s.Established() {
-			continue
+			// Not consumed by the handshake layer → it's data destined
+			// for an established session.
+			s := GlobalSessions.GetByAddr(raddr)
+			if s == nil || !s.Established() {
+				continue
+			}
+			pt, err := recvPacket(s, body)
+			if err != nil {
+				// With explicit nonces, a failed decrypt means garbage,
+				// forgery, or a replay — never legitimate desync. Do NOT
+				// evict the session; that would let any third party that
+				// can spoof this peer's address tear the tunnel down.
+				log.Printf("decrypt/decode error from %s: %v", raddr, err)
+				continue
+			}
+			// Successful decrypt is also liveness; refresh idle timer.
+			GlobalSessions.TouchLastSeen(raddr)
+			// Keepalive carrying the sender's overlay IP: [0x00][4-byte IPv4].
+			// Learn the mapping so overlay-IP routing stays current even when
+			// no data traffic flows (bare 1-byte noops from old versions fall
+			// through to the non-IPv4 drop below).
+			if len(pt) == 5 && pt[0] == 0x00 {
+				srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
+				ipLearning.Learn(srcIP, raddr)
+				continue
+			}
+			if !isIPv4Packet(pt) {
+				// Drop noops and any other non-IP plaintext silently.
+				continue
+			}
+			if ifIP := extractIPv4Src(pt); ifIP != "" {
+				ipLearning.Learn(ifIP, raddr)
+			}
+			// We are an endpoint, not a router. When the sender doesn't yet
+			// know which peer owns a destination IP it broadcasts to all
+			// established sessions; without this filter every non-addressee
+			// writes the packet to its TUN, and any host with IP forwarding
+			// enabled re-injects it into the overlay — packets then loop
+			// between nodes until TTL expiry (duplicate pings with stepped-
+			// down TTLs, ICMP redirects).
+			if myOverlayIP != "" {
+				if dst := extractIPv4Dst(pt); dst != "" && dst != myOverlayIP {
+					continue
+				}
+			}
+			tunIF.Write(pt)
 		}
-		pt, err := recvPacket(s, body)
-		if err != nil {
-			// With explicit nonces, a failed decrypt means garbage,
-			// forgery, or a replay — never legitimate desync. Do NOT
-			// evict the session; that would let any third party that
-			// can spoof this peer's address tear the tunnel down.
-			log.Printf("decrypt/decode error from %s: %v", raddr, err)
-			continue
-		}
-		// Successful decrypt is also liveness; refresh idle timer.
-		GlobalSessions.TouchLastSeen(raddr)
-		if !isIPv4Packet(pt) {
-			// Drop noops and any other non-IP plaintext silently.
-			continue
-		}
-		if ifIP := extractIPv4Src(pt); ifIP != "" {
-			ipLearning.Learn(ifIP, raddr)
-		}
-		tunIF.Write(pt)
-	}
 	}()
 
 	// Encrypt path (TUN -> UDP)
@@ -1301,7 +1330,15 @@ func main() {
 			targets := GlobalSessions.EstablishedAddrs()
 			if dst != "" {
 				if a := ipLearning.Lookup(dst); a != nil {
-					targets = []*net.UDPAddr{a}
+					// Only narrow to the learned endpoint if it still has a
+					// live session. After a peer's NAT endpoint changes, the
+					// old mapping can outlive the old session; routing to it
+					// blackholes traffic even though a fresh session exists.
+					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() {
+						targets = []*net.UDPAddr{a}
+					} else {
+						ipLearning.ForgetAddr(a)
+					}
 				}
 			}
 			for _, addr := range targets {
@@ -1354,30 +1391,39 @@ func main() {
 	// attempt and is then forgotten until the next tracker announce.
 	go holePunchRetryLoop(kp, psk)
 
-	// Passive mode: when a bootstrap session is lost due to idle timeout,
-	// immediately re-poll all trackers to rediscover the bootstrap peer
-	// rather than waiting up to MinAnnounceIntervalSeconds for the next tick.
-	if passive {
-		GlobalSessions.SetSessionLostCallback(func(addr *net.UDPAddr) {
-			log.Printf("session to bootstrap %s lost, re-polling trackers immediately", addr)
-			go func() {
-				pubNow, _ := fetchPublicEndpoint(udpConn, cfg.STUNServers, 8*time.Second)
-				if pubNow == "" {
-					mu.Lock()
-					pubNow = lastPublicIP
-					mu.Unlock()
-				}
-				announceAndConnect(loadTrackerList(cfg), infoHash, peerID, port, pubNow, kp, psk, true)
-				for _, p := range cfg.StaticPeers {
-					peer := p
-					go connectToPeer(peer, kp, psk)
-				}
-			}()
-		})
-	}
+	// On session loss: always drop overlay-IP mappings that point at the
+	// dead endpoint (stale mappings blackhole the send path after the peer
+	// reconnects from a new address). In passive mode, additionally re-poll
+	// all trackers immediately rather than waiting for the next tick.
+	GlobalSessions.SetSessionLostCallback(func(addr *net.UDPAddr) {
+		ipLearning.ForgetAddr(addr)
+		if !passive {
+			return
+		}
+		log.Printf("session to bootstrap %s lost, re-polling trackers immediately", addr)
+		go func() {
+			pubNow, _ := fetchPublicEndpoint(udpConn, cfg.STUNServers, 8*time.Second)
+			if pubNow == "" {
+				mu.Lock()
+				pubNow = lastPublicIP
+				mu.Unlock()
+			}
+			announceAndConnect(loadTrackerList(cfg), infoHash, peerID, port, pubNow, kp, psk, true)
+			for _, p := range cfg.StaticPeers {
+				peer := p
+				go connectToPeer(peer, kp, psk)
+			}
+		}()
+	})
 
-	// NAT keep-alive: 1-byte noop encrypted under the session's send state
-	// every 20s. Receiver decrypts and drops non-IPv4 plaintexts.
+	// NAT keep-alive every 20s, encrypted under the session's send state.
+	// Payload is [0x00][our 4-byte overlay IPv4] so the receiver can keep
+	// its overlay-IP -> endpoint mapping fresh even with no data traffic —
+	// critical for recovering cleanly after a NAT endpoint change.
+	keepalive := []byte{0x00}
+	if ip := net.ParseIP(myOverlayIP); ip != nil && ip.To4() != nil {
+		keepalive = append(keepalive, ip.To4()...)
+	}
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
@@ -1389,9 +1435,8 @@ func main() {
 				if s == nil || !s.Established() {
 					continue
 				}
-				// 1-byte noop through the normal (nonce-framed, locked)
-				// send path. Receiver decrypts and drops non-IPv4.
-				_ = sendPacket(GlobalConn, addr, s, []byte{0x00})
+				// Noop through the normal (nonce-framed, locked) send path.
+				_ = sendPacket(GlobalConn, addr, s, keepalive)
 			}
 		}
 	}()

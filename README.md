@@ -143,10 +143,6 @@ docker logs -f overlay-client      # watch: TUN address, info_hash, handshakes
 ping 10.28.55.X                    # the other node's overlay IP
 ```
 
-### CI deployment
-
-Pushes to `main` trigger the Forgejo workflow, which ships the repo to each server and runs `./deploy.sh` there (node role via the `SERVER_NUM` matrix variable).
-
 ## Making It Safe
 
 The overlay's security rests on two secrets and a handful of operational rules. Read this section before exposing anything real over the network.

@@ -2,9 +2,9 @@
 # (static overlay IP) go in /etc/overlay-node.env on the machine, or in
 # tun.address_cidr if you maintain per-node copies of this file.
 
-network_name: "apg-overlay-CHANGE-ME"
+network_name: "apgo-cc0b983a63e9"
 node_private_key: "/config/node.key"
-psk: "base64:mJ7l7nqL2I8lv6i9vh23gwKygBvdo7R3GjFs8NTvF1A="
+psk: "base64:ObnkmNYp7URqq58tBfxHtxubtIT91iJZ4EnAaz6iYCw="
 
 # The overlay subnet. Each node derives its own stable IP inside this range
 # from its public key — no per-node addressing needed. Override at deploy
