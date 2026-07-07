@@ -184,3 +184,8 @@ Also confirm no service unintentionally binds `0.0.0.0` on the host — `network
 ## Copying
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
+
+## Donations: 
+If you found this software helpful please support by buying me a cup of coffee or something. YOU DO NOT HAVE TO DONATE TO ENJOY!!! Anything is appreciated! 
+
+Monero: 463y7FwfniMAsR2a3hQAQCh4FVuv2bKU86yFBj1SGUmkdgieFi2U4qaSuyyJNfgqEHd7gciN8YfnuGES3dEb1uimLnaQSTr
