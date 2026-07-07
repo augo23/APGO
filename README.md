@@ -86,7 +86,6 @@ A standalone shareable diagram is in [`docs/apgo-architecture.svg`](docs/apgo-ar
 | `config/trackers.txt` | Public tracker list |
 | `docker-compose.template.yml` | Single compose template used by every node |
 | `deploy.sh` | Idempotent deploy/test/teardown script (run on each node) |
-| `.forgejo/workflows/pipeline.yml` | CI: ships the repo to servers and runs `deploy.sh` |
 
 ## Deployment
 
