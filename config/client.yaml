@@ -1,0 +1,33 @@
+# Shared client config — identical on every node. Per-node differences
+# (static overlay IP) go in /etc/overlay-node.env on the machine, or in
+# tun.address_cidr if you maintain per-node copies of this file.
+
+network_name: "apg-overlay-CHANGE-ME"
+node_private_key: "/config/node.key"
+psk: "base64:mJ7l7nqL2I8lv6i9vh23gwKygBvdo7R3GjFs8NTvF1A="
+
+# The overlay subnet. Each node derives its own stable IP inside this range
+# from its public key — no per-node addressing needed. Override at deploy
+# time with the OVERLAY_CIDR environment variable.
+overlay_cidr: "10.28.55.0/24"
+
+tun:
+  name: "ovl0"
+  mtu: 1280
+  # address_cidr: "10.28.55.2/24"   # optional: pin this node's IP manually
+  #                                  # (OVERLAY_ADDRESS env overrides this)
+
+# Fixed listen port so the NAT mapping (and the port we announce) stays
+# stable across restarts. Same port on every machine is fine — they're
+# different hosts.
+udp_listen_port: 6969
+
+stun_servers:
+  - "stun:stun.l.google.com:19302"
+  - "stun:stun1.l.google.com:19302"
+  - "stun:global.stun.twilio.com:3478"
+
+announce_only_on_ip_change: false
+tracker_list_file: "/config/trackers.txt"
+controller_url: ""
+min_announce_interval_seconds: 30

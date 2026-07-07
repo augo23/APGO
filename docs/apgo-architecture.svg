@@ -1,0 +1,77 @@
+<svg viewBox="0 0 960 620" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="620" fill="#f8fafc"/>
+  <text x="480" y="38" text-anchor="middle" font-size="24" font-weight="bold" fill="#0f172a">APGO — A Pretty Good Overlay</text>
+  <text x="480" y="60" text-anchor="middle" font-size="13" fill="#64748b">Serverless encrypted P2P overlay: tracker rendezvous · STUN · UDP hole punching · Noise XX</text>
+
+  <!-- Public internet band -->
+  <rect x="60" y="84" width="840" height="120" rx="12" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="80" y="106" font-size="12" font-weight="bold" fill="#4338ca">PUBLIC INTERNET (rendezvous only — never sees payload)</text>
+
+  <rect x="120" y="120" width="300" height="66" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="270" y="146" text-anchor="middle" font-size="14" font-weight="bold" fill="#3730a3">BitTorrent Trackers</text>
+  <text x="270" y="166" text-anchor="middle" font-size="11" fill="#64748b">peer bulletin board · info_hash = SHA1(network_name)</text>
+
+  <rect x="560" y="120" width="280" height="66" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="700" y="146" text-anchor="middle" font-size="14" font-weight="bold" fill="#3730a3">STUN Servers</text>
+  <text x="700" y="166" text-anchor="middle" font-size="11" fill="#64748b">discover public IP:port mapping</text>
+
+  <!-- Node A -->
+  <rect x="60" y="290" width="330" height="230" rx="12" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="225" y="316" text-anchor="middle" font-size="15" font-weight="bold" fill="#065f46">Node A · behind NAT</text>
+  <rect x="85" y="332" width="280" height="76" rx="8" fill="#ffffff" stroke="#34d399"/>
+  <text x="225" y="356" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">overlay-client (Docker)</text>
+  <text x="225" y="374" text-anchor="middle" font-size="11" fill="#64748b">network_mode: host · NET_ADMIN · udp/6969</text>
+  <text x="225" y="392" text-anchor="middle" font-size="11" fill="#64748b">X25519 node key → auto overlay IP</text>
+  <rect x="85" y="424" width="280" height="46" rx="8" fill="#ffffff" stroke="#34d399"/>
+  <text x="225" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.28.55.x/24</text>
+  <text x="225" y="461" text-anchor="middle" font-size="11" fill="#64748b">kernel routes any IP traffic (SSH, HTTP, ping…)</text>
+  <text x="225" y="500" text-anchor="middle" font-size="11" fill="#64748b">apps ⇄ ovl0 ⇄ encrypted UDP</text>
+
+  <!-- Node B -->
+  <rect x="570" y="290" width="330" height="230" rx="12" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="735" y="316" text-anchor="middle" font-size="15" font-weight="bold" fill="#065f46">Node B · behind NAT</text>
+  <rect x="595" y="332" width="280" height="76" rx="8" fill="#ffffff" stroke="#34d399"/>
+  <text x="735" y="356" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">overlay-client (Docker)</text>
+  <text x="735" y="374" text-anchor="middle" font-size="11" fill="#64748b">network_mode: host · NET_ADMIN · udp/6969</text>
+  <text x="735" y="392" text-anchor="middle" font-size="11" fill="#64748b">X25519 node key → auto overlay IP</text>
+  <rect x="595" y="424" width="280" height="46" rx="8" fill="#ffffff" stroke="#34d399"/>
+  <text x="735" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.28.55.y/24</text>
+  <text x="735" y="461" text-anchor="middle" font-size="11" fill="#64748b">kernel routes any IP traffic (SSH, HTTP, ping…)</text>
+  <text x="735" y="500" text-anchor="middle" font-size="11" fill="#64748b">apps ⇄ ovl0 ⇄ encrypted UDP</text>
+
+  <!-- 1. STUN lines -->
+  <path d="M 330 290 L 640 186" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 760 290 L 730 186" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="530" y="240" font-size="11.5" fill="#334155">1. learn public IP:port (STUN)</text>
+
+  <!-- 2. tracker lines -->
+  <path d="M 190 290 L 230 186" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 620 296 L 330 176" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="120" y="240" font-size="11.5" fill="#334155">2. announce + fetch peers</text>
+
+  <!-- 3. hole punch -->
+  <path d="M 390 356 L 570 356" stroke="#d97706" stroke-width="1.5" stroke-dasharray="6 4" fill="none" marker-end="url(#arrowAmber)" marker-start="url(#arrowAmber)"/>
+  <text x="480" y="345" text-anchor="middle" font-size="11.5" fill="#b45309">3. UDP hole punch (msg1 · 300 ms blast)</text>
+
+  <!-- 4/5 encrypted tunnel -->
+  <path d="M 390 440 L 570 440" stroke="#059669" stroke-width="4" fill="none" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
+  <text x="480" y="425" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#047857">4. Noise XX handshake (X25519 + PSK)</text>
+  <text x="480" y="462" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#047857">5. encrypted IP packets (ChaCha20-Poly1305)</text>
+
+  <!-- footer -->
+  <rect x="60" y="548" width="840" height="46" rx="8" fill="#f1f5f9" stroke="#e2e8f0"/>
+  <text x="480" y="567" text-anchor="middle" font-size="11.5" fill="#475569">Direct peer-to-peer, end-to-end encrypted · replay-protected (64-entry nonce window) · optional LZ4 · LAN broadcast discovery for same-subnet peers</text>
+  <text x="480" y="584" text-anchor="middle" font-size="11" fill="#94a3b8">APGO is free software — GNU GPL v3 or later · gnu.org/licenses/gpl-3.0</text>
+</svg>

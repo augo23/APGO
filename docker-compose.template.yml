@@ -1,0 +1,38 @@
+# Single compose template — identical on every machine. deploy.sh copies it
+# to docker-compose.yml, substituting __CONFIG_DIR__ with the generated
+# active-config directory.
+#
+# network_mode: host is required for reliable NAT hole punching. Behind
+# Docker's bridge network the client sits behind a SECOND layer of NAT
+# (docker's MASQUERADE), which breaks the STUN-discovered mapping and blocks
+# the LAN broadcast discovery that lets same-subnet peers find each other.
+#
+# Per-node settings (like a static overlay IP) do NOT belong in this file —
+# put them in /etc/overlay-node.env on the machine itself:
+#   echo "OVERLAY_ADDRESS=10.28.55.2" | sudo tee /etc/overlay-node.env
+# deploy.sh sources that file before bringing the stack up.
+
+version: "3.8"
+
+services:
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    image: overlay-client
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - CLIENT_CONFIG=/config/client.yaml
+      # Overlay subnet — every node in the network must use the same value.
+      - OVERLAY_CIDR=${OVERLAY_CIDR:-10.28.55.0/24}
+      # Static overlay IP for THIS node (bare IP or CIDR). Empty = derive a
+      # stable IP from the node key automatically.
+      - OVERLAY_ADDRESS=${OVERLAY_ADDRESS:-}
+    volumes:
+      - __CONFIG_DIR__:/config
+    container_name: overlay-client
