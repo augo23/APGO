@@ -189,4 +189,7 @@ This program is free software: you can redistribute it and/or modify it under th
 If you found this software helpful please support by buying me a cup of coffee or something. YOU DO NOT HAVE TO DONATE TO ENJOY!!! 
 
 Anything is appreciated! 
-Monero: 463y7FwfniMAsR2a3hQAQCh4FVuv2bKU86yFBj1SGUmkdgieFi2U4qaSuyyJNfgqEHd7gciN8YfnuGES3dEb1uimLnaQSTr
+
+CashAPP: $APGOverlay 
+Monero : 463y7FwfniMAsR2a3hQAQCh4FVuv2bKU86yFBj1SGUmkdgieFi2U4qaSuyyJNfgqEHd7gciN8YfnuGES3dEb1uimLnaQSTr
+
