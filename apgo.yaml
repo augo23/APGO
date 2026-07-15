@@ -1,0 +1,422 @@
+# APGO + NGINX Proxy Manager on Kubernetes, in the "apgo" namespace. APGO
+# images come from your registry; NPM comes from Docker Hub.
+#
+# TWO deployments on purpose:
+#   * apgo — hostNetwork (required for clean NAT hole punching on ovl0).
+#   * npm  — NORMAL pod networking, with only 80/443/81 published via
+#     hostPort. NPM's API is a Node backend that binds port 3000; when NPM
+#     shared the host network, ANY other service on the node using 3000
+#     (Grafana et al) stole the port, the backend crash-looped, nginx served
+#     the UI on 81 but 502'd every /api call, and the dashboard permanently
+#     reported "API is not healthy". In its own network namespace, 3000
+#     cannot collide with anything.
+# A pod-affinity keeps npm on the same node as apgo, so proxying to overlay
+# (10.28.55.x) backends keeps working via the node's ovl0 route.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRETS — create these once (network name + PSK, and the dashboard login):
+#
+#     kubectl create namespace apgo
+#
+#     # Same network_name + PSK on every APGO node/device.
+#     # Generate a fresh PSK: openssl rand -base64 32  (keep the base64: prefix).
+# kubectl -n apgo create secret generic apgo-network \
+#   --from-literal=NETWORK_NAME='network-name' \
+#   --from-literal=PSK='PSK'
+
+    # # APGO admin dashboard login.
+    # kubectl -n apgo create secret generic apgo-admin \
+    #   --from-literal=ADMIN_USER='admin' \
+    #   --from-literal=ADMIN_PASSWORD='choose-a-strong-password'
+#
+# To rotate a value: delete + recreate the secret, then
+#     kubectl -n apgo rollout restart deploy/apgo
+#
+# Apply:   kubectl apply -f apgo.yaml
+# Watch:   kubectl -n apgo rollout status deploy/apgo
+#          kubectl -n apgo logs -f deploy/apgo -c overlay-client
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apgo
+  labels:
+    name: apgo
+---
+# High scheduling priority so a rescheduled apgo pod jumps ahead of ordinary
+# workloads (and can preempt them) when a node comes back or fails over.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: apgo-critical
+value: 1000000
+globalDefault: false
+description: "APGO overlay + ingress stack — reschedule before ordinary workloads."
+---
+# All persistent state (APGO identity/state, NPM data + certs) lives on
+# Longhorn via the PVCs below, so the pod can restart on any node with its
+# data intact.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: apgo-state
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+  storageClassName: longhorn-allnodes
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-data
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: longhorn-allnodes
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-letsencrypt
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 512Mi
+  storageClassName: longhorn-allnodes
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apgo-config
+  namespace: apgo
+data:
+  OVERLAY_CIDR: "10.28.55.0/24"
+  FRIENDLY_NAME: "k8s-node"
+  # Pin this node's overlay IP (matches the admin-panel assignment). Without a
+  # pin the client auto-derives an IP from its key, which can collide with
+  # another node's (that exact collision — two nodes on 10.28.55.105 — caused
+  # heavy packet loss here once). Keep this in sync if you re-assign it.
+  OVERLAY_ADDRESS: "10.28.55.22"
+  # Set to "1" to make this node an internet EXIT / outproxy.
+  EXIT_NODE: ""
+  # Optional HTTPS discovery servers for BitTorrent-blocked networks (comma list).
+  RENDEZVOUS_SERVERS: ""
+  # Base client config (env vars still override name/PSK/CIDR). STUN servers
+  # are REQUIRED for internet peers — without them the client can't learn its
+  # public endpoint and hole punching fails. A fixed UDP port keeps the NAT
+  # mapping stable across restarts; 6970 avoids colliding with a legacy
+  # standalone client still bound to 6969 on the host.
+  client.yaml: |
+    udp_listen_port: 6970
+    # MUST match every node on the network — the podman stack and the
+    # macOS/Windows app both use aesgcm; a mismatch fails every handshake
+    # with "cipher: message authentication failed".
+    cipher: "aesgcm"
+    # Fast discovery tick — the client announces to a rotating subset of
+    # trackers each tick (individual trackers still see gentle intervals), so
+    # peers converge in seconds instead of the 15-min default.
+    min_announce_interval_seconds: 30
+    # NAT keepalive (default 10s). Lower it further only for extremely
+    # aggressive NATs; sessions self-heal (tear down + re-punch) after ~3
+    # missed intervals either way.
+    keepalive_seconds: 10
+    stun_servers:
+      - "stun:stun.l.google.com:19302"
+      - "stun:stun1.l.google.com:19302"
+      - "stun:global.stun.twilio.com:3478"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apgo
+  namespace: apgo
+  labels:
+    app: apgo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: apgo
+  template:
+    metadata:
+      labels:
+        app: apgo
+    spec:
+      # Host networking: reliable NAT hole punching for APGO, and NPM binds
+      # 80/443/81 on the node.
+      hostNetwork: true
+      # Use the node's own resolver, not CoreDNS: tracker/STUN lookups keep
+      # working (and get real AAAA answers for the IPv6 path) even when
+      # cluster DNS is degraded — peer discovery shouldn't depend on it.
+      dnsPolicy: Default
+      # Fast recovery: jump the scheduling queue, and don't linger 30s in
+      # Terminating during a Recreate rollover or node drain.
+      priorityClassName: apgo-critical
+      terminationGracePeriodSeconds: 10
+      # Node preference (all soft — the pod may still land anywhere):
+      #   * strongly prefer zx3t / zx7t
+      #   * actively de-prefer zx5t / zx11t so they're a last resort
+      # zx3t/zx7t/zx11t are control-plane nodes (they run etcd + apiserver), so
+      # they carry the control-plane NoSchedule taint; the toleration below is
+      # what actually lets the pod land on zx3t/zx7t at all — without it the
+      # scheduler could ONLY use zx5t and the affinity was being ignored.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx3t", "zx7t"]
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["zx5t", "zx11t"]
+      tolerations:
+        # Tolerate the control-plane taint so zx3t / zx7t are schedulable.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        # Fail over quickly if a node goes away.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+      containers:
+        # --- APGO overlay client ---------------------------------------------
+        - name: overlay-client
+          image: registry.kube.sunairies.com/apgoclient:latest
+          # IfNotPresent: restart from the cached image immediately instead of
+          # waiting on (or failing against) the registry. To roll out a new
+          # :latest build:  kubectl -n apgo rollout restart deploy/apgo  after
+          # pre-pulling, or temporarily flip this back to Always.
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          envFrom:
+            # optional: if the secret is missing, the client starts in setup mode
+            # and you configure it from the admin dashboard (/network-setup).
+            - secretRef:
+                name: apgo-network
+                optional: true
+            - configMapRef:
+                name: apgo-config
+                optional: true
+          env:
+            - name: CLIENT_CONFIG
+              value: /config/client.yaml
+            - name: NODE_KEY_FILE
+              value: /state/node.key
+            - name: CONTROL_SOCKET
+              value: /shared/control.sock
+            - name: LOG_FILE
+              value: /shared/overlay-client.log
+            - name: REVOCATIONS_FILE
+              value: /state/revocations.json
+            - name: PROVISIONS_FILE
+              value: /state/provisions.json
+            - name: ADMIN_PUBKEY_FILE
+              value: /state/admin-pubkey
+            - name: SEALED_ADMIN_KEY_FILE
+              value: /state/admin-key-sealed.json
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: state
+              mountPath: /state
+            - name: client-config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+        # --- APGO admin dashboard --------------------------------------------
+        - name: overlay-admin
+          image: registry.kube.sunairies.com/apgoadmin:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # optional: if missing, you're prompted to create a dashboard login
+            # on first visit.
+            - secretRef:
+                name: apgo-admin
+                optional: true
+          env:
+            # 8789 (not 8788) so it can coexist with an old standalone APGO
+            # stack still holding 8788 on the host during migration.
+            - name: ADMIN_LISTEN
+              value: ":8789"
+            - name: CONTROL_SOCKET
+              value: /shared/control.sock
+            - name: LOG_FILE
+              value: /shared/overlay-client.log
+            - name: ADMIN_CREDS_FILE
+              value: /adminkey/credentials.json
+            - name: ADMIN_KEY_FILE
+              value: /adminkey/admin.key
+          ports:
+            - name: dashboard
+              containerPort: 8788
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: state
+              mountPath: /adminkey
+              subPath: adminkey
+      volumes:
+        - name: shared
+          emptyDir: {}
+        - name: state
+          persistentVolumeClaim:
+            claimName: apgo-state
+        - name: client-config
+          configMap:
+            name: apgo-config
+            items:
+              - key: client.yaml
+                path: client.yaml
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+---
+# NGINX Proxy Manager — its OWN deployment with NORMAL pod networking. Only
+# 80/443/81 are published on the node (hostPort); NPM's internal API port
+# (3000) stays inside the pod's network namespace, so it can no longer be
+# stolen by another host service — which is what made the dashboard report
+# "API is not healthy" forever when NPM ran with hostNetwork.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: npm
+  namespace: apgo
+  labels:
+    app: npm
+spec:
+  replicas: 1
+  # Recreate: the two PVCs are ReadWriteOnce — a rolling update would deadlock
+  # with old and new pods both claiming them.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: npm
+  template:
+    metadata:
+      labels:
+        app: npm
+    spec:
+      priorityClassName: apgo-critical
+      terminationGracePeriodSeconds: 10
+      affinity:
+        # Follow the apgo pod: proxying to overlay backends (10.28.55.x)
+        # relies on the node's ovl0 route, which only exists where the
+        # overlay client runs.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: apgo
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+      containers:
+        - name: nginx
+          image: docker.io/jc21/nginx-proxy-manager:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Bind the admin UI (and proxy) on IPv4 only. On a host with a
+            # non-routable IPv6 address the browser prefers [::]:81, loads the
+            # page shell, then hangs on the /api calls — the classic "UI loads
+            # but spins forever." Forcing IPv4 avoids that. (APGO's own overlay
+            # IPv6 transport is unaffected — this only changes NPM's listeners.)
+            - name: DISABLE_IPV6
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 80
+              hostPort: 80
+            - name: https
+              containerPort: 443
+              hostPort: 443
+            - name: npm-admin
+              containerPort: 81
+              hostPort: 81
+          # Surface backend health instead of silently serving a dead UI:
+          # /api answers {"status":"OK"} only once the Node backend is up and
+          # migrations have run. If it ever regresses, the pod goes unready —
+          # visible in `kubectl get pods` instead of a mystery browser error.
+          readinessProbe:
+            httpGet:
+              path: /api/
+              port: 81
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 81
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          volumeMounts:
+            - name: npm-data
+              mountPath: /data
+            - name: npm-letsencrypt
+              mountPath: /etc/letsencrypt
+      volumes:
+        - name: npm-data
+          persistentVolumeClaim:
+            claimName: npm-data
+        - name: npm-letsencrypt
+          persistentVolumeClaim:
+            claimName: npm-letsencrypt
+---
+# APGO dashboard reachable in-cluster (e.g. from NPM) at apgo-admin.apgo.svc:8788
+# (the Service keeps port 8788 outward; the container now listens on 8789).
+# NOTE: now that NPM runs with pod networking, any NPM proxy host that pointed
+# at localhost:8789 / 127.0.0.1:8789 must be changed to apgo-admin.apgo.svc:8788.
+apiVersion: v1
+kind: Service
+metadata:
+  name: apgo-admin
+  namespace: apgo
+spec:
+  selector:
+    app: apgo
+  ports:
+    - name: dashboard
+      port: 8788
+      targetPort: 8788

@@ -1,0 +1,83 @@
+# easy-compose.yml — run APGO on a single host from locally-built images
+# (apgoclient:latest / apgoadmin:latest, built by easy-deploy.sh).
+#
+# Configuration comes from environment variables (compose reads a .env file in
+# this directory automatically — easy-deploy.sh generates one for you). At
+# minimum you need NETWORK_NAME and PSK; everything else has sane defaults.
+#
+#   podman compose -f easy-compose.yml up -d      # or docker compose
+#
+services:
+  client:
+    image: apgoclient:latest
+    restart: unless-stopped
+    # Host networking is required for reliable NAT hole punching.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # --- required: the network identity (same on every node/device) ---
+      - NETWORK_NAME=${NETWORK_NAME:?set NETWORK_NAME in .env}
+      - PSK=${PSK:?set PSK in .env (base64:...)}
+      # --- optional ---
+      - OVERLAY_CIDR=${OVERLAY_CIDR:-10.28.55.0/24}
+      - FRIENDLY_NAME=${FRIENDLY_NAME:-}
+      # Set EXIT_NODE=1 to make this host an internet exit / outproxy.
+      - EXIT_NODE=${EXIT_NODE:-}
+      # Optional HTTPS discovery servers for BitTorrent-blocked networks.
+      - RENDEZVOUS_SERVERS=${RENDEZVOUS_SERVERS:-}
+      # Post-quantum layer + quantum-resistant handshake auth: ON by default.
+      # Set to 0 to disable on this node (keep the whole fleet consistent).
+      - POST_QUANTUM=${POST_QUANTUM:-1}
+      - PQ_AUTH=${PQ_AUTH:-1}
+      # Symmetric-NAT / CGNAT port prediction (helps phone hotspots): ON.
+      - PORT_PREDICTION=${PORT_PREDICTION:-1}
+      # IPv6 dual-stack transport (direct v6 where available): ON. Set 0 for v4-only.
+      - IPV6=${IPV6:-1}
+      # One-shot wipe of the network admin key/password on this node. Set to 1
+      # for a single boot to start fresh, then set back to blank. Reset every
+      # node together or a peer re-seeds the old key via trust-on-first-use.
+      - APGO_RESET_ADMIN=${APGO_RESET_ADMIN:-}
+      # --- fixed paths (persist on the volumes below) ---
+      - NODE_KEY_FILE=/state/node.key
+      - CONTROL_SOCKET=/shared/control.sock
+      - LOG_FILE=/shared/overlay-client.log
+      - REVOCATIONS_FILE=/state/revocations.json
+      - PROVISIONS_FILE=/state/provisions.json
+      - ADMIN_PUBKEY_FILE=/state/admin-pubkey
+      - SEALED_ADMIN_KEY_FILE=/state/admin-key-sealed.json
+      # Per-node toggles set from an admin panel (e.g. IPv6) persist here.
+      - NODE_SETTINGS_FILE=/state/node-settings.json
+    volumes:
+      - overlay-shared:/shared
+      - overlay-state:/state
+    container_name: overlay-client
+
+  admin:
+    image: apgoadmin:latest
+    restart: unless-stopped
+    depends_on:
+      - client
+    environment:
+      # Leave blank to be prompted to create a login on first visit, or pin one.
+      - ADMIN_USER=${ADMIN_USER:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_LISTEN=:8788
+      - CONTROL_SOCKET=/shared/control.sock
+      - LOG_FILE=/shared/overlay-client.log
+      - ADMIN_CREDS_FILE=/adminkey/credentials.json
+      - ADMIN_KEY_FILE=/adminkey/admin.key
+    ports:
+      # Dashboard on localhost only; put a reverse proxy in front to expose it.
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - overlay-shared:/shared
+      - overlay-adminkey:/adminkey
+    container_name: overlay-admin
+
+volumes:
+  overlay-shared:
+  overlay-state:
+  overlay-adminkey:

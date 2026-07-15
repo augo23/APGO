@@ -1,0 +1,92 @@
+# Compose file for a single host (docker OR podman-compose).
+#
+# The client is configured entirely from the mounted config/client.yaml
+# (network_name, psk, node_private_key, and optionally overlay_cidr,
+# friendly_name, rendezvous_servers, exit_node, static_peers, ...).
+#
+# IMPORTANT: podman-compose does NOT expand ${VAR:-default}, so this file uses
+# only literal values and named volumes. Put per-node settings in client.yaml,
+# not here. Admin login is set below (change it).
+
+# sudo docker rm -f $(sudo docker ps -aq --filter name=apgo) 2>/dev/null
+# sudo docker volume rm -f $(sudo docker volume ls -q | grep -i apgo) 2>/dev/null
+# sudo docker ps -a | grep -i apgo
+# sudo docker volume ls | grep -i apgo
+# sudo podman rm -f $(sudo podman ps -aq --filter name=apgo) 2>/dev/null
+# sudo podman volume rm -f $(sudo podman volume ls -q | grep -i apgo) 2>/dev/null
+# sudo podman ps -a | grep -i apgo
+# sudo podman volume ls | grep -i apgo
+
+services:
+  client:
+    image: registry.kube.sunairies.com/apgoclient:latest
+    restart: always
+    # Host networking is required for reliable NAT hole punching.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # Everything network-related comes from the file below.
+      - CLIENT_CONFIG=/config/client.yaml
+      # Operational paths (not in client.yaml).
+      - CONTROL_SOCKET=/shared/control.sock
+      - LOG_FILE=/shared/overlay-client.log
+      - REVOCATIONS_FILE=/state/revocations.json
+      - PROVISIONS_FILE=/state/provisions.json
+      - ADMIN_PUBKEY_FILE=/state/admin-pubkey
+      - SEALED_ADMIN_KEY_FILE=/state/admin-key-sealed.json
+      # Per-node toggles set from an admin panel (e.g. IPv6) persist here.
+      - NODE_SETTINGS_FILE=/state/node-settings.json
+      # To wipe the network admin password/key from THIS node on next start,
+      # uncomment the next line (then re-comment it after one boot). Reset every
+      # node together, or a peer still holding the key will re-seed it via TOFU.
+      # - APGO_RESET_ADMIN=1
+      # Full-VPN / outproxy: devices with "Route all traffic via an exit node"
+      # (iOS/desktop use_exit) need AT LEAST ONE Linux node with exit-node mode
+      # on — otherwise their internet traffic is dropped (never leaked) while
+      # they search for an exit. Uncomment on the node(s) that should egress:
+      - EXIT_NODE=1
+      # IMPORTANT for EXIT_NODE=1: /proc/sys is READ-ONLY in a non-privileged
+      # container, so ALSO enable forwarding on the HOST:
+      #   sudo sysctl -w net.ipv4.ip_forward=1     (persist it in /etc/sysctl.conf)
+      # or add `privileged: true` to this service. Without one of these the
+      # node refuses to advertise as an exit (a non-forwarding "exit" would
+      # black-hole all internet traffic of any device that selects it).
+    privileged: true
+    volumes:
+      # :Z relabels the bind mount for SELinux (RHEL/Fedora/CentOS podman hosts).
+      - ./config:/config:Z
+      - apgo-shared-clean:/shared
+      - apgo-state-clean:/state
+    container_name: apgo-client
+
+  # Web dashboard — its own container. Talks to the client over the shared unix
+  # socket (no network port on the client). Reachable at 127.0.0.1:8788.
+  admin:
+    image: registry.kube.sunairies.com/apgoadmin:latest
+    restart: always
+    depends_on:
+      - client
+    environment:
+      # CHANGE THESE. Or set both blank to be prompted to create a login on first
+      # visit (a one-time password is then printed in the admin logs).
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=change-me
+      - ADMIN_CREDS_FILE=/adminkey/credentials.json
+      - ADMIN_LISTEN=:8788
+      - CONTROL_SOCKET=/shared/control.sock
+      - LOG_FILE=/shared/overlay-client.log
+      - ADMIN_KEY_FILE=/adminkey/admin.key
+    ports:
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - apgo-shared-clean:/shared
+      - apgo-adminkey-clean2:/adminkey
+    container_name: apgo-admin
+
+volumes:
+  apgo-shared-clean:
+  apgo-state-clean:
+  apgo-adminkey-clean2:

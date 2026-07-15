@@ -36,3 +36,10 @@ min_announce_interval_seconds: 30
 #   - "203.0.113.7:6969"
 # tracker_mode: "bootstrap"      # or "passive" (announce port 0, poll fast)
 # compression: true
+# exit_node: true                # BE an internet exit for the mesh (Linux only)
+# use_exit: true                 # route ALL internet traffic via an exit (full VPN)
+# exit_peer: "10.28.55.7"        # pin ONE exit (overlay IP / name / key); blank = fastest
+
+# NAT keepalive interval (seconds). Default 10 (survives aggressive NATs);
+# sessions self-heal after ~3 missed intervals. Clamped 5..120.
+# keepalive_seconds: 10

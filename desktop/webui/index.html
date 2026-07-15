@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APGO Admin</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+<style>
+  :root{
+    --bg:#000; --panel:#0c0c0c; --panel-2:#141414; --fg:#fff; --muted:#9aa0a6;
+    --line:#242424; --accent:#fff; --danger:#ff5a5a; --ok:#39d353; --chip:#171717;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#fff; --panel:#f7f7f7; --panel-2:#efefef; --fg:#0a0a0a; --muted:#5f6368;
+           --line:#e4e4e4; --accent:#000; --danger:#c62828; --ok:#1a7f37; --chip:#ededed; }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  header{
+    display:flex; align-items:center; gap:14px; padding:16px 22px;
+    border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5;
+  }
+  header img{width:36px; height:36px; border-radius:9px}
+  header h1{font-size:16px; margin:0; letter-spacing:.3px}
+  header .sub{color:var(--muted); font-size:12px}
+  header .spacer{flex:1}
+  .logout{color:var(--muted); text-decoration:none; border:1px solid var(--line);
+    padding:7px 12px; border-radius:9px; font-size:13px}
+  .logout:hover{color:var(--fg); border-color:var(--accent)}
+  main{max-width:1100px; margin:0 auto; padding:22px}
+  .cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:22px}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px}
+  .card .k{color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.7px}
+  .card .v{font-size:20px; margin-top:6px; font-variant-numeric:tabular-nums; word-break:break-all}
+  .card .v.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px}
+  h2{font-size:13px; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); margin:26px 0 12px}
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden}
+  .panel.scroll{overflow-x:auto}
+  table{width:100%; border-collapse:collapse}
+  th,td{text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); white-space:nowrap}
+  th{font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted)}
+  tr:last-child td{border-bottom:0}
+  td.mono,.pill{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .pill{background:var(--chip); border:1px solid var(--line); border-radius:20px; padding:2px 9px; font-size:12px}
+  .role{font-size:11px; color:var(--muted)}
+  .pending{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#e6b400;border:1px solid #e6b400;border-radius:6px;padding:1px 5px;margin-left:6px}
+  .exit-active{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#4da3ff;border:1px solid #4da3ff;border-radius:6px;padding:1px 5px;margin-left:6px}
+  .exit-avail{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#8a93a3;border:1px solid #8a93a3;border-radius:6px;padding:1px 5px;margin-left:6px;opacity:.7}
+  .dot{display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:7px; vertical-align:middle}
+  .revoke{background:transparent; color:var(--danger); border:1px solid var(--danger);
+    border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer}
+  .revoke:hover{background:var(--danger); color:var(--bg)}
+  .accept{background:transparent; color:var(--ok); border:1px solid var(--ok);
+    border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer}
+  .accept:hover{background:var(--ok); color:var(--bg)}
+  .empty{padding:26px 16px; color:var(--muted); text-align:center}
+  pre#log{margin:0; padding:14px 16px; max-height:340px; overflow:auto; background:var(--panel-2);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word}
+  .foot{color:var(--muted); font-size:12px; margin-top:18px; display:flex; gap:8px; align-items:center}
+  .stale{color:var(--danger)}
+  .edit-btn{background:transparent; color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer}
+  .edit-btn:hover{border-color:var(--accent)}
+  .modal-backdrop{position:fixed; inset:0; background:rgba(0,0,0,.62); display:none;
+    align-items:center; justify-content:center; z-index:30; padding:20px}
+  .modal-backdrop.show{display:flex}
+  .modal{background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:22px 22px 20px; width:100%; max-width:420px; box-shadow:0 18px 60px rgba(0,0,0,.5)}
+  .modal h3{margin:0 0 4px; font-size:16px}
+  .modal .who{color:var(--muted); font-size:12px; margin:0 0 6px}
+  .modal label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:.6px;
+    color:var(--muted); margin:15px 0 6px}
+  .modal label .lc{text-transform:none; letter-spacing:0}
+  .modal input{width:100%; padding:10px 12px; background:var(--panel-2); color:var(--fg);
+    border:1px solid var(--line); border-radius:9px; font-size:14px; outline:none}
+  .modal input:focus{border-color:var(--accent)}
+  .modal .msg{color:var(--danger); font-size:13px; margin-top:12px; min-height:16px; word-break:break-word}
+  .modal-actions{display:flex; gap:10px; justify-content:flex-end; margin-top:20px}
+  .modal .primary{background:var(--accent); color:var(--bg); border:0; border-radius:9px;
+    padding:9px 18px; font-size:14px; font-weight:600; cursor:pointer}
+  .modal .ghost{background:transparent; color:var(--fg); border:1px solid var(--line);
+    border-radius:9px; padding:9px 16px; font-size:14px; cursor:pointer}
+</style>
+</head>
+<body>
+  <header>
+    <img src="/static/logo.svg" alt="APGO">
+    <div>
+      <h1>APGO Admin</h1>
+      <div class="sub" id="nodeSub">overlay node dashboard</div>
+    </div>
+    <div class="spacer"></div>
+    <button class="edit-btn" id="connectBtn" style="margin-right:8px">Connect</button>
+    <button class="edit-btn" id="editSelf" style="margin-right:8px">Edit this device…</button>
+    <a class="logout" href="/qr" style="margin-right:8px">Join QR</a>
+    <a class="logout" href="/settings" style="margin-right:8px">Settings</a>
+    <a class="logout" href="/logout">Sign out</a>
+  </header>
+
+  <main>
+    <div class="cards">
+      <div class="card"><div class="k">This node</div><div class="v mono" id="cOverlay">—</div></div>
+      <div class="card"><div class="k">Name</div><div class="v" id="cName">—</div></div>
+      <div class="card"><div class="k">Node key</div><div class="v mono" id="cKey">—</div></div>
+      <div class="card"><div class="k">Connected</div><div class="v" id="cCount">—</div></div>
+      <div class="card"><div class="k">Uptime</div><div class="v" id="cUptime">—</div></div>
+      <div class="card"><div class="k">Security</div><div class="v" id="cSecurity">—</div></div>
+    </div>
+
+    <h2>Connected nodes</h2>
+    <div class="panel scroll">
+      <table>
+        <thead><tr>
+          <th>Overlay IP</th><th>Name</th><th>Endpoint</th><th>Key</th><th>PQ</th><th>Connected</th><th>Last seen</th><th></th>
+        </tr></thead>
+        <tbody id="rows"><tr><td class="empty" colspan="8">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2>Revoked peers</h2>
+    <div class="panel scroll">
+      <table>
+        <thead><tr><th>Overlay IP</th><th>Name</th><th>Key</th><th>Revoked</th><th></th></tr></thead>
+        <tbody id="revokedRows"><tr><td class="empty" colspan="5">None.</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2>Client log</h2>
+    <div class="panel"><pre id="log">Loading…</pre></div>
+
+    <div class="foot"><span id="status">·</span></div>
+  </main>
+
+  <div class="modal-backdrop" id="pqModal">
+    <div class="modal">
+      <h3 id="pqTitle">Post-quantum encryption</h3>
+      <p class="who" id="pqWho">—</p>
+      <label for="pqPass">Network admin password</label>
+      <input id="pqPass" type="password">
+      <div class="msg" id="pqMsg"></div>
+      <div class="modal-actions">
+        <button class="ghost" id="pqCancel" type="button">Cancel</button>
+        <button class="primary" id="pqApply" type="button">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="revokeModal">
+    <div class="modal">
+      <h3 id="revokeTitle">Revoke device</h3>
+      <p class="who" id="revokeWho">—</p>
+      <div id="revokePassWrap">
+        <label for="revokePass">Network admin password</label>
+        <input id="revokePass" type="password">
+      </div>
+      <div class="msg" id="revokeMsg"></div>
+      <div class="modal-actions">
+        <button class="ghost" id="revokeCancel" type="button">Cancel</button>
+        <button class="revoke" id="revokeApply" type="button">Revoke</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="approveModal">
+    <div class="modal">
+      <h3 id="approveTitle">Approve device</h3>
+      <p class="who" id="approveWho">—</p>
+      <label for="approvePass">Network admin password</label>
+      <input id="approvePass" type="password">
+      <div class="msg" id="approveMsg"></div>
+      <div class="modal-actions">
+        <button class="ghost" id="approveCancel" type="button">Cancel</button>
+        <button class="revoke" id="approveDeny" type="button" style="margin-left:auto">Deny</button>
+        <button class="primary" id="approveApply" type="button">Approve</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="editModal">
+    <div class="modal">
+      <h3 id="editTitle">Edit node</h3>
+      <p class="who" id="editWho">—</p>
+
+      <label for="editName">Friendly name</label>
+      <input id="editName" type="text" spellcheck="false" autocapitalize="off" placeholder="e.g. web-server-1">
+
+      <label for="editIp">Overlay IP <span class="lc">— full address or just the last number; blank = unchanged</span></label>
+      <input id="editIp" type="text" spellcheck="false" autocapitalize="off">
+
+      <label for="editPass">Network admin password</label>
+      <input id="editPass" type="password">
+
+      <div class="msg" id="editMsg"></div>
+      <div class="modal-actions">
+        <button class="ghost" id="editCancel" type="button">Cancel</button>
+        <button class="primary" id="editApply" type="button">Apply</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const XRW = {"X-Requested-With":"overlay-admin"};
+let selfNode = {pubkey:"", ip:"", name:""};
+
+function rel(unix){
+  if(!unix) return "—";
+  const s = Math.max(0, Math.floor(Date.now()/1000) - unix);
+  if(s < 60) return s + "s ago";
+  if(s < 3600) return Math.floor(s/60) + "m ago";
+  if(s < 86400) return Math.floor(s/3600) + "h ago";
+  return Math.floor(s/86400) + "d ago";
+}
+function dur(sec){
+  sec = Math.floor(sec||0);
+  const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
+  if(d) return d+"d "+h+"h";
+  if(h) return h+"h "+m+"m";
+  if(m) return m+"m";
+  return sec+"s";
+}
+function esc(s){ return (s??"").toString().replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function setConnectBtn(up){
+  const b = document.getElementById("connectBtn");
+  if(!b) return;
+  b.textContent = up ? "Disconnect" : "Connect";
+  b.dataset.up = up ? "1" : "0";
+}
+
+async function loadInfo(){
+  let j = null;
+  try{
+    const r = await fetch("/api/info", {headers:XRW});
+    if(r.status===401){ location.href="/login"; return; }
+    if(r.ok) j = await r.json();
+  }catch(e){}
+  const up = !!(j && j.public_key);
+  setConnectBtn(up);
+  if(!up){
+    document.getElementById("nodeSub").textContent = "client not connected — click Connect";
+    document.getElementById("cOverlay").textContent = "—";
+    document.getElementById("cCount").textContent = "—";
+    return;
+  }
+  selfNode = {pubkey: j.public_key||"", ip: j.overlay_ip||"", name: j.friendly_name||""};
+  document.getElementById("cOverlay").textContent = j.overlay_ip || "—";
+  document.getElementById("cName").textContent = j.friendly_name || "—";
+  document.getElementById("cKey").textContent = j.key_fp || "—";
+  document.getElementById("cCount").textContent = j.sessions ?? "—";
+  document.getElementById("cUptime").textContent = dur(j.uptime_seconds);
+  const sec = document.getElementById("cSecurity");
+  if(sec){
+    sec.innerHTML = "PQ " + (j.post_quantum ? '<span style="color:#38c172">on</span>' : '<span style="color:#e6b400">off</span>')
+      + " · admin " + (j.admin_trusted ? "key set" : "none");
+  }
+  document.getElementById("nodeSub").textContent = "overlay " + (j.overlay_ip||"?") + " · key " + (j.key_fp||"?");
+  if(j.pending_address){
+    document.getElementById("nodeSub").textContent += " · new address " + j.pending_address + " pending reconnect";
+  }
+}
+
+async function loadSessions(){
+  const r = await fetch("/api/sessions", {headers:XRW});
+  if(r.status===401){ location.href="/login"; return; }
+  const list = await r.json();
+  const tb = document.getElementById("rows");
+  if(!Array.isArray(list) || list.length===0){
+    tb.innerHTML = '<tr><td class="empty" colspan="8">No peers connected.</td></tr>';
+    return;
+  }
+  list.sort((a,b)=> (a.overlay_ip||"").localeCompare(b.overlay_ip||""));
+  tb.innerHTML = list.map(s => {
+    const pending = (s.approved === false);
+    return `
+    <tr>
+      <td class="mono"><span class="dot"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.active_exit?' <span class="exit-active" title="This device\'s internet traffic currently egresses through this exit node">&#127760; exit</span>':(s.exit?' <span class="exit-avail" title="Advertises as an internet exit node">exit</span>':'')}</td>
+      <td>${esc(s.name||"—")}</td>
+      <td class="mono">${esc(s.remote)}</td>
+      <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
+      <td style="text-align:center"><input type="checkbox" class="pqbox" ${s.post_quantum?'checked':''} data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}" ${s.pubkey?'':'disabled'} title="Post-quantum encryption for this node"></td>
+      <td>${rel(s.since_unix)}</td>
+      <td>${rel(s.last_seen_unix)}</td>
+      <td style="text-align:right">
+        ${pending?`<button class="edit-btn approve" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Approve…</button>`:''}
+        <button class="edit-btn edit" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||'')}" data-name="${esc(s.name||'')}">Edit</button>
+        <button class="revoke" data-remote="${esc(s.remote)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Revoke</button>
+      </td>
+    </tr>`;}).join("");
+}
+
+async function loadLogs(){
+  const r = await fetch("/api/logs?tail=300", {headers:XRW});
+  if(r.status===401){ location.href="/login"; return; }
+  const j = await r.json();
+  const pre = document.getElementById("log");
+  const atBottom = pre.scrollHeight - pre.clientHeight - pre.scrollTop < 40;
+  pre.textContent = (j.lines||[]).join("\n") || "(no log output yet)";
+  if(atBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+let adminConfigured = false;
+
+async function loadConfig(){
+  try{
+    const r = await fetch("/api/config", {headers:XRW});
+    if(r.ok){ const j = await r.json(); adminConfigured = !!j.admin_configured; }
+  }catch(e){}
+}
+
+async function loadRevocations(){
+  const r = await fetch("/api/revocations", {headers:XRW});
+  if(r.status===401){ location.href="/login"; return; }
+  let list = await r.json();
+  if(!Array.isArray(list)) list = [];
+  list = list.filter(x => x.action === "revoke");
+  const tb = document.getElementById("revokedRows");
+  if(list.length===0){ tb.innerHTML = '<tr><td class="empty" colspan="5">None.</td></tr>'; return; }
+  list.sort((a,b)=>(a.overlay_ip||"").localeCompare(b.overlay_ip||""));
+  tb.innerHTML = list.map(x => `
+    <tr>
+      <td class="mono">${esc(x.overlay_ip||"unknown")}</td>
+      <td>${esc(x.name||"—")}</td>
+      <td><span class="pill">${esc(x.key_fp||"—")}</span></td>
+      <td>${rel(x.ts)}</td>
+      <td><button class="accept" data-pubkey="${esc(x.pubkey)}" data-signed="${x.signed?1:0}" data-ip="${esc(x.overlay_ip||x.key_fp)}">Accept</button></td>
+    </tr>`).join("");
+}
+
+// kind: "revoke" | "restore". With an admin key configured, both require the
+// admin password (used to sign the record); otherwise revoke is a local kick.
+// In-app revoke/restore dialog (no browser prompt/confirm). Resolves true on success.
+function doAction(kind, pubkey, remote, label){
+  return new Promise((resolve)=>{
+    const modal = document.getElementById("revokeModal");
+    const title = document.getElementById("revokeTitle");
+    const who = document.getElementById("revokeWho");
+    const passWrap = document.getElementById("revokePassWrap");
+    const pass = document.getElementById("revokePass");
+    const msg = document.getElementById("revokeMsg");
+    const apply = document.getElementById("revokeApply");
+    const cancel = document.getElementById("revokeCancel");
+    const verb = kind==="revoke" ? "Revoke" : "Re-admit";
+    title.textContent = verb + " device";
+    apply.textContent = verb;
+    pass.value = ""; msg.textContent = "";
+    const signed = adminConfigured;
+    if(kind==="restore" && !signed){
+      who.textContent = "Admin key not configured on this node.";
+      passWrap.style.display = "none"; apply.style.display = "none";
+    } else if(signed){
+      if(!pubkey){ who.textContent = "This peer has no key on record; cannot "+kind+" network-wide."; passWrap.style.display="none"; apply.style.display="none"; }
+      else { who.textContent = (label||"this device") + " — network-wide, signed."; passWrap.style.display=""; apply.style.display=""; }
+    } else {
+      who.textContent = "Revoke and disconnect "+(label||"this device")+"? Local kick only (create a network admin key for network-wide revocation).";
+      passWrap.style.display = "none"; apply.style.display = "";
+    }
+    function close(v){ modal.classList.remove("show"); apply.onclick=null; cancel.onclick=null; modal.onclick=null; resolve(v); }
+    cancel.onclick = ()=>close(false);
+    modal.onclick = (e)=>{ if(e.target.id==="revokeModal") close(false); };
+    apply.onclick = async ()=>{
+      let body;
+      if(signed){
+        if(!pubkey){ return; }
+        if(!pass.value){ msg.textContent = "Network admin password is required."; return; }
+        body = {pubkey, action:kind, password:pass.value};
+      } else { body = {remote}; }
+      msg.textContent = "Working…";
+      const r = await fetch("/api/revoke", {method:"POST", headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      if(!r.ok){ msg.textContent = verb+" failed: "+(await r.text()); return; }
+      close(true);
+    };
+    modal.classList.add("show");
+    if(signed && pubkey) pass.focus();
+  });
+}
+
+// --- in-page per-node post-quantum toggle ----------------------------------
+let pqTarget = {pubkey:"", on:false};
+function openPQModal(pubkey, on, label){
+  pqTarget = {pubkey: pubkey||"", on: on};
+  document.getElementById("pqTitle").textContent = on ? "Enable post-quantum" : "Disable post-quantum";
+  document.getElementById("pqWho").textContent = (label||"this node") + " — " + (on?"turn ON":"turn OFF");
+  document.getElementById("pqPass").value = "";
+  document.getElementById("pqMsg").textContent = "";
+  document.getElementById("pqModal").classList.add("show");
+  document.getElementById("pqPass").focus();
+}
+function closePQModal(){ document.getElementById("pqModal").classList.remove("show"); loadSessions(); }
+document.getElementById("pqCancel").addEventListener("click", closePQModal);
+document.getElementById("pqModal").addEventListener("click", (e)=>{ if(e.target.id==="pqModal") closePQModal(); });
+document.getElementById("pqApply").addEventListener("click", async () => {
+  const msg = document.getElementById("pqMsg");
+  const password = document.getElementById("pqPass").value;
+  if(!pqTarget.pubkey){ msg.textContent = "No key on record for this node yet."; return; }
+  if(!password){ msg.textContent = "Network admin password is required."; return; }
+  msg.textContent = "Signing + distributing…";
+  try{
+    const r = await fetch("/api/policy", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+      body: JSON.stringify({pubkey: pqTarget.pubkey, post_quantum: pqTarget.on, password})});
+    if(!r.ok){ msg.textContent = (await r.text()) || "Failed."; return; }
+    document.getElementById("pqModal").classList.remove("show");
+    setTimeout(loadSessions, 800);
+  }catch(err){ msg.textContent = "Error: "+err; }
+});
+document.getElementById("rows").addEventListener("change", (e) => {
+  const box = e.target.closest(".pqbox"); if(!box) return;
+  openPQModal(box.dataset.pubkey, box.checked, box.dataset.ip || "node");
+});
+
+// --- in-page approve modal (admission control) -----------------------------
+let approveTarget = {pubkey:""};
+function openApproveModal(pubkey, label){
+  approveTarget = {pubkey: pubkey||""};
+  document.getElementById("approveWho").textContent = label || "device";
+  document.getElementById("approvePass").value = "";
+  document.getElementById("approveMsg").textContent = "";
+  document.getElementById("approveModal").classList.add("show");
+  document.getElementById("approvePass").focus();
+}
+function closeApproveModal(){ document.getElementById("approveModal").classList.remove("show"); }
+document.getElementById("approveCancel").addEventListener("click", closeApproveModal);
+document.getElementById("approveModal").addEventListener("click", (e)=>{ if(e.target.id==="approveModal") closeApproveModal(); });
+async function submitApprove(action){
+  const msg = document.getElementById("approveMsg");
+  const password = document.getElementById("approvePass").value;
+  if(!approveTarget.pubkey){ msg.textContent = "No key on record for this device yet."; return; }
+  if(!password){ msg.textContent = "Network admin password is required."; return; }
+  msg.textContent = action==="approve" ? "Approving…" : "Denying…";
+  try{
+    const r = await fetch("/api/approve", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+      body: JSON.stringify({pubkey: approveTarget.pubkey, action, password})});
+    if(!r.ok){ msg.textContent = (await r.text()) || "Failed."; return; }
+    closeApproveModal();
+    await loadSessions();
+  }catch(err){ msg.textContent = "Error: "+err; }
+}
+document.getElementById("approveApply").addEventListener("click", ()=>submitApprove("approve"));
+document.getElementById("approveDeny").addEventListener("click", ()=>submitApprove("deny"));
+
+// --- in-page edit modal (assign overlay IP + friendly name) ----------------
+let editTarget = {pubkey:"", ip:""};
+
+function openEditModal(pubkey, curIp, curName, label){
+  editTarget = {pubkey: pubkey||"", ip: curIp||""};
+  document.getElementById("editTitle").textContent = "Edit " + (label||"node");
+  document.getElementById("editWho").textContent = (curIp||"unknown") + (curName ? " · " + curName : "");
+  document.getElementById("editName").value = curName || "";
+  const ipIn = document.getElementById("editIp");
+  ipIn.value = "";
+  ipIn.placeholder = curIp || "e.g. 42";
+  document.getElementById("editPass").value = "";
+  document.getElementById("editMsg").textContent = "";
+  document.getElementById("editModal").classList.add("show");
+  document.getElementById("editName").focus();
+}
+function closeEditModal(){ document.getElementById("editModal").classList.remove("show"); }
+
+document.getElementById("editCancel").addEventListener("click", closeEditModal);
+document.getElementById("editModal").addEventListener("click", (e) => {
+  if(e.target.id === "editModal") closeEditModal();
+});
+document.addEventListener("keydown", (e) => {
+  if(e.key === "Escape") closeEditModal();
+});
+
+async function submitEdit(){
+  const msg = document.getElementById("editMsg");
+  const name = document.getElementById("editName").value.trim();
+  let ip = document.getElementById("editIp").value.trim();
+  const password = document.getElementById("editPass").value;
+  // A bare last-octet is expanded against the node's current subnet prefix.
+  if(ip && !ip.includes(".")){
+    const base = (editTarget.ip || selfNode.ip || "10.28.55.0").split("/")[0].split(".");
+    if(base.length >= 3) ip = base[0]+"."+base[1]+"."+base[2]+"."+ip;
+  }
+  if(!editTarget.pubkey){ msg.textContent = "No key on record for this node yet — wait until it's connected."; return; }
+  if(!name && !ip){ msg.textContent = "Enter a name, an IP, or both."; return; }
+  if(!password){ msg.textContent = "Network admin password is required."; return; }
+
+  const btn = document.getElementById("editApply");
+  btn.disabled = true; const t = btn.textContent; btn.textContent = "Applying…";
+  try{
+    const r = await fetch("/api/provision", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+      body: JSON.stringify({pubkey: editTarget.pubkey, address: ip, name, password})});
+    if(!r.ok){ msg.textContent = (await r.text()) || "Update failed."; return; }
+    closeEditModal();
+    await Promise.all([loadSessions(), loadInfo()]);
+  }catch(err){
+    msg.textContent = "Request failed — is the client running?";
+  }finally{
+    btn.disabled = false; btn.textContent = t;
+  }
+}
+document.getElementById("editApply").addEventListener("click", submitEdit);
+
+document.getElementById("rows").addEventListener("click", async (e) => {
+  const appr = e.target.closest(".approve");
+  if(appr){
+    openApproveModal(appr.dataset.pubkey, appr.dataset.ip || "device");
+    return;
+  }
+  const edit = e.target.closest(".edit");
+  if(edit){
+    openEditModal(edit.dataset.pubkey, edit.dataset.ip, edit.dataset.name, edit.dataset.ip || "node");
+    return;
+  }
+  const btn = e.target.closest(".revoke"); if(!btn) return;
+  btn.disabled = true; const t = btn.textContent; btn.textContent = "…";
+  const ok = await doAction("revoke", btn.dataset.pubkey, btn.dataset.remote, btn.dataset.ip);
+  if(ok){ await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
+  else { btn.disabled = false; btn.textContent = t; }
+});
+
+document.getElementById("editSelf").addEventListener("click", () => {
+  openEditModal(selfNode.pubkey, selfNode.ip, selfNode.name, "this device");
+});
+
+document.getElementById("connectBtn").addEventListener("click", async (e) => {
+  const b = e.currentTarget;
+  const up = b.dataset.up === "1";
+  b.disabled = true; b.textContent = up ? "Disconnecting…" : "Connecting…";
+  try{ await fetch(up ? "/api/disconnect" : "/api/connect", {method:"POST", headers:XRW}); }catch(err){}
+  setTimeout(async () => {
+    b.disabled = false;
+    await Promise.all([loadInfo(), loadSessions()]);
+  }, up ? 1500 : 3500);
+});
+
+// In-app re-admit dialog (no browser popup) — reuses the styled revoke modal.
+function localRestore(pubkey, label){
+  return new Promise((resolve)=>{
+    const modal = document.getElementById("revokeModal");
+    document.getElementById("revokeTitle").textContent = "Re-admit device";
+    document.getElementById("revokeWho").textContent = "Re-admit " + (label||"this device") + "?";
+    document.getElementById("revokePassWrap").style.display = "none";
+    const apply = document.getElementById("revokeApply"); apply.textContent = "Re-admit"; apply.style.display = "";
+    const cancel = document.getElementById("revokeCancel");
+    const msg = document.getElementById("revokeMsg"); msg.textContent = "";
+    function close(v){ modal.classList.remove("show"); apply.onclick=null; cancel.onclick=null; modal.onclick=null; resolve(v); }
+    cancel.onclick = ()=>close(false);
+    modal.onclick = (e)=>{ if(e.target.id==="revokeModal") close(false); };
+    apply.onclick = async ()=>{
+      msg.textContent = "Working…";
+      const r = await fetch("/api/revoke", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+        body:JSON.stringify({pubkey, action:"restore", local:true})});
+      if(!r.ok){ msg.textContent = "Accept failed: "+(await r.text()); return; }
+      close(true);
+    };
+    modal.classList.add("show");
+  });
+}
+
+document.getElementById("revokedRows").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".accept"); if(!btn) return;
+  const signed = btn.dataset.signed === "1";
+  btn.disabled = true; const t = btn.textContent; btn.textContent = "…";
+  // A signed revocation needs a signed restore (admin password); a local one
+  // is just removed.
+  const ok = signed
+    ? await doAction("restore", btn.dataset.pubkey, "", btn.dataset.ip)
+    : await localRestore(btn.dataset.pubkey, btn.dataset.ip);
+  if(ok){ await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
+  else { btn.disabled = false; btn.textContent = t; }
+});
+
+async function tick(){
+  try{
+    await Promise.all([loadInfo(), loadSessions(), loadRevocations(), loadLogs()]);
+    document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
+    document.getElementById("status").classList.remove("stale");
+  }catch(err){
+    document.getElementById("status").textContent = "connection error — retrying";
+    document.getElementById("status").classList.add("stale");
+  }
+}
+loadConfig().then(tick);
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

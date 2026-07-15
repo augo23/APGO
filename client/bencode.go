@@ -156,5 +156,11 @@ func parseTrackerBencode(body []byte) (TrackerResponse, error) {
 			tr.Peers = append(tr.Peers, net.JoinHostPort(ip, strconv.FormatInt(port, 10)))
 		}
 	}
+
+	// BEP7: compact IPv6 peers. Over v6 there is no NAT, so these are directly
+	// dialable — the serverless path around CGNAT.
+	if peers6, ok := dict["peers6"].(string); ok {
+		tr.Peers = append(tr.Peers, parseCompactPeers6([]byte(peers6))...)
+	}
 	return tr, nil
 }

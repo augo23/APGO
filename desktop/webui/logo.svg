@@ -1,0 +1,36 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- background -->
+  <rect width="512" height="512" rx="100" fill="#000000"/>
+
+  <!-- irregular mesh: 5 nodes, all interconnected, one interior hub -->
+  <g stroke="#ffffff" stroke-linecap="round" fill="none">
+    <!-- edges through the interior node (brightest — the busy hub) -->
+    <line x1="146" y1="152" x2="236" y2="268" stroke-width="4.5" opacity="0.95"/>
+    <line x1="378" y1="122" x2="236" y2="268" stroke-width="4.5" opacity="0.95"/>
+    <line x1="418" y1="338" x2="236" y2="268" stroke-width="4.5" opacity="0.95"/>
+    <line x1="176" y1="400" x2="236" y2="268" stroke-width="4.5" opacity="0.95"/>
+    <!-- perimeter edges (mid weight) -->
+    <line x1="146" y1="152" x2="378" y2="122" stroke-width="3" opacity="0.65"/>
+    <line x1="378" y1="122" x2="418" y2="338" stroke-width="3" opacity="0.65"/>
+    <line x1="418" y1="338" x2="176" y2="400" stroke-width="3" opacity="0.65"/>
+    <line x1="176" y1="400" x2="146" y2="152" stroke-width="3" opacity="0.65"/>
+    <!-- long diagonals (faint, depth) -->
+    <line x1="146" y1="152" x2="418" y2="338" stroke-width="2" opacity="0.3"/>
+    <line x1="378" y1="122" x2="176" y2="400" stroke-width="2" opacity="0.3"/>
+  </g>
+
+  <!-- nodes: halo + solid dot, varied sizes -->
+  <g fill="#ffffff">
+    <circle cx="236" cy="268" r="30" opacity="0.14"/>
+    <circle cx="146" cy="152" r="22" opacity="0.12"/>
+    <circle cx="378" cy="122" r="19" opacity="0.12"/>
+    <circle cx="418" cy="338" r="22" opacity="0.12"/>
+    <circle cx="176" cy="400" r="19" opacity="0.12"/>
+
+    <circle cx="236" cy="268" r="19"/>
+    <circle cx="146" cy="152" r="13"/>
+    <circle cx="378" cy="122" r="11"/>
+    <circle cx="418" cy="338" r="14"/>
+    <circle cx="176" cy="400" r="11"/>
+  </g>
+</svg>

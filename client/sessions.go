@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -14,7 +15,20 @@ import (
 )
 
 const sessionIdleTimeout = 5 * time.Minute
-const sessionEvictInterval = 2 * time.Minute
+const sessionEvictInterval = 15 * time.Second
+
+// gKeepaliveInterval / sessionStaleTimeout are set from keepalive_seconds at
+// startup (defaults: 10s / 45s). Both sides keepalive every interval, so an
+// ESTABLISHED session with no inbound for sessionStaleTimeout has a dead or
+// one-way path (blocked inbound, expired NAT mapping, rebooted peer, …).
+// Tearing it down promptly — instead of waiting out sessionIdleTimeout —
+// lets the recovery machinery (announce, PEX, coordinated punch, relay)
+// rebuild a working path within seconds on ANY kind of network, rather than
+// blackholing traffic for up to 5 minutes.
+var (
+	gKeepaliveInterval  = 10 * time.Second
+	sessionStaleTimeout = 45 * time.Second
+)
 
 // Retransmit / deadline knobs for the handshake state machines.
 //
@@ -101,11 +115,23 @@ type session struct {
 	recvBitmap  uint64
 	recvAny     bool
 
+	// decryptFails counts consecutive failed decrypts since the last
+	// successful one (see NoteDecryptFailure). Guarded by the table lock.
+	decryptFails int
+
 	// msg3Frame is the final handshake frame we sent as initiator. If the
 	// responder never received it (UDP loss) it keeps retransmitting msg2;
 	// we answer those retransmits by resending msg3 so the responder can
 	// complete. Nil on responder-side sessions.
 	msg3Frame []byte
+
+	// peerStatic is the remote peer's Noise static public key, learned during
+	// the handshake. It is the stable cryptographic identity of the peer
+	// (their overlay IP derives from it) and the key the admin revocation list
+	// is keyed on. createdAt/initiator are metadata surfaced to the dashboard.
+	peerStatic [32]byte
+	createdAt  time.Time
+	initiator  bool
 }
 
 // replayCheck returns true if a data packet with this nonce should be
@@ -220,22 +246,59 @@ func (t *SessionTable) evictStale() {
 	t.mu.Lock()
 	now := time.Now()
 	var lost []*net.UDPAddr
+	var lostKeys [][32]byte
 	for addr, s := range t.byAddr {
-		if now.Sub(s.lastSeen) > sessionIdleTimeout {
+		// Established sessions go stale FAST (no inbound for ~3 keepalive
+		// intervals = dead/one-way path); half-open handshake state keeps the
+		// long idle timeout (it has its own retransmit deadlines).
+		limit := sessionIdleTimeout
+		if s.established {
+			limit = sessionStaleTimeout
+		}
+		if now.Sub(s.lastSeen) > limit {
 			delete(t.byAddr, addr)
 			if s.established && s.addr != nil {
 				lost = append(lost, s.addr)
+				lostKeys = append(lostKeys, s.peerStatic)
+				log.Printf("[liveness] session %s silent for %v — tearing down to force re-punch/relay",
+					addr, now.Sub(s.lastSeen).Round(time.Second))
 			}
 		}
 	}
 	cb := t.onSessionLost
 	t.mu.Unlock()
 
-	if cb != nil {
-		for _, addr := range lost {
+	for i, addr := range lost {
+		// Drop the overlay-IP mapping too, so traffic for that peer falls back
+		// to the relay/discovery path immediately instead of blackholing into
+		// the dead endpoint.
+		ipLearning.ForgetAddr(addr)
+		t.dropPeerCryptoIfNoRoute(lostKeys[i])
+		if cb != nil {
 			go cb(addr)
 		}
 	}
+}
+
+// dropPeerCryptoIfNoRoute clears the per-peer PQ state (and cached PQ-status
+// flag) once the LAST established route to that peer identity is gone. With
+// multi-route peers a single torn-down address may leave a live backup route,
+// in which case the negotiated ML-KEM layer must be KEPT; only when nothing
+// remains do we forget it so the next reconnect renegotiates cleanly.
+func (t *SessionTable) dropPeerCryptoIfNoRoute(key [32]byte) {
+	if key == ([32]byte{}) {
+		return
+	}
+	t.mu.RLock()
+	for _, s := range t.byAddr {
+		if s.established && s.peerStatic == key {
+			t.mu.RUnlock()
+			return // a route still exists — keep the PQ layer
+		}
+	}
+	t.mu.RUnlock()
+	pqForget(key)
+	forgetPeerPQStatus(key)
 }
 
 func (t *SessionTable) Close() {
@@ -260,8 +323,16 @@ func (t *SessionTable) GetByAddr(addr *net.UDPAddr) *session {
 
 func (t *SessionTable) Evict(addr *net.UDPAddr) {
 	t.mu.Lock()
+	var key [32]byte
+	if s := t.byAddr[addr.String()]; s != nil {
+		key = s.peerStatic
+	}
 	delete(t.byAddr, addr.String())
 	t.mu.Unlock()
+	// Clear negotiated PQ state if this was the peer's last route (wake/resume
+	// evicts every session — the reconnect must renegotiate the ML-KEM layer,
+	// not reuse a key the peer may have discarded when it slept).
+	t.dropPeerCryptoIfNoRoute(key)
 }
 
 // RecordFailure / RecordSuccess / ShouldSkip implement a soft back-off.
@@ -307,9 +378,73 @@ func (t *SessionTable) ShouldSkip(addr *net.UDPAddr) bool {
 
 func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	s.lastSeen = time.Now()
-	t.byAddr[addr.String()] = s
+	key := addr.String()
+	t.byAddr[key] = s
+
+	// MULTI-ROUTE PEERS. Discovery is multi-path (tracker, PEX, LAN beacon),
+	// so the same peer can legitimately hold sessions at SEVERAL addresses —
+	// its LAN address and its public/WAN address. These are ROUTES to one
+	// device, and both are KEPT: the extra route is a warm standby (its
+	// keepalives hold the NAT pinhole open), so when the primary path dies —
+	// a phone walking out of Wi-Fi range, a laptop switching networks — the
+	// stale-timeout eviction ForgetAddr's the primary and the backup's next
+	// keepalive takes over routing within seconds. Nothing is deleted here,
+	// so the two ends can never disagree about which keys are live (deleting
+	// is what caused the "cipher: message authentication failed" desync
+	// storms). The UI collapses same-key routes and shows only the primary
+	// (see Snapshot).
+	//
+	// ROUTING PREFERENCE: LAN beats WAN. If this NEW session is a LAN path
+	// (or the peer has no LAN path), it becomes the primary route: existing
+	// mappings at the older addresses are repointed to it. If the new
+	// session is a WAN path while a LAN session exists, routing stays on the
+	// LAN session and the new one just sits as the backup (sticky Learn in
+	// ip_learning.go keeps its keepalives from stealing the route).
+	//
+	// LOCK ORDER: collect addresses under t.mu, but touch ipLearning only
+	// AFTER releasing it. ipLearning.Learn takes its own lock and then reads
+	// this table — calling RemapAddr while holding t.mu is the classic AB-BA
+	// deadlock, which froze the receive loop and hung the control API.
+	var others []*net.UDPAddr
+	takeover := true
+	var zeroKey [32]byte
+	if s.peerStatic != zeroKey {
+		newPrivate := isPrivateUDPAddr(addr)
+		for k, old := range t.byAddr {
+			if k == key || !old.established || old.peerStatic != s.peerStatic {
+				continue
+			}
+			if old.addr != nil {
+				others = append(others, old.addr)
+			}
+			if isPrivateUDPAddr(old.addr) && !newPrivate {
+				takeover = false // existing LAN route stays primary
+			}
+		}
+	}
+	t.mu.Unlock()
+	if len(others) == 0 {
+		return
+	}
+	if !takeover {
+		log.Printf("[session] LAN route stays primary for this peer; new %s kept as backup route (roaming failover)", key)
+		return
+	}
+	for _, oldAddr := range others {
+		ipLearning.RemapAddr(oldAddr, addr)
+	}
+	log.Printf("[session] %s is now the primary route for this peer (%d backup route(s) kept for roaming failover)", key, len(others))
+}
+
+// isPrivateUDPAddr reports whether a terminates at an RFC1918/link-local/
+// loopback address — i.e. a directly-routable LAN path rather than a
+// router-hairpin or internet path.
+func isPrivateUDPAddr(a *net.UDPAddr) bool {
+	if a == nil || a.IP == nil {
+		return false
+	}
+	return a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback()
 }
 
 func (t *SessionTable) EstablishedAddrs() []*net.UDPAddr {
@@ -335,8 +470,98 @@ func (t *SessionTable) TouchLastSeen(addr *net.UDPAddr) {
 	t.mu.Lock()
 	if s := t.byAddr[addr.String()]; s != nil {
 		s.lastSeen = time.Now()
+		s.decryptFails = 0
 	}
 	t.mu.Unlock()
+}
+
+// NoteDecryptFailure records a failed decrypt on the established session for
+// addr. A failed decrypt is normally garbage or spoofing and must NOT tear the
+// session down (that would let third parties kill tunnels). But a session
+// where EVERYTHING fails and NOTHING has decrypted for multiple keepalive
+// intervals is not being spoofed — it's key desync: the peer re-keyed onto a
+// different session (e.g. an older build holding duplicate sessions to us).
+// Waiting out the full stale timer blackholes traffic for up to a minute;
+// tear down early so both sides re-handshake and converge. A live peer's
+// keepalives decrypt fine and reset the counter every interval, so a spoof
+// flood can never trip this (lastSeen stays fresh).
+func (t *SessionTable) NoteDecryptFailure(addr *net.UDPAddr) {
+	key := addr.String()
+	t.mu.Lock()
+	s := t.byAddr[key]
+	if s == nil || !s.established {
+		t.mu.Unlock()
+		return
+	}
+	s.decryptFails++
+	quiet := time.Since(s.lastSeen)
+	if s.decryptFails < 10 || quiet < 2*gKeepaliveInterval+2*time.Second {
+		t.mu.Unlock()
+		return
+	}
+	fails := s.decryptFails
+	peerKey := s.peerStatic
+	cb := t.onSessionLost
+	delete(t.byAddr, key)
+	t.mu.Unlock()
+	log.Printf("[liveness] session %s: %d consecutive decrypt failures, no valid traffic for %v — key desync, tearing down to re-handshake",
+		key, fails, quiet.Round(time.Second))
+	ipLearning.ForgetAddr(addr)
+	// Key desync often means the peer restarted and lost its ML-KEM state;
+	// clear ours (if no route remains) so the reconnect re-offers PQ instead
+	// of both sides assuming a dead layer is still up.
+	t.dropPeerCryptoIfNoRoute(peerKey)
+	if cb != nil {
+		go cb(addr)
+	}
+}
+
+// logDecryptError logs a failed decrypt, damped to a few lines per peer per
+// 30-second window. During a mixed-build transition an old-build peer holding
+// a superseded duplicate session produces one failed keepalive every interval
+// — harmless (traffic rides the live session), but at packet rate it floods
+// the log and looks like a catastrophe. Failures still COUNT toward the
+// key-desync teardown (NoteDecryptFailure); only the logging is damped.
+type decryptErrState struct {
+	windowStart time.Time
+	logged      int
+	suppressed  int
+}
+
+var (
+	decryptErrMu sync.Mutex
+	decryptErrs  = map[string]*decryptErrState{}
+)
+
+func logDecryptError(addr string, err error) {
+	decryptErrMu.Lock()
+	st := decryptErrs[addr]
+	if st == nil {
+		st = &decryptErrState{}
+		decryptErrs[addr] = st
+	}
+	now := time.Now()
+	if now.Sub(st.windowStart) > 30*time.Second {
+		suppressed := st.suppressed
+		st.windowStart = now
+		st.logged = 1
+		st.suppressed = 0
+		decryptErrMu.Unlock()
+		if suppressed > 0 {
+			log.Printf("decrypt/decode error from %s: %v (+%d similar suppressed over the last 30s — likely a peer on an old build still sending on a superseded session)", addr, err, suppressed)
+		} else {
+			log.Printf("decrypt/decode error from %s: %v", addr, err)
+		}
+		return
+	}
+	if st.logged < 3 {
+		st.logged++
+		decryptErrMu.Unlock()
+		log.Printf("decrypt/decode error from %s: %v", addr, err)
+		return
+	}
+	st.suppressed++
+	decryptErrMu.Unlock()
 }
 
 func derivePrologue(psk []byte) []byte {
@@ -345,6 +570,44 @@ func derivePrologue(psk []byte) []byte {
 	}
 	h := sha256.Sum256(append([]byte("OVLY-PSK-1:"), psk...))
 	return h[:]
+}
+
+// pskAuthKey derives the 32-byte pre-shared key that is mixed into the Noise
+// KEY SCHEDULE (Noise XXpsk0). Unlike the prologue (which only binds the
+// transcript hash), this makes the session key depend on the symmetric PSK, so
+// authentication and confidentiality survive a quantum computer that breaks the
+// X25519 DH: without the PSK an attacker cannot derive the key or impersonate a
+// member, even with quantum. Distinct label from the prologue.
+func pskAuthKey(psk []byte) []byte {
+	h := sha256.Sum256(append([]byte("OVLY-PSK-AUTH-1:"), psk...))
+	return h[:]
+}
+
+// pqAuth enables quantum-resistant handshake authentication by mixing the PSK
+// into the Noise key schedule (XXpsk0). OFF by default: it changes the handshake
+// wire format, so EVERY node must have the same setting, and a node with it off
+// is compatible with the classic (prologue-only) handshake. Turn it on network-
+// wide (pq_auth: true / PQ_AUTH=1) only once the whole fleet runs a build that
+// has it. Set from config in main().
+var pqAuth bool
+
+// noiseHandshakeConfig builds the handshake config. With pqAuth on and a PSK set,
+// the PSK is placed at position 0 (XXpsk0) so it authenticates the whole
+// handshake in a quantum-resistant way. Otherwise the PSK only binds the
+// transcript via the prologue (the classic, widely-compatible handshake).
+func noiseHandshakeConfig(cs noise.CipherSuite, initiator bool, kp keypair, psk []byte) noise.Config {
+	cfg := noise.Config{
+		CipherSuite:   cs,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     initiator,
+		StaticKeypair: noise.DHKey{Private: kp.priv[:], Public: kp.pub[:]},
+		Prologue:      derivePrologue(psk),
+	}
+	if pqAuth && len(psk) > 0 {
+		cfg.PresharedKey = pskAuthKey(psk)
+		cfg.PresharedKeyPlacement = 0 // XXpsk0
+	}
+	return cfg
 }
 
 func peerIDFromSession(kp keypair) string {
@@ -440,14 +703,8 @@ func (t *SessionTable) EnsureSession(addr *net.UDPAddr, kp keypair, psk []byte) 
 		t.mu.Unlock()
 	}
 
-	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashBLAKE2b)
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   cs,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     true,
-		StaticKeypair: noise.DHKey{Private: kp.priv[:], Public: kp.pub[:]},
-		Prologue:      derivePrologue(psk),
-	})
+	cs := noise.NewCipherSuite(noise.DH25519, noiseCipher, noise.HashBLAKE2b)
+	hs, err := noise.NewHandshakeState(noiseHandshakeConfig(cs, true, kp, psk))
 	if err != nil {
 		cleanupPending()
 		return nil, err
@@ -483,7 +740,7 @@ waitForR:
 	for {
 		if !time.Now().Before(deadline) {
 			cleanupPending()
-			return nil, errors.New("handshake timeout reading R")
+			return nil, errors.New("no handshake reply (peer unreachable: NAT/firewall blocking the direct path, or peer offline — the mesh will relay if a path exists)")
 		}
 		select {
 		case payload = <-pending:
@@ -505,7 +762,22 @@ waitForR:
 
 	if _, _, _, err = hs.ReadMessage(nil, payload); err != nil {
 		cleanupPending()
-		return nil, err
+		// We got a reply but couldn't authenticate it: the two sides derived
+		// different handshake keys. This is a CONFIG/BUILD mismatch, not NAT —
+		// every node must run the SAME build and share the same psk + cipher.
+		// It's the classic symptom of a partial upgrade (some nodes rebuilt, some
+		// not) or a psk/cipher that differs between nodes.
+		return nil, fmt.Errorf("handshake crypto mismatch (check every node runs the same build and the same psk + cipher): %w", err)
+	}
+
+	// Capture the responder's static public key (learned from msg2) and refuse
+	// to finish the handshake with a peer an operator has revoked via the admin
+	// dashboard.
+	var peerStatic [32]byte
+	copy(peerStatic[:], hs.PeerStatic())
+	if revoked.isRevoked(peerStatic) || revocations.isRevoked(peerStatic) {
+		cleanupPending()
+		return nil, errors.New("peer is revoked")
 	}
 
 	// msg3: Write S — final message; produces cipher states cs1, cs2.
@@ -530,6 +802,9 @@ waitForR:
 		established: true,
 		lastSeen:    time.Now(),
 		msg3Frame:   msg3Frame,
+		peerStatic:  peerStatic,
+		createdAt:   time.Now(),
+		initiator:   true,
 	})
 	return t.GetByAddr(addr), nil
 }
@@ -555,12 +830,17 @@ func (t *SessionTable) Deliver(raddr *net.UDPAddr, typ byte, body []byte, kp key
 	t.mu.Lock()
 	s := t.byAddr[key]
 
-	// Peer restarted: a fresh msg1 from an established peer drops our
-	// stale session and starts over as the responder.
-	if s != nil && s.Established() && typ == PktMsg1 {
-		delete(t.byAddr, key)
-		s = nil
-	}
+	// Peer restarted: a fresh msg1 from an established peer starts a new
+	// responder handshake. Crucially, the EXISTING session is KEPT until the
+	// new handshake authenticates (handleResponder replaces it atomically
+	// via set() once msg3 verifies). The old behavior deleted the session
+	// here — before the sender had proven anything — so any stray msg1 (a
+	// peer's redundant hole-punch toward our tracker-advertised endpoint,
+	// retransmits from a simultaneous-init race, or a spoofed source
+	// address) instantly blackholed a WORKING tunnel until a re-handshake
+	// completed, which showed up as periodic multi-second connection drops.
+	// Pending handshakes live in their own map, so the responder handshake
+	// below proceeds fine alongside the live session.
 
 	// Established session + non-msg1 handshake byte. A msg2 here means the
 	// responder never saw our msg3 (lost in flight) and is retransmitting;
@@ -676,9 +956,29 @@ func (t *SessionTable) Deliver(raddr *net.UDPAddr, typ byte, body []byte, kp key
 			t.mu.Unlock()
 			return true
 		}
-		if p.firstMsg1 == nil {
-			p.firstMsg1 = append([]byte(nil), body...)
+		if p.firstMsg1 != nil {
+			// A DIFFERENT msg1 while a responder handshake is mid-flight: the
+			// initiator gave up on its previous attempt and restarted with a
+			// fresh ephemeral. Feeding the new msg1 into the OLD handshake (or
+			// answering it with the old msg2) makes the initiator fail with a
+			// misleading "handshake crypto mismatch" and back off for up to
+			// 60s — the "phone takes forever to find the mac" symptom.
+			// Replace the stale pending with a fresh responder handshake; the
+			// old goroutine notices it was superseded and exits.
+			np := &pendingHandshake{
+				peer:             raddr,
+				msgs:             make(chan []byte, 8),
+				isResponder:      true,
+				responderSpawned: true,
+				firstMsg1:        append([]byte(nil), body...),
+			}
+			t.pendingByAddr[key] = np
+			np.msgs <- append([]byte(nil), body...)
+			t.mu.Unlock()
+			go handleResponder(t.udpConn, raddr, np, kp, psk)
+			return true
 		}
+		p.firstMsg1 = append([]byte(nil), body...)
 	}
 	t.mu.Unlock()
 
@@ -716,14 +1016,8 @@ func handleResponder(conn *net.UDPConn, addr *net.UDPAddr, pending *pendingHands
 		}
 		GlobalSessions.mu.Unlock()
 	}
-	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashBLAKE2b)
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   cs,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     false,
-		StaticKeypair: noise.DHKey{Private: kp.priv[:], Public: kp.pub[:]},
-		Prologue:      derivePrologue(psk),
-	})
+	cs := noise.NewCipherSuite(noise.DH25519, noiseCipher, noise.HashBLAKE2b)
+	hs, err := noise.NewHandshakeState(noiseHandshakeConfig(cs, false, kp, psk))
 	if err != nil {
 		cleanupPending()
 		return
@@ -776,6 +1070,16 @@ waitForS:
 			}
 			break waitForS
 		case <-retransmit.C:
+			// Superseded by a fresh responder handshake (the initiator
+			// restarted)? Then STOP retransmitting our stale msg2 — the
+			// initiator would try to read it with its new handshake state
+			// and fail with a bogus "crypto mismatch".
+			GlobalSessions.mu.RLock()
+			cur := GlobalSessions.pendingByAddr[key]
+			GlobalSessions.mu.RUnlock()
+			if cur != pending {
+				return
+			}
 			_, _ = conn.WriteToUDP(msg2Frame, addr)
 		}
 	}
@@ -786,6 +1090,16 @@ waitForS:
 		return
 	}
 
+	// Learn the initiator's static key (from msg3) and drop the handshake if
+	// this peer has been revoked from the admin dashboard.
+	var peerStatic [32]byte
+	copy(peerStatic[:], hs.PeerStatic())
+	if revoked.isRevoked(peerStatic) || revocations.isRevoked(peerStatic) {
+		cleanupPending()
+		log.Printf("rejected revoked peer %s", addr)
+		return
+	}
+
 	// Responder: send with cs2, recv with cs1.
 	GlobalSessions.set(addr, &session{
 		addr:        addr,
@@ -793,8 +1107,17 @@ waitForS:
 		recv:        cs1,
 		established: true,
 		lastSeen:    time.Now(),
+		peerStatic:  peerStatic,
+		createdAt:   time.Now(),
+		initiator:   false,
 	})
 	log.Printf("session established with %s (responder)", addr)
+
+	// Announce our overlay IP immediately so the peer can route to us (and
+	// act as our relay) without waiting for the first keepalive.
+	if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && myOverlayIP != "" {
+		_ = sendPacket(conn, addr, s, buildAddrAnnounce())
+	}
 
 	cleanupPending()
 }

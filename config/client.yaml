@@ -2,9 +2,9 @@
 # (static overlay IP) go in /etc/overlay-node.env on the machine, or in
 # tun.address_cidr if you maintain per-node copies of this file.
 
-network_name: "apgo-cc0b983a63e9"
+network_name: "apgo-81f36xddoijoj"
 node_private_key: "/config/node.key"
-psk: "base64:ObnkmNYp7URqq58tBfxHtxubtIT91iJZ4EnAaz6iYCw="
+psk: "base64:Nc3c3VvkvY94TaYM52N7qud9BAzla/BwjUwFp/o0zYx="
 
 # The overlay subnet. Each node derives its own stable IP inside this range
 # from its public key — no per-node addressing needed. Override at deploy
@@ -17,15 +17,60 @@ tun:
   # address_cidr: "10.28.55.2/24"   # optional: pin this node's IP manually
   #                                  # (OVERLAY_ADDRESS env overrides this)
 
+# IPv6 dual-stack transport. ON by default. Wherever a node has a routable IPv6
+# address (many home ISPs and phone hotspots), peers connect directly over v6
+# with NO NAT and NO port-forward — which is what fixes CGNAT/hotspot
+# reachability. The overlay itself stays IPv4 (the 10.x addresses above), so
+# nothing changes for you; where v6 isn't available it transparently falls back
+# to the v4 path (NAT-PMP + relay). Set false to force IPv4-only transport, or
+# toggle it from any admin panel's settings. Also settable via the IPV6 env var.
+ipv6: true
+
 # Fixed listen port so the NAT mapping (and the port we announce) stays
 # stable across restarts. Same port on every machine is fine — they're
 # different hosts.
 udp_listen_port: 6969
 
+# NAT keepalive interval (seconds). Default 10 — short enough to survive
+# aggressive consumer/carrier NATs whose UDP mappings expire in 15-30s.
+# Sessions self-heal (tear down + re-punch) after ~3 missed intervals.
+keepalive_seconds: 10
+
 stun_servers:
   - "stun:stun.l.google.com:19302"
   - "stun:stun1.l.google.com:19302"
   - "stun:global.stun.twilio.com:3478"
+
+# Transport cipher: "chacha" (default, fast everywhere) or "aesgcm"
+# (AES-NI hardware acceleration on x86 — faster there). Every node in t0he
+# network MUST use the same value or handshakes will fail.
+cipher: "aesgcm"
+
+# Post-quantum hybrid layer (ML-KEM-768 over the classical tunnel). ON by default
+# — the whole network comes up quantum-protected. Set false to disable on a node
+# (or toggle network-wide from any admin panel). Adds a little overhead.
+post_quantum: true
+
+# Quantum-resistant handshake authentication (PSK mixed into the Noise key
+# schedule, XXpsk0). ON by default. This changes the handshake wire format, so
+# EVERY node must run a build that supports it — keep the whole fleet on the same
+# version. Set false only if you must interop with a very old build.
+pq_auth: true
+
+# Symmetric-NAT port prediction. ON — helps nodes behind symmetric/CGNAT
+# (e.g. a phone hotspot) hole-punch by probing the NAT's port-allocation
+# stride and spraying predicted ports during the coordinated punch. Can also
+# be toggled with the PORT_PREDICTION env var.
+port_prediction: true
+
+# Anchor / bootstrap peers. REQUIRED for connectivity when every node is behind
+# NAT (home router + phone CGNAT can't reach each other directly). Make ONE node
+# publicly reachable — port-forward UDP 6969 on your home router to a home box,
+# OR run a client on a VPS with a public IP — then put its PUBLIC endpoint here
+# on EVERY node (Mac, phone, all Linux hosts). Nodes dial it outbound (works even
+# through CGNAT), get one session, and relay + IP-learning heal the rest.
+# static_peers:
+#   - "YOUR.ANCHOR.PUBLIC.IP:6969"
 
 announce_only_on_ip_change: false
 tracker_list_file: "/config/trackers.txt"

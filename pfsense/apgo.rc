@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# APGO overlay client — FreeBSD/pfSense rc.d service.
+# Install as /usr/local/etc/rc.d/apgo.sh (pfSense only runs rc.d scripts
+# ending in .sh at boot), mode 0755.
+#
+# Enable + configure in /etc/rc.conf.local (created by install-pfsense.sh):
+#   apgo_enable="YES"
+#
+# Config lives in /usr/local/etc/apgo/client.yaml (same YAML the Docker
+# container and desktop apps use). Managed state (node key, provisions,
+# trackers) lives next to it — one node identity per router.
+
+# PROVIDE: apgo
+# REQUIRE: NETWORKING FILESYSTEMS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="apgo"
+rcvar="apgo_enable"
+
+: "${apgo_enable:=NO}"
+: "${apgo_config:=/usr/local/etc/apgo/client.yaml}"
+: "${apgo_dir:=/usr/local/etc/apgo}"
+: "${apgo_log:=/var/log/apgo.log}"
+
+command="/usr/sbin/daemon"
+pidfile="/var/run/apgo.pid"
+apgo_bin="/usr/local/bin/overlay-client"
+
+start_precmd="apgo_precmd"
+command_args="-r -P ${pidfile} -o ${apgo_log} env \
+CLIENT_CONFIG=${apgo_config} \
+ADMIN_PUBKEY_FILE=${apgo_dir}/admin-pubkey \
+PROVISIONS_FILE=${apgo_dir}/provisions.json \
+REVOCATIONS_FILE=${apgo_dir}/revocations.json \
+SEALED_ADMIN_KEY_FILE=${apgo_dir}/admin-key-sealed.json \
+APPROVALS_FILE=${apgo_dir}/approvals.json \
+NETCONFIG_FILE=${apgo_dir}/netconfig.json \
+TRACKERS_FILE=${apgo_dir}/trackers.txt \
+POLICY_FILE=${apgo_dir}/policy.json \
+${apgo_bin}"
+
+apgo_precmd()
+{
+    if [ ! -x "${apgo_bin}" ]; then
+        echo "apgo: ${apgo_bin} missing — run pfsense/install-pfsense.sh" >&2
+        return 1
+    fi
+    if [ ! -f "${apgo_config}" ]; then
+        echo "apgo: ${apgo_config} missing — copy client.yaml.sample and edit it" >&2
+        return 1
+    fi
+    mkdir -p "${apgo_dir}"
+}
+
+load_rc_config $name
+run_rc_command "$1"

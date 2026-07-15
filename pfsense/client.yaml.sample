@@ -1,0 +1,42 @@
+# APGO overlay client config for pfSense — /usr/local/etc/apgo/client.yaml
+# Same format as the Docker container's client.yaml. Minimum: network_name,
+# psk, overlay_cidr. This router gets a stable overlay IP derived from its
+# key (or pin one with tun.address_cidr).
+
+network_name: "CHANGE-ME"
+psk: "base64:CHANGE-ME"
+friendly_name: "pfsense-router"
+
+node_private_key: "/usr/local/etc/apgo/node.key"
+
+overlay_cidr: "10.28.55.0/24"
+
+tun:
+  name: "ovl0"
+  mtu: 1280
+  # address_cidr: "10.28.55.1/24"   # optional: pin this router's overlay IP
+
+udp_listen_port: 6969
+keepalive_seconds: 10
+ipv6: true
+
+# Post-quantum hybrid layer — keep identical on every node in the network.
+post_quantum: true
+pq_auth: true
+
+# Transport cipher: "chacha" (default) or "aesgcm" (faster with AES-NI).
+# Every node MUST use the same value.
+cipher: "chacha"
+
+stun_servers:
+  - "stun:stun.l.google.com:19302"
+  - "stun:stun1.l.google.com:19302"
+
+# Optional HTTPS rendezvous servers for networks that block BitTorrent:
+# rendezvous_servers:
+#   - "https://rendezvous.example.com"
+
+# Make this router a full-VPN exit for your other devices? FreeBSD NAT isn't
+# auto-configured (that's Linux-only) — add an Outbound NAT rule for the
+# overlay subnet in the pfSense GUI instead; see pfsense/README.md.
+# exit_node: true
