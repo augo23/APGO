@@ -49,13 +49,13 @@ flowchart TB
 
     subgraph NodeA["Node A (behind NAT)"]
         A1["overlay-client container<br/>(network_mode: host)"]
-        A2["TUN ovl0<br/>10.28.55.x/24"]
+        A2["TUN ovl0<br/>10.22.55.x/24"]
         A1 --- A2
     end
 
     subgraph NodeB["Node B (behind NAT)"]
         B1["overlay-client container<br/>(network_mode: host)"]
-        B2["TUN ovl0<br/>10.28.55.y/24"]
+        B2["TUN ovl0<br/>10.22.55.y/24"]
         B1 --- B2
     end
 
@@ -120,7 +120,7 @@ On the **first** run it writes a `.env` with a freshly generated `PSK` and a ran
 ```
 NETWORK_NAME=apgo-xxxxxxxx     # same on every node — defines the swarm
 PSK=base64:...                 # same on every node — the membership secret
-OVERLAY_CIDR=10.28.55.0/24     # private subnet for the overlay
+OVERLAY_CIDR=10.22.55.0/24     # private subnet for the overlay
 FRIENDLY_NAME=<hostname>
 EXIT_NODE=                      # set to 1 to make this host an internet exit
 RENDEZVOUS_SERVERS=            # optional HTTPS discovery (BitTorrent-blocked nets)
@@ -136,7 +136,7 @@ You must also populate `config/trackers.txt` with public trackers (one per line;
 
 Every node picks the best path to its peers on its own, in this order:
 
-- **IPv6 (best).** The transport binds dual-stack. Where a node has a routable IPv6 address (many home ISPs and phone hotspots), peers connect **directly over v6 with no NAT** — this is what fixes CGNAT/hotspot reachability. The overlay itself stays IPv4 (`10.28.55.x`), so nothing changes for you.
+- **IPv6 (best).** The transport binds dual-stack. Where a node has a routable IPv6 address (many home ISPs and phone hotspots), peers connect **directly over v6 with no NAT** — this is what fixes CGNAT/hotspot reachability. The overlay itself stays IPv4 (`10.22.55.x`), so nothing changes for you.
 - **NAT-PMP / PCP auto port-mapping.** On IPv4, a home node asks its own router to open its listen port automatically — no port-forward, no static IP. Watch for `[portmap] SUCCESS` in the log.
 - **Symmetric-NAT port prediction** (on by default) + **STUN hole punching**.
 - **Relay through a connected peer** as the final fallback.
@@ -147,7 +147,7 @@ The only case that can't self-heal is when *every* node is behind NAT with no IP
 
 Set machine-local values in `.env` (or the environment). Common ones:
 
-- `OVERLAY_ADDRESS=10.28.55.2` — pin this node's overlay IP (otherwise auto-derived from its key).
+- `OVERLAY_ADDRESS=10.22.55.2` — pin this node's overlay IP (otherwise auto-derived from its key).
 - `EXIT_NODE=1` — make this host a full-VPN exit / outproxy.
 - `POST_QUANTUM=0`, `PQ_AUTH=0`, `PORT_PREDICTION=0` — opt out of a default (keep the fleet consistent).
 - `RENDEZVOUS_SERVERS=https://rv.example.com` — HTTPS discovery for BitTorrent-blocked networks.
@@ -159,7 +159,7 @@ For raw-config deployments, `config/client.yaml` exposes the same settings plus 
 ```bash
 docker logs -f overlay-client      # or: podman logs -f overlay-client
 # watch for: TUN address, matching info_hash across nodes, handshakes, [portmap]
-ping 10.28.55.X                    # the other node's overlay IP
+ping 10.22.55.X                    # the other node's overlay IP
 ```
 
 ### Start over / wipe a node completely
@@ -231,9 +231,9 @@ it as a full VPN: route *all* your internet traffic out through one of your node
     friendly name, base64 public key, or key-fingerprint prefix. All internet
     traffic egresses **only** there; if it goes offline, traffic pauses (it is
     never silently re-routed to another exit). Set it in the apps' *Exit node*
-    field, or `exit_peer: "10.28.55.7"` / `EXIT_PEER=…` on the raw client. On a
+    field, or `exit_peer: "10.22.55.7"` / `EXIT_PEER=…` on the raw client. On a
     running node you can also switch live via the control socket:
-    `POST /api/exit-pin {"pin":"10.28.55.7"}` (empty pin = back to fastest),
+    `POST /api/exit-pin {"pin":"10.22.55.7"}` (empty pin = back to fastest),
     and list advertised exits with `GET /api/exits`.
 
 The overlay is IPv4: on a network with native IPv6, v6 traffic keeps using the
@@ -307,7 +307,7 @@ This pairs with the PSK/name rotation above: revoke or simply don't approve a de
 
 Enter the admin password only over your encrypted tunnel or TLS — a wrong password simply fails to decrypt. Security trade-off: because the encrypted key now lives on every node, anyone who can read a node's disk **and** knows or brute-forces the password could sign — so use a strong admin password (it's protected by PBKDF2 + AES-256-GCM).
 
-Because you're exposing it on a node port, prefer to reach it over the overlay itself, a trusted LAN, or an SSH tunnel — or set `ADMIN_TLS_CERT` / `ADMIN_TLS_KEY` (paths inside the container) to serve HTTPS. The dashboard is only as private as the network you expose port 8088 on. If `ADMIN_PASSWORD` is unset the admin container refuses to start (the client is unaffected).
+Because you're exposing it on a node port, prefer to reach it over the overlay itself, a trusted LAN, or an SSH tunnel — or set `ADMIN_TLS_CERT` / `ADMIN_TLS_KEY` (paths inside the container) to serve HTTPS. The dashboard is only as private as the network you expose port 8088 on. If `ADMIN_PASSWORD` is unset, the first visit to the dashboard shows a create-login page (username + password, entered twice) — until then, whoever reaches port 8088 first claims the panel, so bring it up on a trusted network.
 
 ## Encryption & post-quantum
 
@@ -360,12 +360,14 @@ Also confirm no service unintentionally binds `0.0.0.0` on the host — `network
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
 
-## Donations
-If you found this software helpful please support by buying me a cup of coffee, or a beer, or two/three. These donations fund the iOS app as there is no free way to get an app on the App Store.
+## Support This Project
+If you found this software helpful please support by buying me a cup of coffee, or a beer, or two/three. These gifts fund the iOS app as there is no free way to get an app on the App Store.
 
-YOU DO NOT HAVE TO DONATE TO ENJOY!!! 
+YOU NEVER HAVE TO GIVE ANYTHING TO ENJOY THIS SOFTWARE!!!
 
-Anything is appreciated!  
+Anything is appreciated!
+
+**Please note:** APGO is not a charity or a registered non-profit, and any support you send is a personal gift to the project — not a tax-deductible donation. It cannot be written off on your taxes, and no goods or services are provided in exchange.
 
 CashAPP: $APGOverlay
 
