@@ -361,7 +361,7 @@ Also confirm no service unintentionally binds `0.0.0.0` on the host — `network
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
 
 ## Support This Project
-If you found this software helpful please support by buying me a cup of coffee, or a beer, or two/three. These gifts fund the iOS app as there is no free way to get an app on the App Store.
+If you found this software helpful please support by buying me a cup of coffee, or a beer. These gifts help fund the iOS app and all hosting costs etc..
 
 YOU NEVER HAVE TO GIVE ANYTHING TO ENJOY THIS SOFTWARE!!!
 
