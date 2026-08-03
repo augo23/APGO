@@ -370,5 +370,6 @@ Anything is appreciated!
 **Please note:** APGO is not a charity or a registered non-profit, and any support you send is a personal gift to the project — not a tax-deductible donation. It cannot be written off on your taxes, and no goods or services are provided in exchange.
 
 CashAPP: $APGOverlay
+Venmo: https://www.venmo.com/u/APGOverlay
 
 Monero : 463y7FwfniMAsR2a3hQAQCh4FVuv2bKU86yFBj1SGUmkdgieFi2U4qaSuyyJNfgqEHd7gciN8YfnuGES3dEb1uimLnaQSTr
