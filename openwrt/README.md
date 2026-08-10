@@ -85,5 +85,5 @@ overlay IP on `ovl0`. The node key and managed state live in `/etc/apgo/`
 `exit_node: true` NAT setup in-process uses iptables; on modern
 (nftables-based) OpenWrt either install `iptables-nft`, or add the
 masquerade yourself: enable `masq` on the `wan` zone for the overlay subnet
-(`uci set firewall.@zone[1].masq_src='10.28.55.0/24'` style) and forward
+(`uci set firewall.@zone[1].masq_src='10.22.55.0/24'` style) and forward
 `apgo` → `wan`.

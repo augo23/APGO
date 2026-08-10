@@ -46,6 +46,10 @@ var (
 	// exitRepick nudges the selection loop to re-probe + re-pick immediately
 	// (e.g. after the pin is changed at runtime via the control API).
 	exitRepick = make(chan struct{}, 1)
+
+	// exitNATErr records WHY exit-node mode was requested but disabled
+	// (setupExitNAT failure), for display in the dashboards. "" = no failure.
+	exitNATErr string
 )
 
 type exitInfo struct {
@@ -68,8 +72,12 @@ func initExit(cfg *ClientConfig) {
 			// Do NOT keep advertising: a node that announces 'E' but cannot
 			// actually forward makes every full-VPN client that selects it
 			// lose ALL internet ("connected to no internet"). Better to be
-			// no exit than a black hole.
+			// no exit than a black hole. The reason is kept for /api/info so
+			// the dashboards can SHOW it — this failure used to be a single
+			// log line nobody saw, which made "no green E anywhere" look
+			// like a mesh bug instead of a local NAT problem.
 			amExit = false
+			exitNATErr = err.Error()
 			log.Printf("[exit] exit-node mode DISABLED — could not enable internet forwarding (NAT): %v", err)
 		} else {
 			log.Printf("[exit] exit-node mode ON — forwarding internet traffic for overlay clients")
@@ -259,6 +267,17 @@ func exitSelectionLoop() {
 	pick := func() {
 		exitMu.Lock()
 		defer exitMu.Unlock()
+		// Forget exits that stopped advertising long ago (node left the network
+		// or stopped being an exit) so the map stays bounded and a dead exit
+		// can never linger in the candidate list indefinitely.
+		for k, e := range exitCandidates {
+			if time.Since(e.lastSeen) > 30*time.Minute {
+				if selectedExit == e {
+					selectedExit = nil
+				}
+				delete(exitCandidates, k)
+			}
+		}
 		pin := exitPin
 		var best, pinned *exitInfo
 		for _, e := range exitCandidates {

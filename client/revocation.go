@@ -100,12 +100,13 @@ func adoptSeededAdminPub(b64, source string) {
 // buildAdminSeed returns an "OVLYCTL1P<base64 pubkey>" control payload that
 // advertises this node's trusted admin key to peers, or nil if there is none.
 func buildAdminSeed() []byte {
-	if !adminKeySet() {
+	pub := adminPubBytes()
+	if pub == nil {
 		return nil
 	}
 	out := append([]byte(nil), ctlMagic...)
 	out = append(out, 'P')
-	return append(out, []byte(base64.StdEncoding.EncodeToString(adminPub))...)
+	return append(out, []byte(base64.StdEncoding.EncodeToString(pub))...)
 }
 
 // verifyRevocation checks the signature against adminPub and returns the target

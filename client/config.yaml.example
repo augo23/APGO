@@ -9,12 +9,12 @@ psk: "base64:r5D9QBcJw5ToR+Aq68aL/eSZzq6Cm7IWkW+T/ozzUaU="
 # Overlay subnet. Each node derives its own stable IP inside this range from
 # its public key — no per-node addressing needed. Can also be set with the
 # OVERLAY_CIDR environment variable (env wins over this file).
-overlay_cidr: "10.28.55.0/24"
+overlay_cidr: "10.22.55.0/24"
 
 tun:
   name: "ovl0"
   mtu: 1280
-  # address_cidr: "10.28.55.2/24"   # optional: pin this node's IP manually
+  # address_cidr: "10.22.55.2/24"   # optional: pin this node's IP manually
 
 # Fixed port keeps the NAT mapping stable across restarts. 0 = random.
 udp_listen_port: 6969
@@ -38,8 +38,19 @@ min_announce_interval_seconds: 30
 # compression: true
 # exit_node: true                # BE an internet exit for the mesh (Linux only)
 # use_exit: true                 # route ALL internet traffic via an exit (full VPN)
-# exit_peer: "10.28.55.7"        # pin ONE exit (overlay IP / name / key); blank = fastest
+# exit_peer: "10.22.55.7"        # pin ONE exit (overlay IP / name / key); blank = fastest
 
-# NAT keepalive interval (seconds). Default 10 (survives aggressive NATs);
-# sessions self-heal after ~3 missed intervals. Clamped 5..120.
-# keepalive_seconds: 10
+# Rendezvous (HTTPS discovery) credential, for servers that require one.
+# ONE field, two schemes, auto-detected:
+#   "user:password"  -> HTTP Basic
+#   "sometoken"      -> Bearer token
+# Blank/absent = send no credential (open server). Env: RENDEZVOUS_AUTH, or
+# RENDEZVOUS_TOKEN, or RENDEZVOUS_USER + RENDEZVOUS_PASSWORD.
+# rendezvous_auth: "alice:hunter2"
+
+# NAT keepalive interval (seconds). Default 25 (WireGuard's persistent-
+# keepalive value — beats typical ~30s+ NAT UDP timeouts while keeping phone
+# peers' radios asleep 2.5x longer than the old 10s default). Lower it for
+# extremely aggressive NATs; sessions self-heal after ~3 missed intervals.
+# Clamped 5..120.
+# keepalive_seconds: 25

@@ -72,8 +72,7 @@ func factoryResetAdminIfRequested() {
 		}
 	}
 	// Clear anything already loaded into memory this process.
-	adminPub = nil
-	adminPubParsed = nil
+	clearAdminPub()
 	if sentinel != "" {
 		_ = os.Remove(sentinel)
 	}

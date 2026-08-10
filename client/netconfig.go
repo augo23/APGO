@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,8 +34,9 @@ func canonicalNetConfig(name, psk string, epoch, ts int64) string {
 }
 
 // currentNetEpoch is the epoch of the applied/persisted network config (0 = the
-// original file/env config). Guards against replaying older rotations.
-var currentNetEpoch int64
+// original file/env config). Guards against replaying older rotations. Atomic:
+// written by gossip/control handlers on different goroutines while others read.
+var currentNetEpoch atomic.Int64
 
 func netConfigFilePath() string {
 	if p := os.Getenv("NETCONFIG_FILE"); p != "" {
@@ -58,7 +60,7 @@ func applyNetConfigFile(cfg *ClientConfig) {
 	}
 	cfg.NetworkName = nc.NetworkName
 	cfg.PSK = nc.PSK
-	currentNetEpoch = nc.Epoch
+	currentNetEpoch.Store(nc.Epoch)
 	log.Printf("[netconfig] applied rotated network config (epoch %d)", nc.Epoch)
 }
 
@@ -106,7 +108,7 @@ func adoptNetConfig(nc SignedNetworkConfig) {
 	if !verifyNetConfig(nc) {
 		return
 	}
-	if nc.Epoch <= currentNetEpoch {
+	if nc.Epoch <= currentNetEpoch.Load() {
 		return // not newer — ignore (also de-dupes gossip storms)
 	}
 	data, err := json.MarshalIndent(nc, "", "  ")
@@ -118,7 +120,7 @@ func adoptNetConfig(nc SignedNetworkConfig) {
 		log.Printf("[netconfig] failed to persist rotated config")
 		return
 	}
-	currentNetEpoch = nc.Epoch
+	currentNetEpoch.Store(nc.Epoch)
 	log.Printf("[netconfig] adopted rotated network config (epoch %d) — flooding + restarting to apply", nc.Epoch)
 
 	// Flood to every peer NOW (over the still-valid old tunnel), then restart a

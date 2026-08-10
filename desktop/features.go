@@ -21,6 +21,7 @@ func handleAdminApprove(w http.ResponseWriter, r *http.Request) {
 		PubKey   string `json:"pubkey"`
 		Action   string `json:"action"`
 		Password string `json:"password"`
+		Net      string `json:"net"` // "" / "main" or a secondary network id
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8192))
 	if json.Unmarshal(body, &req) != nil || req.PubKey == "" {
@@ -50,8 +51,13 @@ func handleAdminApprove(w http.ResponseWriter, r *http.Request) {
 	if pub := adminPublicKeyB64(); pub != "" {
 		pushAdminPubKey(pub)
 	}
+	sock, sockErr := netSocketByID(req.Net)
+	if sockErr != nil {
+		http.Error(w, sockErr.Error(), http.StatusBadRequest)
+		return
+	}
 	recBytes, _ := json.Marshal(rec)
-	proxyCtl(w, "POST", "/api/approve-signed", recBytes)
+	proxyCtlOn(w, sock, "POST", "/api/approve-signed", recBytes)
 }
 
 func handleAdminNetwork(w http.ResponseWriter, r *http.Request) {

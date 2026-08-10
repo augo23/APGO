@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>APGO</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>APGO uses the camera to scan a network "Join QR" so you can join without typing.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>APGO uses Face ID to unlock the app when the app lock is enabled in Settings.</string>
+	<!-- iOS 14+ Local Network privacy: without this permission the tunnel can't
+	     reach peers on the same Wi-Fi (LAN discovery + direct LAN connections).
+	     The prompt is triggered from the app on first Connect (LocalNetworkPrompt). -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>APGO connects directly to your own devices on the same network. Without this, devices on the same Wi‑Fi can't find each other.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_apgo._udp.</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>

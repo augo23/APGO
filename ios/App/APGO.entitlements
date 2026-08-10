@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.org.apgo.APGO</string>
+    </array>
+    <!-- OPTIONAL — UDP broadcast LAN discovery. iOS 14+ blocks sending/receiving
+         UDP broadcast without this RESTRICTED entitlement. APGO works without it
+         (it falls back to a unicast LAN sweep), but broadcast discovery is
+         instant. To enable: request approval from Apple at
+         https://developer.apple.com/contact/request/networking-multicast
+         then uncomment here AND in Tunnel/APGOTunnel.entitlements, and add the
+         capability to your App ID. Do NOT uncomment before Apple grants it —
+         the provisioning profile won't match and the build will fail to install.
+    <key>com.apple.developer.networking.multicast</key>
+    <true/>
+    -->
+</dict>
+</plist>

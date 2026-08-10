@@ -26,7 +26,10 @@ type joinPayload struct {
 	PSK               string   `json:"psk"`
 	OverlayCIDR       string   `json:"overlay_cidr"`
 	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
-	Trackers          []string `json:"trackers,omitempty"` // top trackers so a scanned device shares this network's discovery
+	// RendezvousAuth travels with the servers: a rendezvous that requires a
+	// credential is useless to a phone that scanned only the URL.
+	RendezvousAuth string   `json:"rendezvous_auth,omitempty"`
+	Trackers       []string `json:"trackers,omitempty"` // top trackers so a scanned device shares this network's discovery
 	Cipher            string   `json:"cipher,omitempty"`   // "chacha" or "aesgcm"
 	PostQuantum       *bool    `json:"post_quantum,omitempty"`
 	PQAuth            *bool    `json:"pq_auth,omitempty"`
@@ -45,6 +48,7 @@ func buildJoinPayload() ([]byte, joinPayload, error) {
 		PSK               string   `json:"psk"`
 		OverlayCIDR       string   `json:"overlay_cidr"`
 		RendezvousServers []string `json:"rendezvous_servers"`
+		RendezvousAuth    string   `json:"rendezvous_auth"`
 		Trackers          []string `json:"trackers"`
 		Cipher            string   `json:"cipher"`
 		PostQuantum       *bool    `json:"post_quantum"`
@@ -59,6 +63,7 @@ func buildJoinPayload() ([]byte, joinPayload, error) {
 		PSK:               src.PSK,
 		OverlayCIDR:       src.OverlayCIDR,
 		RendezvousServers: src.RendezvousServers,
+		RendezvousAuth:    src.RendezvousAuth,
 		Trackers:          src.Trackers,
 		Cipher:            src.Cipher,
 		PostQuantum:       src.PostQuantum,

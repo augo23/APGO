@@ -34,6 +34,7 @@ var (
 	netMu      sync.Mutex
 	netItems   map[string]*systray.MenuItem // network name -> submenu item
 	mNetworks  *systray.MenuItem
+	mNetAdd    *systray.MenuItem
 	mNetSave   *systray.MenuItem
 	mNetDelete *systray.MenuItem
 )
@@ -170,6 +171,9 @@ func deleteCurrentProfile() {
 // menu order (after Settings/Admin, before Start-at-login).
 func setupNetworksMenu() {
 	mNetworks = systray.AddMenuItem("Networks", "Switch between saved networks")
+	mNetAdd = mNetworks.AddSubMenuItem("Add a new network…",
+		"Enter a brand-new network's name and PSK, then switch to it")
+	mNetworks.AddSubMenuItem("— Switch to —", "").Disable()
 	netMu.Lock()
 	netItems = map[string]*systray.MenuItem{}
 	netMu.Unlock()
@@ -184,21 +188,25 @@ func setupNetworksMenu() {
 	go func() {
 		for {
 			select {
+			case <-mNetAdd.ClickedCh:
+				safeRun("add-network", doAddNetwork)
 			case <-mNetSave.ClickedCh:
-				if name, err := registerCurrentProfile(); err != nil {
-					notify("Couldn't save network: " + err.Error())
-				} else {
-					netMu.Lock()
-					_, exists := netItems[name]
-					netMu.Unlock()
-					if !exists {
-						addNetworkItem(name)
+				safeRun("save-network", func() {
+					if name, err := registerCurrentProfile(); err != nil {
+						notify("Couldn't save network: " + err.Error())
+					} else {
+						netMu.Lock()
+						_, exists := netItems[name]
+						netMu.Unlock()
+						if !exists {
+							addNetworkItem(name)
+						}
+						notify("Saved \"" + name + "\" — switch networks from this menu.")
+						refreshNetworkChecks()
 					}
-					notify("Saved \"" + name + "\" — switch networks from this menu.")
-					refreshNetworkChecks()
-				}
+				})
 			case <-mNetDelete.ClickedCh:
-				deleteCurrentProfile()
+				safeRun("delete-network", deleteCurrentProfile)
 			}
 		}
 	}()
@@ -213,7 +221,7 @@ func addNetworkItem(name string) {
 	netMu.Unlock()
 	go func() {
 		for range item.ClickedCh {
-			switchToProfile(name)
+			safeRun("switch-network", func() { switchToProfile(name) })
 		}
 	}()
 }

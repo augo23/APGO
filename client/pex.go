@@ -23,8 +23,17 @@ package main
 
 import (
 	"net"
+	"strconv"
 	"strings"
 )
+
+// minLANPrefixLen is the widest subnet we will still call a "LAN". Anything
+// broader than a /16 is not a local network — it is a misconfiguration or an
+// ISP handing out an absurd netmask — and treating it as one would classify
+// large swathes of the internet as directly attached. That matters because
+// isPrivateUDPAddr feeds this into routing preference: a WAN peer wrongly
+// judged "LAN" gets pinned as the primary route and blocks failover.
+const minLANPrefixLen = 16
 
 // isAttachedLANAddr reports whether a is an IPv4 address on one of our
 // directly-attached subnets — i.e. dialable without any NAT traversal.
@@ -37,6 +46,10 @@ func isAttachedLANAddr(a *net.UDPAddr) bool {
 		return false
 	}
 	for _, n := range localIPv4Nets() {
+		ones, bits := n.Mask.Size()
+		if bits != 32 || ones < minLANPrefixLen {
+			continue
+		}
 		if n.Contains(ip) {
 			return true
 		}
@@ -55,22 +68,49 @@ func buildPeerExchangeFor(dst *net.UDPAddr) []byte {
 	includeLAN := isAttachedLANAddr(dst)
 	var eps []string
 	seen := map[string]bool{}
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			eps = append(eps, s)
+		}
+	}
 	for _, addr := range GlobalSessions.EstablishedAddrs() {
+		if len(eps) >= 64 {
+			break
+		}
+		// Same-host peer connected over loopback (static_peers pinning — see
+		// docs/two-nodes-same-host.md, e.g. a second container in the host
+		// netns that can't bind the LAN discovery port and is therefore mute
+		// on the LAN). dst can't dial 127.0.0.1, but this peer shares OUR
+		// host network namespace, so a same-site dst CAN reach it at our LAN
+		// address(es) on the same port. Translate instead of dropping —
+		// without this, a phone on the same Wi-Fi only ever finds such a
+		// peer via the slow same-site hairpin ladder (minutes), even though
+		// it is one LAN hop away the whole time.
+		if includeLAN && addr.IP != nil && addr.IP.IsLoopback() {
+			for _, n := range localIPv4Nets() {
+				add(net.JoinHostPort(n.IP.String(), strconv.Itoa(addr.Port)))
+			}
+			continue
+		}
 		s := addr.String()
 		if dst != nil && s == dst.String() {
 			continue // don't hand a peer its own endpoint
 		}
-		if seen[s] {
+		// NEVER gossip an overlay-subnet endpoint, even to a same-site peer.
+		// This is how a bad endpoint went viral: the attached-LAN allowance
+		// below is satisfied by the OVERLAY interface itself on some hosts,
+		// so one node that had dialled 10.x.overlay:port taught it to
+		// everyone else, who dialled it, memorised it, and re-gossiped it.
+		// The mesh then kept resurrecting an address no node actually owns,
+		// long after the config that introduced it was corrected.
+		if isOverlayTransportAddr(addr.IP) {
 			continue
 		}
 		if !isValidPeer(s) && !(includeLAN && isAttachedLANAddr(addr)) {
 			continue
 		}
-		seen[s] = true
-		eps = append(eps, s)
-		if len(eps) >= 64 {
-			break
-		}
+		add(s)
 	}
 	if len(eps) == 0 {
 		return nil
@@ -96,6 +136,11 @@ func handlePeerExchange(payload []byte, kp keypair, psk []byte) {
 		}
 		addr, _ := net.ResolveUDPAddr("udp", ep)
 		if addr == nil {
+			continue
+		}
+		// Same rule on receipt: an overlay address from a peer is never a
+		// route we can use, whichever gossip path it arrived on.
+		if isOverlayTransportAddr(addr.IP) {
 			continue
 		}
 		if !isValidPeer(ep) && !isAttachedLANAddr(addr) {

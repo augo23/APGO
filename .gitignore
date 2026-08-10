@@ -1,0 +1,45 @@
+# OS noise
+.DS_Store
+
+# local build artifacts (never commit binaries)
+client/client
+rendezvous/client
+*-go-tmp-umask
+
+# gomobile output — regenerate with: cd ios && bash build-xcframework.sh
+# (the .framework binaries are ~36MB each; they were tracked until the split)
+ios/Overlaymobile.xcframework/
+
+# Xcode per-user UI state, not project config
+ios/**/xcuserdata/
+
+# Gradle / Android build output. build-releases.sh sweeps these after each run,
+# but keep them out of git in case a build is interrupted.
+android/.gradle/
+android/build/
+android/app/build/
+android/app/libs/overlaymobile.aar
+android/app/libs/overlaymobile-sources.jar
+
+# The website now lives in its own repo (austin/apgo-website). Nothing
+# website-related belongs here; this guards against a stray clone or a
+# rebuilt husk being committed back.
+website/
+apgo-website/
+apgoweb.containerfile
+
+# The release folder. build-releases.sh writes every installer, both torrents,
+# magnets.json and manifest.txt here, then uploads the lot to the Forgejo
+# package registry — the apgo-website repo fetches it from there, so none of it
+# is ever committed.
+#
+# release/extras/ is the exception: small hand-maintained files (release notes,
+# checksums, sample configs, signatures) that you DO want tracked. They get
+# merged into the payload before the torrent is hashed, so anything committed
+# there ships with the release.
+release/*
+!release/extras/
+
+# local verification scratch modfiles
+verify.mod
+verify.sum

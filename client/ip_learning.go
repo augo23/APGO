@@ -44,32 +44,64 @@ func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e, ok := t.m[ip]; ok && e.addr.String() != addr.String() {
-		// Sticky routing between DUPLICATE sessions. LAN discovery + tracker
-		// announce can legitimately produce two established sessions to the
-		// SAME peer (its LAN address and its WAN/hairpin address). Both send
-		// keepalives, so last-writer-wins here made the route to that peer
-		// flip between the two paths every few seconds — and when one path
-		// is one-way (typical router hairpin), traffic blackholed in bursts,
-		// recovering only briefly each time the good path's keepalive landed.
-		// If the incumbent mapping and the new candidate are both live
-		// sessions to the same peer key, keep the incumbent. When it truly
-		// dies it is evicted (and ForgetAddr'd) within the stale timeout,
-		// and the other path takes over. Mappings via DIFFERENT peers (e.g.
-		// relay -> direct upgrades) still overwrite as before.
+		// ROUTE-CLASS PREFERENCE. Routes to an overlay IP come in classes:
+		//
+		//   direct — a session whose peer key OWNS ip (it is the device itself)
+		//   relay  — a session to some OTHER peer that forwarded ip's traffic
+		//
+		// and within a class a route is proven LIVE (RouteIsLive: decrypted
+		// inbound within ~2 keepalives) or merely established. The rules:
+		//
+		//   1. A LIVE direct route is never displaced by a relay. Since
+		//      unproven senders flood relay-wrapped duplicates in parallel
+		//      with the direct copy (see the TUN egress path), a relayed
+		//      duplicate arriving is EXPECTED noise — letting it steal the
+		//      route sent return traffic through the relay, starved the
+		//      direct session into staleness on both ends, and cascaded
+		//      node after node into relay mode (observed fleet-wide within
+		//      minutes of the parallel-flood change: "everything is relayed
+		//      now"). Direct-and-live always wins.
+		//   2. A DEAD direct route never blocks failover. If the direct
+		//      session has nothing decrypted inbound for routeLiveTimeout,
+		//      any working route — a relay included — may take over
+		//      immediately, instead of blackholing until the 45s stale
+		//      sweep. This is the same established-vs-live distinction as
+		//      RouteIsLive's own doc comment.
+		//   3. An established direct route always beats a relay route
+		//      (relay -> direct upgrade, as before).
+		//   4. Between two routes to the SAME peer key (its LAN + WAN
+		//      addresses), keep the incumbent while it is live — sticky, no
+		//      flip-flopping — but prefer an upgrade to the LAN path, and
+		//      fail over when the incumbent is dead and the candidate live.
+		//   5. Between two relay routes, last-writer-wins (as before): the
+		//      most recent forwarder is the one proven to reach us.
 		if GlobalSessions != nil {
 			cur := GlobalSessions.GetByAddr(e.addr)
 			cand := GlobalSessions.GetByAddr(addr)
-			if cur.Established() && cand.Established() && cur.peerStatic == cand.peerStatic {
-				// Exception: upgrade to the peer's LAN route. Among two live
-				// routes to the same device, a directly-attached (private)
-				// path always beats a WAN/hairpin path.
-				if isPrivateUDPAddr(addr) && !isPrivateUDPAddr(e.addr) {
-					e.addr = addr
-					e.seen = time.Now()
-					return
+			if cur.Established() {
+				if cand.Established() && cur.peerStatic == cand.peerStatic {
+					// Rule 4: two routes to the same device.
+					if isPrivateUDPAddr(addr) && !isPrivateUDPAddr(e.addr) {
+						e.addr = addr
+						e.seen = time.Now()
+						return
+					}
+					if GlobalSessions.RouteIsLive(e.addr) || !GlobalSessions.RouteIsLive(addr) {
+						e.seen = time.Now()
+						return
+					}
+					// Incumbent dead, candidate live: fall through, take it.
+				} else if peerOverlayIPByPub(cur.peerStatic) == ip {
+					// Incumbent is the DIRECT route to ip; candidate is a
+					// relay or an unknown endpoint.
+					candDirect := cand.Established() && peerOverlayIPByPub(cand.peerStatic) == ip
+					if !candDirect && GlobalSessions.RouteIsLive(e.addr) {
+						return // rule 1: live direct route is never stolen
+					}
+					// Rule 2/3: dead direct route, or candidate is itself
+					// direct — fall through, take the candidate.
 				}
-				e.seen = time.Now()
-				return
+				// Incumbent is a relay: rules 3 and 5 — overwrite.
 			}
 		}
 	}
@@ -92,8 +124,13 @@ func (t *IPLearning) ForgetAddr(addr *net.UDPAddr) {
 }
 
 // OverlayIPFor returns the overlay IP currently mapped to addr, or "" if none
-// is known. It is the reverse of Lookup, used by the admin control server to
-// label each session with its overlay address.
+// is known — or if the mapping is AMBIGUOUS. It is the reverse of Lookup, used
+// by the admin control server to label each session with its overlay address.
+// With relayed routes, MANY overlay IPs legitimately map to one next-hop
+// endpoint (the relay's); returning a random one of them (Go map order)
+// mislabeled the relay's own row with a relayed peer's address on some polls
+// and not others — the peer list flickered between right and wrong. Only an
+// unambiguous single mapping is trustworthy as "this endpoint's own address".
 func (t *IPLearning) OverlayIPFor(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -101,12 +138,16 @@ func (t *IPLearning) OverlayIPFor(addr *net.UDPAddr) string {
 	key := addr.String()
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	found := ""
 	for ip, e := range t.m {
 		if e.addr.String() == key {
-			return ip
+			if found != "" {
+				return "" // several IPs route here — can't tell which is its own
+			}
+			found = ip
 		}
 	}
-	return ""
+	return found
 }
 
 // RemapAddr repoints every overlay-IP mapping from old to new. Used when a peer
@@ -133,4 +174,27 @@ func (t *IPLearning) Lookup(ip string) *net.UDPAddr {
 		return e.addr
 	}
 	return nil
+}
+
+// LearnedIP is one entry of the routing table: an overlay IP, the endpoint it
+// currently routes to (a direct peer OR a relay next-hop), and when it was last
+// refreshed.
+type LearnedIP struct {
+	IP   string
+	Addr *net.UDPAddr
+	Seen time.Time
+}
+
+// Entries returns a snapshot of the learned overlay-IP routes. The peer list
+// uses it to surface RELAY-only peers (an overlay IP whose next hop is another
+// peer's endpoint) that have no direct session and would otherwise be invisible
+// even though traffic to them works.
+func (t *IPLearning) Entries() []LearnedIP {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]LearnedIP, 0, len(t.m))
+	for ip, e := range t.m {
+		out = append(out, LearnedIP{IP: ip, Addr: e.addr, Seen: e.seen})
+	}
+	return out
 }

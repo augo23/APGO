@@ -129,7 +129,7 @@ func announceNameToPeers() {
 // bytes are defined by canonicalProvision and must match the signer exactly.
 type SignedProvision struct {
 	PubKey  string `json:"pubkey"`  // base64(std) target node static key
-	Address string `json:"address"` // new overlay address ("10.28.55.42" or CIDR), or "" to leave unchanged
+	Address string `json:"address"` // new overlay address ("10.22.55.42" or CIDR), or "" to leave unchanged
 	Name    string `json:"name"`    // friendly name, or "" to leave unchanged
 	Seq     int64  `json:"seq"`
 	Ts      int64  `json:"ts"`
@@ -333,7 +333,7 @@ func applyProvisionSelf(rec SignedProvision) {
 		// Admin-assigned = pinned: conflict self-healing must never hop away
 		// from an address the operator chose deliberately.
 		addrAutoDerived = false
-		if stripMask(addr) == myOverlayIP {
+		if stripMask(addr) == myOverlayIP() {
 			return // already on this address
 		}
 		pendingAddrMu.Lock()

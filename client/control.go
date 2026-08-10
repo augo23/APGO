@@ -6,6 +6,7 @@ package main
 // on the network — access is gated by filesystem permissions on the socket.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -21,7 +22,7 @@ import (
 	"time"
 )
 
-// overlayCIDR is this node's overlay subnet (e.g. "10.28.55.0/24"), set in
+// overlayCIDR is this node's overlay subnet (e.g. "10.22.55.0/24"), set in
 // main(). The control server uses it to derive a peer's stable overlay IP from
 // that peer's static public key when no announced mapping is known yet.
 var overlayCIDR string
@@ -113,7 +114,17 @@ type SessionInfo struct {
 	PostQuantum  bool   `json:"post_quantum"` // peer's advertised live PQ state
 	Established  bool   `json:"established"`
 	Exit         bool   `json:"exit"`        // peer advertises as an internet exit node
+	ExitFailed   bool   `json:"exit_failed"` // peer WANTS to be an exit but its NAT setup failed (gossiped)
+	V6           bool   `json:"v6"`          // peer has a globally routable IPv6 transport address (gossiped)
+	// IPDerived: the overlay IP shown is a GUESS derived from the peer's
+	// public key, because the peer has not announced one and no admin
+	// provision exists. It is what that peer WOULD get by default, but it is
+	// not confirmed — and presenting a guess identically to a known address
+	// is how a peer ends up "showing the wrong IP" in the UI.
+	IPDerived    bool   `json:"ip_derived"`
 	ActiveExit   bool   `json:"active_exit"` // the exit THIS device currently egresses through
+	Relayed      bool   `json:"relayed"`     // reachable only via a relay (no direct session)
+	Via          string `json:"via"`         // relayed rows: the relaying node (overlay IP or endpoint)
 	SinceUnix    int64  `json:"since_unix"`     // when the session was created
 	LastSeenUnix int64  `json:"last_seen_unix"` // last inbound activity
 }
@@ -234,6 +245,19 @@ func peerKeyFingerprint(pub []byte) string {
 	return hex.EncodeToString(h[:6])
 }
 
+// publicIPOnly returns just the host part of the STUN reflexive endpoint
+// ("203.0.113.7" from "203.0.113.7:6969"), or "" when unknown.
+func publicIPOnly() string {
+	ep := currentPublicEndpoint()
+	if ep == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(ep); err == nil {
+		return host
+	}
+	return ep
+}
+
 func stripMask(cidr string) string {
 	if i := strings.IndexByte(cidr, '/'); i >= 0 {
 		return cidr[:i]
@@ -330,19 +354,414 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				}
 			}
 		}
+		derived := false
 		if ip == "" && overlayCIDR != "" && r.key != ([32]byte{}) {
 			if d, err := deriveOverlayIP(overlayCIDR, r.key); err == nil {
 				ip = stripMask(d)
+				derived = true // a guess, not an announced address
 			}
 		}
 		info.OverlayIP = ip
+		info.IPDerived = derived
 		info.Name = peerNameByPub(r.key)
 		info.Approved = admitted(r.key)
 		info.PostQuantum = peerPQByPub(r.key)
 		info.Exit, info.ActiveExit = exitStatusFor(r.key)
+		// Merge the gossiped roster view into the direct row. Exit capability
+		// deliberately has REDUNDANT paths to the UI: the peer's own 'E'
+		// announce over this session, its self-report in its roster, and
+		// every OTHER node's roster view of it. Any one of them lights the
+		// green E — so one flaky link can't hide the only exit on the mesh.
+		// (exitStatusFor stays authoritative for ACTIVE exit selection; the
+		// roster only widens what is DISPLAYED.) A failed exit never
+		// announces at all, so its failure flag can ONLY come from gossip.
+		if rv, ok := rosterLookup(ip); ok {
+			info.Exit = info.Exit || rv.Exit
+			info.ExitFailed = rv.ExitErr
+			info.V6 = rv.V6
+		}
 		out = append(out, info)
 	}
+
+	// RELAY-ONLY peers. The list above is built purely from DIRECT sessions, so
+	// a peer we can only reach through another node's relay is invisible even
+	// though traffic to it works. Surface those from the routing table, but
+	// tightly filtered so we never show junk or duplicates:
+	//   * overlay-range IPs ONLY — never internet destinations learned while an
+	//     exit node is in use (that was surfacing public IPs),
+	//   * only when the next hop is a LIVE session that is NOT the peer's own
+	//     endpoint (i.e. a genuine relay, not a direct peer or a stale route),
+	//   * deduped against the direct list by overlay IP AND by device key, so a
+	//     peer that also has a direct route never appears twice and the relayed
+	//     row disappears the moment a direct route forms.
+	if ipLearning != nil {
+		directIPs := map[string]bool{}
+		directKeys := map[[32]byte]bool{}
+		directFPs := map[string]bool{}
+		for _, si := range out {
+			if si.OverlayIP != "" {
+				directIPs[si.OverlayIP] = true
+			}
+			if si.KeyFP != "" {
+				directFPs[si.KeyFP] = true
+			}
+		}
+		for _, r := range raws {
+			if r.key != ([32]byte{}) {
+				directKeys[r.key] = true
+			}
+		}
+		var overlayNet *net.IPNet
+		if overlayCIDR != "" {
+			if _, n, err := net.ParseCIDR(overlayCIDR); err == nil {
+				overlayNet = n
+			}
+		}
+		seen := map[string]bool{}
+		for _, e := range ipLearning.Entries() {
+			if e.IP == "" || e.IP == myOverlayIP() || directIPs[e.IP] || seen[e.IP] {
+				continue
+			}
+			// Overlay range only — drops internet destinations (exit mode) and
+			// anything else that isn't an overlay address.
+			if overlayNet != nil {
+				if pip := net.ParseIP(e.IP); pip == nil || !overlayNet.Contains(pip) {
+					continue
+				}
+			}
+			// The next hop must be a live session, and must be a RELAY — not the
+			// endpoint's own peer (that would be a direct peer, already listed).
+			hop := GlobalSessions.GetByAddr(e.Addr)
+			if !hop.Established() || peerOverlayIPByPub(hop.peerStatic) == e.IP {
+				continue
+			}
+			name, keyFP, key := relayPeerIdentity(e.IP)
+			if key != ([32]byte{}) && directKeys[key] {
+				continue // same device already has a direct route — not relayed
+			}
+			// Fill identity gaps from the gossip'd roster, including the
+			// node's live post-quantum state (per-session PQ status frames
+			// only flow over direct sessions, so without this a relayed
+			// node always showed PQ off — the encryption was never dropped,
+			// each hop is its own PQ-wrapped session; only the DISPLAY was
+			// blind).
+			pq := false
+			exitCap := false
+			if key != ([32]byte{}) {
+				pq = peerPQByPub(key)
+				exitCap, _ = exitStatusFor(key)
+			}
+			// pubKey is what the admin UI needs to ACT on this row — rename,
+			// revoke, approve are all addressed to the full static key, and a
+			// row without one can only be looked at. It comes from a stored
+			// provision when we have one, else from the gossip'd roster.
+			pubKey := ""
+			if key != ([32]byte{}) {
+				pubKey = base64.StdEncoding.EncodeToString(key[:])
+			}
+			if r, ok := rosterLookup(e.IP); ok {
+				if name == "" {
+					name = r.Name
+				}
+				if keyFP == "" {
+					keyFP = r.FP
+				}
+				if pubKey == "" {
+					pubKey = r.PK
+				}
+				if !pq {
+					pq = r.PQ
+				}
+				// Exit capability travels in the roster for the same reason
+				// PQ does: the 'E' announce only flows over direct sessions.
+				if !exitCap {
+					exitCap = r.Exit
+				}
+			}
+			// The same DEVICE may already be listed directly under a
+			// different resolved IP (announce raced the snapshot, or a
+			// key-derived fallback address) — never show it twice, once
+			// "direct" and once "relayed".
+			if keyFP != "" && directFPs[keyFP] {
+				continue
+			}
+			// Register this row's identity so LATER relay rows dedup against it
+			// too. These sets were built once from the direct rows and never
+			// updated, so two relay rows for the SAME device under different
+			// overlay addresses both survived — which is what happens whenever a
+			// node is re-addressed and the old address is still inside its
+			// roster TTL. The result was a peer count larger than the number of
+			// devices, with the same machine listed twice.
+			if keyFP != "" {
+				directFPs[keyFP] = true
+			}
+			if key != ([32]byte{}) {
+				directKeys[key] = true
+			}
+			seen[e.IP] = true
+			// Which node is doing the relaying — its overlay IP when it has
+			// announced one, else its UDP endpoint.
+			via := peerOverlayIPByPub(hop.peerStatic)
+			if via == "" && e.Addr != nil {
+				via = e.Addr.String()
+			}
+			out = append(out, SessionInfo{
+				// Relay-only rows have no direct UDP endpoint, but the client
+				// UIs use Remote as the stable unique identity for a row. Give
+				// each one a deterministic, unique key ("relay/<overlayIP>",
+				// already deduped by IP above) so two relay peers — or a relay
+				// peer whose key fingerprint / overlay IP happens to coincide
+				// with another row — never collapse into a single list entry.
+				Remote:       "relay/" + e.IP,
+				Approved:     admittedB64(pubKey),
+				OverlayIP:    e.IP,
+				Name:         name,
+				KeyFP:        keyFP,
+				PubKey:       pubKey,
+				PostQuantum:  pq,
+				Exit:         exitCap,
+				ExitFailed:   func() bool { rv, ok := rosterLookup(e.IP); return ok && rv.ExitErr }(),
+				V6:           func() bool { rv, ok := rosterLookup(e.IP); return ok && rv.V6 }(),
+				Established:  false,
+				Relayed:      true,
+				Via:          via,
+				LastSeenUnix: e.Seen.Unix(),
+			})
+		}
+	}
+
+	// Gossip'd roster: nodes the network says exist but that this device has
+	// neither a direct session nor a traffic-learned relay route to right
+	// now. They're reachable through the relay flood (that's why pings work
+	// even while they're missing), so list them as relayed instead of letting
+	// them flicker in and out with the routing table's memory.
+	{
+		listed := map[string]bool{}
+		listedFPs := map[string]bool{}
+		for _, si := range out {
+			if si.OverlayIP != "" {
+				listed[si.OverlayIP] = true
+			}
+			if si.KeyFP != "" {
+				listedFPs[si.KeyFP] = true
+			}
+		}
+		myFP := peerKeyFingerprint(gKP.pub[:])
+		var overlayNet *net.IPNet
+		if overlayCIDR != "" {
+			if _, n, err := net.ParseCIDR(overlayCIDR); err == nil {
+				overlayNet = n
+			}
+		}
+		for _, e := range rosterSnapshot() {
+			if e.IP == myOverlayIP() || listed[e.IP] {
+				continue
+			}
+			// Same DEVICE already listed (directly or via a relay route)
+			// under a different resolved IP — or the roster echoing OUR OWN
+			// node back at us under a stale address. One device, one row.
+			if e.FP != "" && (e.FP == myFP || listedFPs[e.FP]) {
+				continue
+			}
+			if overlayNet != nil {
+				if pip := net.ParseIP(e.IP); pip == nil || !overlayNet.Contains(pip) {
+					continue
+				}
+			}
+			listed[e.IP] = true
+			if e.FP != "" {
+				listedFPs[e.FP] = true
+			}
+			name, keyFP, pubKey := e.Name, e.FP, e.PK
+			if name == "" || keyFP == "" || pubKey == "" {
+				n2, fp2, k2 := relayPeerIdentity(e.IP)
+				if name == "" {
+					name = n2
+				}
+				if keyFP == "" {
+					keyFP = fp2
+				}
+				if pubKey == "" && k2 != ([32]byte{}) {
+					pubKey = base64.StdEncoding.EncodeToString(k2[:])
+				}
+			}
+			out = append(out, SessionInfo{
+				Remote:       "known/" + e.IP,
+				Approved:     admittedB64(pubKey),
+				OverlayIP:    e.IP,
+				Name:         name,
+				KeyFP:        keyFP,
+				PubKey:       pubKey,
+				PostQuantum:  e.PQ,
+				Exit:         e.Exit,
+				ExitFailed:   e.ExitErr,
+				V6:           e.V6,
+				Established:  false,
+				Relayed:      true,
+				LastSeenUnix: e.Seen.Unix(),
+			})
+		}
+	}
+
+	// HEARD THROUGH THE MESH: nodes whose relayed control frames are arriving
+	// right now, but which are in neither the routing table nor the roster.
+	//
+	// A node that can dial out but never be dialled — anything behind a
+	// symmetric NAT, including an overlay client running inside a Kubernetes
+	// pod behind CNI masquerade — holds zero direct sessions. Nothing
+	// advertises it into the roster (roster.go gossips only DIRECT peers, one
+	// hop), and ip_learning drops it as soon as data traffic pauses. It was
+	// therefore reachable and serving traffic while appearing nowhere in this
+	// list, which reads as "the node is gone" when it plainly isn't.
+	//
+	// Its connect requests/acks are the proof of life the other two sources
+	// lack, so they get their own row source here. Listed LAST so a direct
+	// session or a real learned route always wins the row. See heard.go.
+	{
+		listed := map[string]bool{}
+		listedFPs := map[string]bool{}
+		for _, si := range out {
+			if si.OverlayIP != "" {
+				listed[si.OverlayIP] = true
+			}
+			if si.KeyFP != "" {
+				listedFPs[si.KeyFP] = true
+			}
+		}
+		myFP := peerKeyFingerprint(gKP.pub[:])
+		var overlayNet *net.IPNet
+		if overlayCIDR != "" {
+			if _, n, err := net.ParseCIDR(overlayCIDR); err == nil {
+				overlayNet = n
+			}
+		}
+		for ip, h := range heardSnapshot() {
+			if ip == myOverlayIP() || listed[ip] {
+				continue
+			}
+			// Overlay range only, mirroring the relay-route filter above: a
+			// forged or malformed source IP never becomes a row.
+			if overlayNet != nil {
+				if pip := net.ParseIP(ip); pip == nil || !overlayNet.Contains(pip) {
+					continue
+				}
+			}
+			name, keyFP, key := relayPeerIdentity(ip)
+			pubKey := ""
+			if key != ([32]byte{}) {
+				pubKey = base64.StdEncoding.EncodeToString(key[:])
+			}
+			if r, ok := rosterLookup(ip); ok {
+				if name == "" {
+					name = r.Name
+				}
+				if keyFP == "" {
+					keyFP = r.FP
+				}
+				if pubKey == "" {
+					pubKey = r.PK
+				}
+			}
+			// One device, one row — never echo ourselves back, and never show
+			// a device that is already listed under a different resolved IP.
+			if keyFP != "" && (keyFP == myFP || listedFPs[keyFP]) {
+				continue
+			}
+			listed[ip] = true
+			if keyFP != "" {
+				listedFPs[keyFP] = true
+			}
+			out = append(out, SessionInfo{
+				Remote:       "heard/" + ip,
+				Approved:     admittedB64(pubKey),
+				OverlayIP:    ip,
+				Name:         name,
+				KeyFP:        keyFP,
+				PubKey:       pubKey,
+				Established:  false,
+				Relayed:      true,
+				Via:          h.Via,
+				LastSeenUnix: h.Seen.Unix(),
+			})
+		}
+	}
 	return out
+}
+
+// relayPeerIdentity returns a best-effort friendly name, key fingerprint, and
+// static key for a relay-only peer, matched by overlay IP against admin-signed
+// provisions — the only IP-keyed identity we might hold for a peer we have no
+// direct session to. All zero when the peer isn't provisioned (the row still
+// shows its overlay IP); the returned key lets the caller dedupe against a
+// direct route to the same device.
+// admittedB64 reports whether a base64 static key is admitted by admission
+// control. An empty or malformed key reports TRUE: a row whose identity we
+// could not establish must not be labelled "pending", which would invite an
+// approval the UI has no key to send.
+func admittedB64(b64 string) bool {
+	if b64 == "" {
+		return true
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(raw) != 32 {
+		return true
+	}
+	var pub [32]byte
+	copy(pub[:], raw)
+	return admitted(pub)
+}
+
+
+// peerPubByOverlayIP resolves an overlay address back to the device's full
+// static public key, using the announce table every node maintains.
+//
+// This is what makes the admin actions work on a RELAYED row. Edit, Revoke and
+// Approve are all addressed to a full public key; a relayed row carries only
+// what gossip gave it, which is a truncated fingerprint. The previous lookup
+// searched stored provisions, so the buttons appeared only for devices an admin
+// had already renamed or re-addressed — i.e. almost never, and never for the
+// device you had just noticed and wanted to act on.
+//
+// peerOverlayIPs is populated from each peer's own address announce, which
+// reaches us over the relay flood as readily as over a direct session, and is
+// filled in regardless of what build the peer runs. So any node that has ever
+// announced itself to us is resolvable here, with no dependency on roster
+// gossip carrying the key.
+func peerPubByOverlayIP(ip string) ([32]byte, bool) {
+	var zero [32]byte
+	if ip == "" {
+		return zero, false
+	}
+	nameMu.Lock()
+	defer nameMu.Unlock()
+	for pub, got := range peerOverlayIPs {
+		if got == ip && pub != zero {
+			return pub, true
+		}
+	}
+	return zero, false
+}
+
+func relayPeerIdentity(ip string) (name, keyFP string, key [32]byte) {
+	for _, rec := range provisions.list() {
+		if rec.Address == "" || stripMask(normalizeOverlayAddr(rec.Address)) != ip {
+			continue
+		}
+		name = rec.Name
+		if raw, err := base64.StdEncoding.DecodeString(rec.PubKey); err == nil && len(raw) == 32 {
+			copy(key[:], raw)
+			keyFP = peerKeyFingerprint(raw)
+		}
+		return name, keyFP, key
+	}
+	// No provision for this address — fall back to the announce table, which
+	// covers every node that has ever told us its overlay IP. Without this the
+	// admin buttons on a relayed row only ever appeared for a device that had
+	// already been provisioned.
+	if pub, ok := peerPubByOverlayIP(ip); ok {
+		return peerNameByPub(pub), peerKeyFingerprint(pub[:]), pub
+	}
+	return "", "", key
 }
 
 // RevokeByRemote tears down the session to the given UDP endpoint, forgets its
@@ -391,6 +810,48 @@ func (t *SessionTable) RevokeByRemote(remote string) bool {
 
 // --- control HTTP server (unix socket) ------------------------------------
 
+// anotherClientIsLive reports whether a FULLY STARTED client owns socketPath.
+//
+// A bare Dial is not enough, and the difference is a deadlock. An UNCONFIGURED
+// client serves the first-run setup UI on this very socket (see
+// runSetupServerAndWait), so "the socket answers" is also true when the only
+// thing running is a node waiting to be told its network name. Treating that as
+// "already running" wedges the machine permanently: the setup server holds the
+// socket forever, and every properly configured client that tries to start
+// refuses and exits. Nothing ever connects, and the log says only that another
+// client is already running.
+//
+// So ask for /api/info and require a public key in the reply. Only a client
+// that finished startup can produce one; the setup server cannot, and is
+// correctly treated as replaceable.
+func anotherClientIsLive(socketPath string) bool {
+	if socketPath == "" {
+		return false
+	}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	c := &http.Client{Transport: tr, Timeout: 2 * time.Second}
+	resp, err := c.Get("http://unix/api/info")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var m struct {
+		PublicKey string `json:"public_key"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&m) != nil {
+		return false
+	}
+	return m.PublicKey != ""
+}
+
 func startControlServer(socketPath string) {
 	// SINGLE-INSTANCE GUARD. This used to unconditionally os.Remove the
 	// socket and listen — silently STEALING it from an already-running
@@ -400,8 +861,7 @@ func startControlServer(socketPath string) {
 	// with itself, peers see an address conflict, and the shared log shows
 	// every line twice. If the socket answers, another instance is alive —
 	// refuse to start instead of shouldering past it.
-	if conn, err := net.DialTimeout("unix", socketPath, time.Second); err == nil {
-		conn.Close()
+	if anotherClientIsLive(socketPath) {
 		log.Fatalf("[control] another overlay client is ALREADY RUNNING (control socket %s is live). "+
 			"Stop it first (macOS: sudo pkill -f overlay-client) — running two instances gives this "+
 			"machine two identities and breaks the mesh.", socketPath)
@@ -423,11 +883,16 @@ func startControlServer(socketPath string) {
 
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"overlay_ip":      myOverlayIP,
+			"overlay_ip":      myOverlayIP(),
 			"public_key":      base64.StdEncoding.EncodeToString(gKP.pub[:]),
 			"key_fp":          peerKeyFingerprint(gKP.pub[:]),
 			"friendly_name":   getMyFriendlyName(),
 			"pending_address": getPendingAddress(),
+			// This node's public (STUN reflexive) endpoint: "ip:port", or "" if
+			// STUN hasn't succeeded yet. public_ip is the host part alone for
+			// simple display.
+			"public_endpoint": currentPublicEndpoint(),
+			"public_ip":       publicIPOnly(),
 			// admin_trusted: this node trusts a network admin public key (so the
 			// network HAS an admin key), even if the encrypted blob for signing
 			// hasn't synced here yet.
@@ -441,15 +906,83 @@ func startControlServer(socketPath string) {
 			// Local transport toggles (per-node).
 			"ipv6":               ipv6Enabled,
 			"pq_auth":            pqAuth,
-			"port_prediction":    portPredictionOn,
+			"port_prediction":    portPredictionOn.Load(),
+			// How this node's NAT allocates external ports. "symmetric" means
+			// peers behind their own NAT cannot punch to us and will relay —
+			// the one diagnosis the UI previously had no way to show.
+			"nat":                natSummary(),
+			"nat_type":           natTypeLabel(),
 			"uptime_seconds":     int64(time.Since(nodeStartTime).Seconds()),
-			"sessions":           len(GlobalSessions.EstablishedAddrs()),
+			// Distinct DEVICES, not sessions: a peer reached over both its LAN
+			// and WAN address holds two established sessions, and the peer table
+			// collapses those into one row. Counting addresses here made the
+			// card disagree with the table underneath it.
+			"sessions":           GlobalSessions.EstablishedPeerCount(),
+			"session_routes":     len(GlobalSessions.EstablishedAddrs()),
 			// Full-VPN state: whether this node routes internet traffic via an
 			// exit, which exit is pinned ("" = automatic/fastest), and which exit
 			// is currently carrying traffic.
 			"use_exit":     useExit,
 			"exit_pin":     currentExitPin(),
 			"current_exit": currentExitSummary(),
+			// Whether THIS node is an exit (EXIT_NODE / exit_node, with NAT
+			// successfully enabled). The sessions table can only badge PEERS
+			// (they announce 'E' over their sessions), so without this field
+			// an exit node's own dashboard showed no green E anywhere — the
+			// one node guaranteed to be an exit was the one place it was
+			// invisible.
+			"exit_node": amExit,
+			// Non-empty when exit-node mode was REQUESTED but NAT setup
+			// failed (the node then refuses to advertise rather than
+			// black-hole clients). Dashboards surface this string.
+			"exit_node_error": exitNATErr,
+			// Non-empty when the overlay CIDR collides with a physical
+			// network this machine is on — a config error that breaks exit
+			// return-routing and makes peer IPs ambiguous.
+			"overlay_lan_conflict": overlayLANConflict,
+			// IPv6 TRANSPORT reachability. "Does this node have a globally
+			// routable IPv6 address it can be dialled on?" — the single fact
+			// that decides whether a peer pair can skip NAT traversal
+			// entirely. Two nodes that BOTH report true should never need a
+			// relay; a node reporting false can only be reached over IPv4,
+			// with all the NAT rules that implies. Reported per node so the
+			// dashboard can say WHICH end lacks it instead of leaving
+			// "should we go IPv6?" to guesswork.
+			"ipv6_global":    hasGlobalIPv6(),
+			"ipv6_endpoints": globalIPv6Endpoints(myUDPPort),
+			// INBOUND REACHABILITY — has any off-LAN peer ever completed a
+			// handshake TOWARD this node? "false" while peers exist is the
+			// signature of a firewall dropping inbound UDP on our port, which
+			// is the most common reason a node is permanently relayed.
+			"inbound_ok": func() bool { ok, _, _ := inboundStatus(); return ok }(),
+			"inbound_last_unix": func() int64 { _, l, _ := inboundStatus(); return l }(),
+			"inbound_from":      func() string { _, _, f := inboundStatus(); return f }(),
+			"listen_port":       myUDPPort,
+			"advertise_port":    advertisePort,
+			// WHAT WE TELL PEERS TO DIAL. This is the single most useful fact
+			// for "why is this node relayed", and it was invisible: if the
+			// list is EMPTY (STUN blocked, no LAN address a peer could use,
+			// no configured candidate) then peers have nothing to dial and
+			// relay is guaranteed — with no firewall involved at all. A
+			// Kubernetes pod is the classic case: cluster-internal pod IP,
+			// egress-only network, STUN filtered.
+			"my_candidates": myConnectCandidates(),
+			// behind_router: our STUN-observed public IP is not an address on
+			// any local interface, so at least one NAT sits between us and the
+			// internet that we do NOT control from this host. It decides
+			// whether "open the port" means a HOST firewall rule or a ROUTER
+			// port-forward — advice that is useless (and misleading) if it
+			// names the wrong device. A Kubernetes pod on a LAN node is
+			// behind two: the CNI masquerade and the site router.
+			"behind_router": behindRouter(),
+			"local_v4":      localIPv4Strings(),
+			"nat_advice": func() string {
+				p := advertisePort
+				if p == 0 {
+					p = myUDPPort
+				}
+				return natTraversalAdvice(p)
+			}(),
 		})
 	})
 
@@ -464,7 +997,7 @@ func startControlServer(socketPath string) {
 	})
 
 	// Set the outproxy selection mode: {"pin":""} = automatic (fastest exit),
-	// {"pin":"10.28.55.7"} (or a friendly name / base64 key / fingerprint
+	// {"pin":"10.22.55.7"} (or a friendly name / base64 key / fingerprint
 	// prefix) = always egress via that node. Applies live within seconds and
 	// persists across restarts when NODE_SETTINGS_FILE is configured.
 	mux.HandleFunc("/api/exit-pin", func(w http.ResponseWriter, r *http.Request) {
@@ -562,7 +1095,7 @@ func startControlServer(socketPath string) {
 
 	// Current epoch of the applied network config (0 = original).
 	mux.HandleFunc("/api/net-epoch", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"epoch": currentNetEpoch})
+		writeJSON(w, http.StatusOK, map[string]any{"epoch": currentNetEpoch.Load()})
 	})
 
 	// Tracker management: GET the effective list; POST a replacement list (the
@@ -611,6 +1144,11 @@ func startControlServer(socketPath string) {
 			"psk":                gPSKString,
 			"overlay_cidr":       overlayCIDR,
 			"rendezvous_servers": gRendezvous,
+			// The rendezvous credential travels with the join details so a
+			// phone that scans the QR can actually USE the server. It is no
+			// more sensitive than the PSK sitting next to it, and this page
+			// is already admin-authenticated.
+			"rendezvous_auth": gRendezvousCred,
 			// Top trackers so a scanned phone uses this network's discovery
 			// (incl. any private tracker) instead of only its compiled-in
 			// defaults. Capped so the QR stays small enough to scan.
@@ -703,7 +1241,7 @@ func startControlServer(socketPath string) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if len(adminPub) == 0 {
+		if len(adminPubBytes()) == 0 {
 			http.Error(w, "no admin public key configured on this node (set ADMIN_PUBLIC_KEY)", http.StatusBadRequest)
 			return
 		}
@@ -730,6 +1268,54 @@ func startControlServer(socketPath string) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": rec.Action, "changed": changed})
 	})
 
+	// Apply an admin-signed network share/unshare (join or leave a secondary
+	// network): verify, store, gossip immediately, and apply if it targets this
+	// node. The multi-network management endpoints live in multinet.go.
+	mux.HandleFunc("/api/netshare-signed", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var rec SignedNetShare
+		if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(adminPubBytes()) == 0 {
+			http.Error(w, "no admin public key configured on this node", http.StatusBadRequest)
+			return
+		}
+		if !verifyNetShare(rec) {
+			http.Error(w, "signature verification failed", http.StatusUnauthorized)
+			return
+		}
+		changed := netShares.apply(rec)
+		if changed {
+			applyNetShareSelf(rec)
+		}
+		// Flood immediately so the target (and every store-and-forward node)
+		// gets it without waiting for the keepalive gossip tick.
+		if frame := buildNetShareFrame(rec); frame != nil {
+			for _, addr := range GlobalSessions.EstablishedAddrs() {
+				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
+					_ = sendPacket(GlobalConn, addr, s, frame)
+				}
+			}
+		}
+		log.Printf("[admin] applied signed net-%s of %s for network %q (seq %d, changed=%v)",
+			rec.Action, rec.PubKey[:min(12, len(rec.PubKey))], rec.NetworkName, rec.Seq, changed)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": rec.Action, "changed": changed})
+	})
+
+	// List stored share records (the panel shows which devices are shared into
+	// which networks, and derives the next Seq).
+	mux.HandleFunc("/api/netshares", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, netShares.list())
+	})
+
+	// Multi-network management: /api/networks, /api/network-add, -remove, -set.
+	registerMultinetAPI(mux)
+
 	// Apply an admin-signed provision (overlay IP and/or friendly name for a
 	// target node): verify, store, gossip to peers immediately, and apply if it
 	// targets this node.
@@ -743,7 +1329,7 @@ func startControlServer(socketPath string) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if len(adminPub) == 0 {
+		if len(adminPubBytes()) == 0 {
 			http.Error(w, "no admin public key configured on this node", http.StatusBadRequest)
 			return
 		}
@@ -847,6 +1433,72 @@ func startControlServer(socketPath string) {
 	// Per-node IPv6 transport toggle. Persists a local override (survives
 	// restarts) and reports whether a restart is needed to apply it (changing
 	// IPv6 re-binds the UDP socket, so it takes effect on the next start).
+	// Rendezvous discovery config (servers + credential). Lets the admin panel
+	// on a CONTAINERIZED node — where there is no desktop Settings window —
+	// point the node at a discovery server without editing YAML and
+	// redeploying. Persisted to node settings; applies on restart.
+	mux.HandleFunc("/api/rendezvous-config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// Never echo the credential back — the panel shows whether one is
+			// set, not what it is (same rule as every password field here).
+			writeJSON(w, http.StatusOK, map[string]any{
+				"servers":  gRendezvous,
+				"auth_set": gRendezvousCred != "",
+				"auth_user": func() string {
+					if u, _, ok := strings.Cut(gRendezvousCred, ":"); ok {
+						return u
+					}
+					return ""
+				}(),
+			})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Servers []string `json:"servers"`
+			User    string   `json:"user"`
+			Pass    string   `json:"pass"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		clean := make([]string, 0, len(req.Servers))
+		for _, s := range req.Servers {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+				http.Error(w, "rendezvous URLs must start with http:// or https://", http.StatusBadRequest)
+				return
+			}
+			clean = append(clean, s)
+		}
+		// Recombine into the single credential string the client uses.
+		auth := ""
+		if u := strings.TrimSpace(req.User); u != "" {
+			if p := strings.TrimSpace(req.Pass); p != "" {
+				auth = u + ":" + p
+			} else {
+				auth = u
+			}
+		}
+		if err := saveNodeRendezvous(clean, auth); err != nil {
+			http.Error(w, "no persistent settings path configured on this node (set NODE_SETTINGS_FILE)", http.StatusBadRequest)
+			return
+		}
+		// Apply the credential live; the server LIST is read at announce time
+		// from cfg, so a restart is what makes new servers take effect.
+		gRendezvousCred = auth
+		log.Printf("[admin] rendezvous config updated — %d server(s), credential set=%v (restart to apply servers)",
+			len(clean), auth != "")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "servers": clean, "auth_set": auth != ""})
+	})
+
 	mux.HandleFunc("/api/set-ipv6", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)

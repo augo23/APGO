@@ -4,8 +4,10 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // setupExitNAT turns this Linux node into an internet exit for overlay clients:
@@ -35,20 +37,41 @@ func setupExitNAT() error {
 	if dev == "" {
 		dev = "ovl0"
 	}
+	// Pick an iptables binary that actually works on THIS kernel. "iptables"
+	// in the container image is the LEGACY (xtables) variant; on a modern
+	// nftables-only host kernel every legacy call fails with "can't
+	// initialize iptables table `nat'" — which silently disabled exit-node
+	// mode on exactly the hosts most people run Kubernetes on. Probe the
+	// candidates with a harmless read and use the first one that can even
+	// SEE the nat table.
+	var ipt string
+	var probeErrs []string
+	for _, cand := range []string{"iptables", "iptables-nft", "iptables-legacy"} {
+		if out, err := exec.Command(cand, "-t", "nat", "-L", "POSTROUTING", "-n").CombinedOutput(); err == nil {
+			ipt = cand
+			break
+		} else {
+			probeErrs = append(probeErrs, fmt.Sprintf("%s: %v (%s)", cand, err, strings.TrimSpace(string(out))))
+		}
+	}
+	if ipt == "" {
+		return fmt.Errorf("no working iptables variant on this kernel — %s", strings.Join(probeErrs, "; "))
+	}
 	// Idempotent: delete-then-add so repeated starts don't stack rules.
 	run := func(args ...string) {
-		_ = exec.Command("iptables", args...).Run()
+		_ = exec.Command(ipt, args...).Run()
 	}
 	// MASQUERADE overlay-sourced traffic leaving via a non-overlay interface.
 	run("-t", "nat", "-D", "POSTROUTING", "-s", cidr, "!", "-o", dev, "-j", "MASQUERADE")
-	if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING",
+	if out, err := exec.Command(ipt, "-t", "nat", "-A", "POSTROUTING",
 		"-s", cidr, "!", "-o", dev, "-j", "MASQUERADE").CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables MASQUERADE: %v (%s)", err, out)
+		return fmt.Errorf("%s MASQUERADE: %v (%s)", ipt, err, out)
 	}
 	// Allow forwarding in both directions for the overlay subnet.
 	run("-D", "FORWARD", "-s", cidr, "-j", "ACCEPT")
 	run("-A", "FORWARD", "-s", cidr, "-j", "ACCEPT")
 	run("-D", "FORWARD", "-d", cidr, "-j", "ACCEPT")
 	run("-A", "FORWARD", "-d", cidr, "-j", "ACCEPT")
+	log.Printf("[exit] Linux NAT ready — %s masquerading %s (dev %s)", ipt, cidr, dev)
 	return nil
 }

@@ -28,7 +28,7 @@ type Config struct {
 	NetworkName   string   `json:"network_name"`
 	PSK           string   `json:"psk"`
 	OverlayCIDR   string   `json:"overlay_cidr"`
-	OverlayIP     string   `json:"overlay_ip"`   // this device's overlay address (e.g. 10.28.55.30)
+	OverlayIP     string   `json:"overlay_ip"`   // this device's overlay address (e.g. 10.22.55.30)
 	UDPListenPort int      `json:"udp_listen_port"`
 	Cipher        string   `json:"cipher"`
 	STUNServers   []string `json:"stun_servers"`

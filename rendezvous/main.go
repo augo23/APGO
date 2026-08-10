@@ -19,6 +19,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -69,7 +70,47 @@ func (r *registry) announce(network, endpoint string) []string {
 			out = append(out, ep)
 		}
 	}
+	// Never leave an empty network behind: every distinct network name costs a
+	// map entry that used to live FOREVER — anyone spraying random names could
+	// grow this server's memory without bound.
+	if len(m) == 0 {
+		delete(r.nets, network)
+	}
 	return out
+}
+
+// sweep drops expired endpoints and empty networks. announce() already prunes
+// the network being touched; this catches networks nobody announces to anymore
+// (the leak: one POST with a unique name used to leave state behind for the
+// life of the process).
+func (r *registry) sweep() {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, m := range r.nets {
+		for ep, e := range m {
+			if now.Sub(e.lastSeen) > r.ttl {
+				delete(m, ep)
+			}
+		}
+		if len(m) == 0 {
+			delete(r.nets, name)
+		}
+	}
+}
+
+// validEndpoint accepts only a plausible "host:port" (or "[v6]:port") string —
+// junk never enters the registry, and clients never receive garbage to dial.
+func validEndpoint(ep string) bool {
+	if len(ep) == 0 || len(ep) > 64 {
+		return false
+	}
+	host, portStr, err := net.SplitHostPort(ep)
+	if err != nil || net.ParseIP(host) == nil {
+		return false
+	}
+	p, err := strconv.Atoi(portStr)
+	return err == nil && p > 0 && p <= 65535
 }
 
 func main() {
@@ -78,9 +119,21 @@ func main() {
 		ttl = v
 	}
 	reg := newRegistry(time.Duration(ttl) * time.Second)
+	// Background sweep so abandoned networks are reclaimed even when nothing
+	// announces to them again.
+	go func() {
+		t := time.NewTicker(reg.ttl)
+		defer t.Stop()
+		for range t.C {
+			reg.sweep()
+		}
+	}()
+
+	auth := loadAuthConfig()
+	auth.logStartupState()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/rendezvous", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/rendezvous", auth.requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
@@ -94,11 +147,28 @@ func main() {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		// The network id is a hex info-hash (40 chars); anything much longer is
+		// junk. Malformed endpoints are recorded as "" (query-only announce).
+		if len(req.Network) > 64 {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !validEndpoint(req.Endpoint) {
+			req.Endpoint = ""
+		}
 		peers := reg.announce(req.Network, req.Endpoint)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"peers": peers})
-	})
+	}))
+	// Health check stays UNAUTHENTICATED: Kubernetes probes and load balancers
+	// have no credential, and it reveals nothing (no network names, no peers).
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
+	// Lets a client verify its credential without announcing anything — the
+	// "Test connection" button in the apps posts here.
+	mux.HandleFunc("/api/auth-check", auth.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "auth_required": auth.enabled()})
+	}))
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {

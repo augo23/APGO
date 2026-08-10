@@ -33,6 +33,7 @@ func handleAPIApprove(w http.ResponseWriter, r *http.Request) {
 		PubKey   string `json:"pubkey"`
 		Action   string `json:"action"` // "approve" | "deny"
 		Password string `json:"password"`
+		Net      string `json:"net"` // "" / "main" or a secondary network id
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8192))
 	if json.Unmarshal(body, &req) != nil || req.PubKey == "" {
@@ -62,8 +63,13 @@ func handleAPIApprove(w http.ResponseWriter, r *http.Request) {
 	if akf, ok := currentAdminKeyFile(); ok {
 		distributeSealedKey(akf)
 	}
+	sock, sockErr := netSocketByID(req.Net)
+	if sockErr != nil {
+		http.Error(w, sockErr.Error(), http.StatusBadRequest)
+		return
+	}
 	recBytes, _ := json.Marshal(rec)
-	code, resp, err := ctlPost("/api/approve-signed", recBytes)
+	code, resp, err := ctlPostOn(sock, "/api/approve-signed", recBytes)
 	proxyJSON(w, code, resp, err)
 }
 
@@ -82,6 +88,28 @@ func handleAPISetIPv6(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
 	code, resp, err := ctlPost("/api/set-ipv6", body)
+	proxyJSON(w, code, resp, err)
+}
+
+// handleAPIRendezvousConfig proxies the rendezvous discovery config (server
+// list + credential) to/from the local client control socket. GET never
+// returns the credential itself, only whether one is set.
+func handleAPIRendezvousConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		code, resp, err := ctlGet("/api/rendezvous-config")
+		proxyJSON(w, code, resp, err)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("X-Requested-With") != "overlay-admin" {
+		http.Error(w, "missing X-Requested-With header", http.StatusBadRequest)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	code, resp, err := ctlPost("/api/rendezvous-config", body)
 	proxyJSON(w, code, resp, err)
 }
 
@@ -222,6 +250,32 @@ func networkPage(current string, pq, ipv6 bool) string {
 		ipv6Checked = "checked"
 	}
 	return pageShell("Settings", `
+  <h1>This device</h1>
+  <p class="sub">Rename this device or move it to a different overlay address. Applies as an admin-signed provision — every node on the mesh learns the change within seconds. (This replaces the old "Edit this device" button on the dashboard.)</p>
+  <label>Device name</label>
+  <input id="selfName" type="text" spellcheck="false" autocapitalize="off">
+  <label>Overlay IP (last octet or full address — blank = keep current)</label>
+  <input id="selfIp" type="text" spellcheck="false" autocapitalize="off">
+  <label>Network admin password</label>
+  <input id="selfPw" type="password">
+  <button type="button" class="primary" onclick="saveSelf()">Apply device settings</button>
+  <p id="smsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
+  <h1>Rendezvous discovery</h1>
+  <p class="sub">HTTP(S) discovery servers for networks that block BitTorrent — an alternative to trackers. One URL per line. If your server requires a credential, fill in the username and password (HTTP Basic), or put a token in the username box alone (Bearer). Both are included in this network's Join QR, so phones scanning it get working discovery with no typing. Applies to THIS node on its next restart.</p>
+  <label>Server URLs</label>
+  <textarea id="rvServers" rows="3" spellcheck="false" placeholder="https://rv.example.com"></textarea>
+  <label>Username or token (optional)</label>
+  <input id="rvUser" type="text" spellcheck="false" autocapitalize="off">
+  <label>Password (blank if using a token)</label>
+  <input id="rvPass" type="password" autocomplete="off">
+  <button type="button" class="primary" onclick="saveRendezvous()">Save rendezvous settings</button>
+  <p id="rmsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
   <h1>Transport</h1>
   <p class="sub">IPv6 dual-stack transport. Where a node has a routable IPv6 address (many home ISPs and phone hotspots), peers connect directly over v6 with no NAT — this is what fixes CGNAT/hotspot reachability. The overlay itself stays IPv4. Per-node setting; applies to THIS node on its next restart.</p>
   <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
@@ -263,11 +317,123 @@ func networkPage(current string, pq, ipv6 bool) string {
   <p id="msg" class="msg"></p>
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
+  <h1>Dashboard login</h1>
+  <p class="sub">Change the username/password for THIS node's dashboard (separate from the network admin password).</p>
+  <label>Current password</label>
+  <input id="accCur" type="password" autocomplete="off">
+  <label>New username</label>
+  <input id="accUser" type="text" spellcheck="false" autocapitalize="off" value="`+html.EscapeString(currentUsername())+`">
+  <label>New password (min 6 characters)</label>
+  <input id="accPw" type="password" autocomplete="off">
+  <label>Confirm new password</label>
+  <input id="accPw2" type="password" autocomplete="off">
+  <button type="button" class="primary" onclick="saveAccount()">Change dashboard login</button>
+  <p id="amsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
   <h1>More settings</h1>
   <p class="sub"><a href="/adminkey">Network admin key &amp; password →</a></p>
   <p class="sub"><a href="/trackers">Trackers →</a></p>
-  <p class="sub"><a href="/account">Dashboard login (account) →</a></p>
 `, `
+// "This device" — prefill from the client, apply via the same admin-signed
+// provision API the per-peer Edit buttons use.
+let selfInfo = {pubkey:"", ip:"", name:""};
+(async () => {
+  try {
+    const r = await fetch('/api/info', {headers:{'X-Requested-With':'overlay-admin'}});
+    if(!r.ok) return;
+    const j = await r.json();
+    selfInfo = {pubkey: j.public_key||'', ip: j.overlay_ip||'', name: j.friendly_name||''};
+    const n = document.getElementById('selfName');
+    if(n && !n.value) n.value = selfInfo.name;
+    const ip = document.getElementById('selfIp');
+    if(ip) ip.placeholder = selfInfo.ip || 'e.g. 42';
+  } catch(e) {}
+})();
+// Rendezvous discovery — load current config, then save via the client's
+// control API. The credential is never echoed back by the server, so the
+// password box starts blank and is only sent when the admin types one.
+(async () => {
+  try {
+    const r = await fetch('/api/rendezvous-config', {headers:{'X-Requested-With':'overlay-admin'}});
+    if(!r.ok) return;
+    const j = await r.json();
+    const t = document.getElementById('rvServers');
+    if(t) t.value = (j.servers||[]).join('\n');
+    const u = document.getElementById('rvUser');
+    if(u) u.value = j.auth_user || '';
+    if(j.auth_set && !j.auth_user){
+      // A bare token is set; show it as configured without revealing it.
+      if(u) u.placeholder = '(token configured — type to replace)';
+    }
+  } catch(e) {}
+})();
+async function saveRendezvous(){
+  const msg = document.getElementById('rmsg');
+  msg.textContent='Saving…'; msg.style.color='';
+  const servers = document.getElementById('rvServers').value
+    .split('\n').map(s=>s.trim()).filter(s=>s);
+  const body = JSON.stringify({
+    servers,
+    user: document.getElementById('rvUser').value.trim(),
+    pass: document.getElementById('rvPass').value,
+  });
+  try {
+    const r = await fetch('/api/rendezvous-config', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'}, body});
+    const t = await r.text();
+    msg.textContent = r.ok
+      ? 'Saved — restart this node to start using the new server list.'
+      : ('Failed: '+t.trim());
+    msg.style.color = r.ok ? '#38c172' : '#e6b400';
+    if(r.ok) document.getElementById('rvPass').value='';
+  } catch(e) {
+    msg.textContent='Request failed — is the client running?'; msg.style.color='#e6b400';
+  }
+}
+async function saveSelf(){
+  const msg = document.getElementById('smsg');
+  const name = document.getElementById('selfName').value.trim();
+  let ip = document.getElementById('selfIp').value.trim();
+  const password = document.getElementById('selfPw').value;
+  if(!selfInfo.pubkey){ msg.textContent='The client is not connected yet — try again in a moment.'; msg.style.color='#e6b400'; return; }
+  if(!name && !ip){ msg.textContent='Enter a device name or an overlay IP.'; msg.style.color='#e6b400'; return; }
+  if(!password){ msg.textContent='Network admin password is required.'; msg.style.color='#e6b400'; return; }
+  // A bare last-octet is expanded against this node's current subnet prefix.
+  if(ip && !ip.includes('.')){
+    const b = (selfInfo.ip||'10.22.55.0').split('/')[0].split('.');
+    if(b.length >= 3) ip = b[0]+'.'+b[1]+'.'+b[2]+'.'+ip;
+  }
+  msg.textContent='Applying…'; msg.style.color='';
+  try {
+    const r = await fetch('/api/provision', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+      body: JSON.stringify({pubkey: selfInfo.pubkey, address: ip, name, password})});
+    const t = await r.text();
+    msg.textContent = r.ok ? 'Applied — the mesh picks it up within seconds.' : ('Failed: '+t.trim());
+    msg.style.color = r.ok ? '#38c172' : '#e6b400';
+    if(r.ok) document.getElementById('selfPw').value='';
+  } catch(e) {
+    msg.textContent='Request failed — is the client running?'; msg.style.color='#e6b400';
+  }
+}
+async function saveAccount(){
+  const msg=document.getElementById('amsg');
+  const pw=document.getElementById('accPw').value;
+  if(pw!==document.getElementById('accPw2').value){
+    msg.textContent="The new passwords don't match — type the same password in both boxes.";
+    msg.style.color='#e6b400'; return;
+  }
+  msg.textContent='Saving…'; msg.style.color='';
+  const body=new URLSearchParams({current_password:document.getElementById('accCur').value,
+    new_username:document.getElementById('accUser').value,new_password:pw,new_password2:pw});
+  const r=await fetch('/account',{method:'POST',headers:{'X-Requested-With':'overlay-admin'},body});
+  const t=await r.text();
+  msg.textContent = r.ok ? t : ('Failed: '+t.trim());
+  msg.style.color = r.ok ? '#38c172' : '#e6b400';
+  if(r.ok){for(const id of ['accCur','accPw','accPw2'])document.getElementById(id).value='';}
+}
 async function setIPv6(){
   const msg=document.getElementById('imsg'); msg.textContent='Saving…';
   const on=document.getElementById('ipv6').checked;
@@ -381,6 +547,9 @@ func pageShell(title, body, script string) string {
   .trow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:6px}
   .turl{flex:1;font-size:13px;word-break:break-all}
   .rm{background:transparent;color:#e06c6c;border:1px solid var(--line);padding:5px 10px}
+  /* In-page links (e.g. "More settings") follow the theme foreground (white on
+     the dark theme) instead of browser-default blue. */
+  a{color:var(--fg)}
   a.back{display:inline-block;margin-top:18px;color:var(--muted);font-size:13px;text-decoration:none;border:1px solid var(--line);padding:9px 16px;border-radius:10px}
   a.backtop{display:inline-block;margin:0 0 16px;color:var(--fg);font-size:13px;font-weight:600;text-decoration:none;border:1px solid var(--line);padding:7px 14px;border-radius:10px}
 </style></head><body>

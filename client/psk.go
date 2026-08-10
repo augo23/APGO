@@ -13,6 +13,11 @@ import (
 // format the client expects.
 func generatePSK() string {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// A CSPRNG failure must never silently yield an all-zero network
+		// membership secret. Nothing on this system is trustworthy anymore;
+		// fail loudly instead of minting a guessable PSK.
+		panic("crypto/rand failure while generating a PSK: " + err.Error())
+	}
 	return "base64:" + base64.StdEncoding.EncodeToString(b)
 }

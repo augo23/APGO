@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 // SignedApproval mirrors the admin's struct; canonicalApproval defines the bytes
@@ -39,11 +41,113 @@ func admissionRequired() bool {
 	return adminKeySet()
 }
 
-// admitted reports whether a peer key is admin-APPROVED. This is now a purely
-// informational whitelist marker (shown in the dashboard as approved/pending) —
-// it does NOT gate the data plane. Blocking a device is done with Revoke, which
-// tears down its session and refuses re-handshake. Without an admin key on the
-// network everyone is "approved" (nothing to gate).
+// --- data-plane enforcement toggle ----------------------------------------
+
+// admissionEnforced reports whether unapproved peers are actually BLOCKED, as
+// opposed to merely logged. Read once at startup from ADMISSION_ENFORCE
+// ("1"/"true"/"yes"/"on").
+//
+// DEFAULT OFF, deliberately, and this default is load-bearing. Enforcement cuts
+// the data plane for every peer that has not been explicitly approved — and on
+// a network where approvals were never enforced, that is every peer at once.
+// The failure mode is nasty to debug because control frames stay exempt: the
+// node keeps gossiping, so it still appears in everyone's peer list at full
+// health while passing no traffic whatsoever. Visible but unreachable.
+//
+// So the rollout is: deploy with this OFF, watch the "[admission] would drop"
+// lines to see the real blast radius, approve everything that belongs, and only
+// then set ADMISSION_ENFORCE=1.
+var (
+	admissionEnforceOnce sync.Once
+	admissionEnforceVal  bool
+)
+
+func admissionEnforced() bool {
+	admissionEnforceOnce.Do(func() {
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("ADMISSION_ENFORCE"))) {
+		case "1", "true", "yes", "on":
+			admissionEnforceVal = true
+		}
+		if !admissionRequired() {
+			return // no admin key — nothing to gate, stay quiet
+		}
+		if admissionEnforceVal {
+			log.Printf("[admission] ENFORCING — unapproved peers cannot pass overlay data")
+		} else {
+			log.Printf("[admission] warn-only — unapproved peers still pass data; set ADMISSION_ENFORCE=1 to block")
+		}
+	})
+	return admissionEnforceVal
+}
+
+// admissionLogEvery throttles the per-peer message. Without it an unapproved
+// peer logs on every single packet and buries everything else.
+const admissionLogEvery = 30 * time.Second
+
+var (
+	admissionLogMu   sync.Mutex
+	admissionLogSeen = map[[32]byte]time.Time{}
+)
+
+// admissionOK is THE data-plane gate — every enforcement point calls this, not
+// admitted(). It returns whether the peer's traffic may pass; in warn-only mode
+// it returns true while logging what enforcement would have dropped.
+//
+// admitted() stays the pure predicate on purpose: the dashboard's
+// approved/pending badge must keep showing real approval state regardless of
+// whether enforcement is switched on.
+//
+// where is a short label ("ingress", "relay-in", "egress", …) so the log says
+// which path a peer is being blocked on.
+func admissionOK(pub [32]byte, where string) bool {
+	if admitted(pub) {
+		return true
+	}
+	enforcing := admissionEnforced()
+	admissionLogMu.Lock()
+	last, seen := admissionLogSeen[pub]
+	fresh := !seen || time.Since(last) > admissionLogEvery
+	if fresh {
+		admissionLogSeen[pub] = time.Now()
+	}
+	admissionLogMu.Unlock()
+	if fresh {
+		if enforcing {
+			log.Printf("[admission] DROP %s from unapproved peer %s", where, peerKeyFingerprint(pub[:]))
+		} else {
+			log.Printf("[admission] would drop %s from unapproved peer %s (set ADMISSION_ENFORCE=1 to enforce)", where, peerKeyFingerprint(pub[:]))
+		}
+	}
+	return !enforcing
+}
+
+// admitted reports whether a peer key is admin-APPROVED, and it DOES gate the
+// data plane again.
+//
+// History, because this flipped twice: it originally gated data, was then
+// downgraded to a purely informational dashboard marker with blocking left to
+// Revoke, and is now enforcing once more. The informational version had a
+// surprising consequence — a device sitting in the "pending" list had full
+// overlay access, and could reach every other node through any admitted node's
+// relay paths, because the relay handlers checked revocation but not approval.
+// Pending looked like a gate and was not one.
+//
+// Enforcement points (mirrored in ios/core):
+//   - ingress data path, after control-frame dispatch
+//   - case 'R' relay handler, on both the requesting and forwarding sessions
+//   - the return-path relay in the decrypt loop
+//   - egress unicast and the discovery flood
+//   - case 'A', which no longer learns an unapproved peer's overlay IP
+//
+// Control frames stay EXEMPT everywhere: an unapproved peer must be able to
+// exchange them or it can never learn the admin key and its own approval, and
+// approval would be unreachable by design.
+//
+// Revoke remains the stronger action — it tears down the session and refuses
+// re-handshake, whereas an unapproved peer may still hold a session and talk
+// control frames. Without an admin key on the network everyone is "approved"
+// (admissionRequired() is false), so none of this affects a deployment that
+// never opted in.
 func admitted(pub [32]byte) bool {
 	if !admissionRequired() {
 		return true

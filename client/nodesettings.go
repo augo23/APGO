@@ -19,6 +19,38 @@ type nodeSettings struct {
 	// "unset" (nil) means "fall back to config/env". Unlike IPv6 it also
 	// applies LIVE (via setExitPin) — no restart needed.
 	ExitPeer *string `json:"exit_peer,omitempty"`
+	// Rendezvous discovery, settable from the admin panel so a containerized
+	// node (where there is no desktop Settings window) can be pointed at a
+	// discovery server without editing YAML and redeploying. Pointers so
+	// "unset" falls back to config/env. RendezvousAuth is the combined
+	// credential: "user:pass" = HTTP Basic, bare = Bearer, "" = none.
+	RendezvousServers *[]string `json:"rendezvous_servers,omitempty"`
+	RendezvousAuth    *string   `json:"rendezvous_auth,omitempty"`
+}
+
+// saveNodeRendezvous persists the rendezvous server list + credential.
+func saveNodeRendezvous(servers []string, auth string) error {
+	p := nodeSettingsPath()
+	if p == "" {
+		return os.ErrInvalid
+	}
+	nodeSettingsMu.Lock()
+	defer nodeSettingsMu.Unlock()
+	s := nodeSettings{}
+	if data, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(data, &s)
+	}
+	s.RendezvousServers = &servers
+	s.RendezvousAuth = &auth
+	out, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
 }
 
 var nodeSettingsMu sync.Mutex

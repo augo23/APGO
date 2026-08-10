@@ -35,7 +35,7 @@
   <text x="225" y="374" text-anchor="middle" font-size="11" fill="#64748b">network_mode: host · NET_ADMIN · udp/6969</text>
   <text x="225" y="392" text-anchor="middle" font-size="11" fill="#64748b">X25519 node key → auto overlay IP</text>
   <rect x="85" y="424" width="280" height="46" rx="8" fill="#ffffff" stroke="#34d399"/>
-  <text x="225" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.28.55.x/24</text>
+  <text x="225" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.22.55.x/24</text>
   <text x="225" y="461" text-anchor="middle" font-size="11" fill="#64748b">kernel routes any IP traffic (SSH, HTTP, ping…)</text>
   <text x="225" y="500" text-anchor="middle" font-size="11" fill="#64748b">apps ⇄ ovl0 ⇄ encrypted UDP</text>
 
@@ -47,7 +47,7 @@
   <text x="735" y="374" text-anchor="middle" font-size="11" fill="#64748b">network_mode: host · NET_ADMIN · udp/6969</text>
   <text x="735" y="392" text-anchor="middle" font-size="11" fill="#64748b">X25519 node key → auto overlay IP</text>
   <rect x="595" y="424" width="280" height="46" rx="8" fill="#ffffff" stroke="#34d399"/>
-  <text x="735" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.28.55.y/24</text>
+  <text x="735" y="443" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">TUN ovl0 — 10.22.55.y/24</text>
   <text x="735" y="461" text-anchor="middle" font-size="11" fill="#64748b">kernel routes any IP traffic (SSH, HTTP, ping…)</text>
   <text x="735" y="500" text-anchor="middle" font-size="11" fill="#64748b">apps ⇄ ovl0 ⇄ encrypted UDP</text>
 

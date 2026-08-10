@@ -12,6 +12,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -53,13 +55,12 @@ func main() {
 		return
 	}
 
-	initBootstrap()
 	loadLoginThrottle() // restore brute-force backoff state across restarts
-	if bootstrapPassword != "" {
+	if mustSetup() {
 		log.Println("============================================================")
 		log.Println("[admin] No dashboard login is configured yet.")
-		log.Printf("[admin]   Temporary login -> username: %q  password: %s", adminUser, bootstrapPassword)
-		log.Println("[admin]   Sign in with these; you'll be asked to set your own password.")
+		log.Printf("[admin]   Open the dashboard (port %s) to create your", listenAddr)
+		log.Println("[admin]   username and password — first visit claims the panel.")
 		log.Println("============================================================")
 	}
 
@@ -84,8 +85,17 @@ func main() {
 	mux.HandleFunc("/api/approve", requireAuthAPI(handleAPIApprove))
 	mux.HandleFunc("/api/network", requireAuthAPI(handleAPINetwork))
 	mux.HandleFunc("/api/set-ipv6", requireAuthAPI(handleAPISetIPv6))
+	mux.HandleFunc("/api/rendezvous-config", requireAuthAPI(handleAPIRendezvousConfig))
 	mux.HandleFunc("/api/trackers", requireAuthAPI(handleAPITrackers))
 	mux.HandleFunc("/api/policy", requireAuthAPI(handleAPIPolicy))
+	mux.HandleFunc("/api/networks", requireAuthAPI(handleAPINetworks))
+	mux.HandleFunc("/api/network-add", requireAuthAPI(handleAPINetworkAdd))
+	mux.HandleFunc("/api/network-remove", requireAuthAPI(handleAPINetworkRemove))
+	mux.HandleFunc("/api/network-set", requireAuthAPI(handleAPINetworkSet))
+	mux.HandleFunc("/api/network-profile", requireAuthAPI(handleAPINetworkProfile))
+	mux.HandleFunc("/api/netshares", requireAuthAPI(handleAPINetShares))
+	mux.HandleFunc("/api/net-sessions", requireAuthAPI(handleAPINetSessions))
+	mux.HandleFunc("/api/share", requireAuthAPI(handleAPIShare))
 	mux.HandleFunc("/network-setup", handleNetworkSetup)
 	mux.HandleFunc("/", handleIndex)
 
@@ -105,12 +115,54 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// WAIT FOR THE ADDRESS TO EXIST.
+	//
+	// ADMIN_LISTEN is normally pinned to the node's OVERLAY address so the
+	// dashboard is published on the overlay and nowhere else. That address
+	// only exists once the overlay client has created and configured its TUN
+	// — and in a multi-container pod both start at the same instant, so this
+	// process routinely gets here first and bind() fails with EADDRNOTAVAIL.
+	//
+	// Exiting would be wrong: the container restarts, races again, and can
+	// crash-loop indefinitely while the cause ("the interface isn't up yet")
+	// looks like a configuration error. Retry instead — the interface appears
+	// within a second or two of the client starting, and the wait is bounded
+	// so a genuinely bad address is still reported clearly.
+	ln, err := listenWhenAddressAppears(listenAddr, 3*time.Minute)
+	if err != nil {
+		log.Fatalf("[admin] cannot listen on %s: %v", listenAddr, err)
+	}
+
 	if tlsCert != "" && tlsKey != "" {
 		log.Printf("overlay-admin listening on %s (https)", listenAddr)
-		log.Fatal(srv.ListenAndServeTLS(tlsCert, tlsKey))
+		log.Fatal(srv.ServeTLS(ln, tlsCert, tlsKey))
 	}
 	log.Printf("overlay-admin listening on %s (http) — put it behind TLS or an SSH tunnel for real use", listenAddr)
-	log.Fatal(srv.ListenAndServe())
+	log.Fatal(srv.Serve(ln))
+}
+
+// listenWhenAddressAppears binds addr, retrying while the failure is "that
+// address is not on this host yet" (the overlay interface is still coming up).
+// Any other error — a port already in use, a malformed address — is returned
+// immediately, because retrying those only hides the real problem.
+func listenWhenAddressAppears(addr string, budget time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(budget)
+	warned := false
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if !errors.Is(err, syscall.EADDRNOTAVAIL) || time.Now().After(deadline) {
+			return nil, err
+		}
+		if !warned {
+			log.Printf("[admin] %s is not on this host yet (the overlay interface is still coming up) — "+
+				"waiting up to %v for it", addr, budget)
+			warned = true
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // --- sessions (login cookie -> expiry) -----------------------------------
@@ -224,13 +276,14 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !authed(r) {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	if mustSetup() {
+		// First run with no compose credentials: create the login before
+		// anything else (no temporary password to dig out of the logs).
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
-	if mustSetup() {
-		// Signed in with the temporary password — force setting a real one.
-		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+	if !authed(r) {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 	if clientNeedsSetup() {
@@ -281,6 +334,27 @@ func handleNetworkSetup(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, networkSetupPage("Setup failed: "+msg))
 			return
 		}
+		// Rendezvous discovery, if the operator filled it in. Sent as a
+		// SEPARATE call because it is persisted in node settings (not the
+		// network identity), and deliberately best-effort: a discovery
+		// mis-entry must not fail an otherwise-successful network setup —
+		// it is editable afterwards in Settings.
+		if rv := strings.TrimSpace(r.FormValue("rendezvous")); rv != "" {
+			servers := []string{}
+			for _, s := range strings.Split(rv, ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					servers = append(servers, s)
+				}
+			}
+			rvPayload, _ := json.Marshal(map[string]any{
+				"servers": servers,
+				"user":    strings.TrimSpace(r.FormValue("rendezvous_user")),
+				"pass":    strings.TrimSpace(r.FormValue("rendezvous_pass")),
+			})
+			if _, _, rerr := ctlPost("/api/rendezvous-config", rvPayload); rerr != nil {
+				log.Printf("[setup] rendezvous config could not be saved: %v", rerr)
+			}
+		}
 		// The client persists the config and restarts; bounce back to the
 		// dashboard shortly.
 		fmt.Fprint(w, `<!DOCTYPE html><meta charset="utf-8"><meta http-equiv="refresh" content="6;url=/">
@@ -328,10 +402,10 @@ func networkSetupPage(msg string) string {
   <script>function genPsk(){var b=new Uint8Array(32);crypto.getRandomValues(b);document.getElementById('psk').value='base64:'+btoa(String.fromCharCode.apply(null,b));}</script>
 
   <label for="overlay_cidr">Overlay subnet (CIDR)</label>
-  <input id="overlay_cidr" name="overlay_cidr" type="text" value="10.28.55.0/24" spellcheck="false">
+  <input id="overlay_cidr" name="overlay_cidr" type="text" value="10.22.55.0/24" spellcheck="false">
 
   <label for="address">Overlay IP for THIS node (optional)</label>
-  <input id="address" name="address" type="text" spellcheck="false" placeholder="blank = auto-assign, or e.g. 10.28.55.5/24">
+  <input id="address" name="address" type="text" spellcheck="false" placeholder="blank = auto-assign, or e.g. 10.22.55.5/24">
 
   <label for="friendly_name">Friendly name (optional)</label>
   <input id="friendly_name" name="friendly_name" type="text" spellcheck="false">
@@ -341,11 +415,26 @@ func networkSetupPage(msg string) string {
   </label>
   <div class="hint">Future-proofs against quantum computers. Slightly slower; enable on every device.</div>
 
+  <label for="rendezvous">Rendezvous server URL (optional)</label>
+  <input id="rendezvous" name="rendezvous" type="text" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">
+  <div class="hint">HTTP(S) discovery for networks that block BitTorrent. Leave blank to use trackers. You can add or change this later in Settings.</div>
+
+  <label for="rendezvous_user">Rendezvous username or token (optional)</label>
+  <input id="rendezvous_user" name="rendezvous_user" type="text" spellcheck="false" autocapitalize="off">
+  <label for="rendezvous_pass">Rendezvous password</label>
+  <input id="rendezvous_pass" name="rendezvous_pass" type="password" placeholder="blank if using a token">
+  <div class="hint">Only if the server requires a credential: username <b>and</b> password (HTTP Basic), or just a token in the box above (Bearer). Both are carried in the Join QR for phones.</div>
+
   <button type="submit">Save &amp; connect</button>
 </form>` + banner + `</body></html>`
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
+	// No login exists yet — nothing to sign in with; create one instead.
+	if mustSetup() {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if authed(r) {
@@ -388,11 +477,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 // handleSetup is the one-time create-account page, shown only while no login
 // exists (blank compose credentials and no saved credentials file).
 func handleSetup(w http.ResponseWriter, r *http.Request) {
-	if !authed(r) {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
+	// First-run: no saved credentials and no compose ADMIN_PASSWORD — the
+	// setup page is reachable WITHOUT auth so the operator can create the
+	// login on first visit (there is no password to sign in with yet).
+	// The moment credentials exist, this page is gone for good.
 	if !mustSetup() {
+		if !authed(r) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -403,6 +496,10 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 		p := r.FormValue("password")
 		if u == "" || len(p) < 6 {
 			fmt.Fprint(w, setupPage("Enter a username and a password of at least 6 characters."))
+			return
+		}
+		if p != r.FormValue("password2") {
+			fmt.Fprint(w, setupPage("The passwords don't match — type the same password in both boxes."))
 			return
 		}
 		nc, err := newCreds(u, p)
@@ -444,9 +541,10 @@ func setupPage(msg string) string {
 </style></head><body>
 <form method="POST" autocomplete="off">
   <div class="brand"><img src="/static/logo.svg" alt="APGO"><h1>Create dashboard login</h1></div>
-  <p class="sub">You're signed in with the temporary password. Now set your own username and password.</p>
+  <p class="sub">First-time setup: choose the username and password for this dashboard.</p>
   <label>Username</label><input name="username" value="` + html.EscapeString(adminUser) + `" autofocus spellcheck="false" autocapitalize="off">
   <label>Password</label><input name="password" type="password">
+  <label>Confirm password</label><input name="password2" type="password">
   <button type="submit">Create</button>` + banner + `
 </form></body></html>`
 }
@@ -546,15 +644,30 @@ func handleAccount(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodPost {
 		_ = r.ParseForm()
+		// AJAX callers (the inline Dashboard-login section on /network) get
+		// plain-text responses instead of a full HTML page.
+		ajax := r.Header.Get("X-Requested-With") == "overlay-admin"
+		fail := func(msg string) {
+			if ajax {
+				http.Error(w, msg, http.StatusBadRequest)
+			} else {
+				fmt.Fprint(w, accountPage(msg))
+			}
+		}
 		cur := r.FormValue("current_password")
 		nu := strings.TrimSpace(r.FormValue("new_username"))
 		np := r.FormValue("new_password")
 		if nu == "" || len(np) < 6 {
-			fmt.Fprint(w, accountPage("Username is required and the new password must be at least 6 characters."))
+			fail("Username is required and the new password must be at least 6 characters.")
+			return
+		}
+		// Password typed twice — a typo'd dashboard password is a lockout.
+		if np != r.FormValue("new_password2") {
+			fail("The new passwords don't match — type the same password in both boxes.")
 			return
 		}
 		if !verifyCurrentPassword(cur) {
-			fmt.Fprint(w, accountPage("Current password is incorrect."))
+			fail("Current password is incorrect.")
 			return
 		}
 		nc, err := newCreds(nu, np)
@@ -562,10 +675,14 @@ func handleAccount(w http.ResponseWriter, r *http.Request) {
 			err = saveCreds(nc)
 		}
 		if err != nil {
-			fmt.Fprint(w, accountPage("Could not save: "+err.Error()))
+			fail("Could not save: " + err.Error())
 			return
 		}
-		fmt.Fprint(w, accountPage("Saved. Sign out and back in with the new credentials."))
+		if ajax {
+			fmt.Fprint(w, "Saved. Sign out and back in with the new credentials.")
+		} else {
+			fmt.Fprint(w, accountPage("Saved. Sign out and back in with the new credentials."))
+		}
 		return
 	}
 	fmt.Fprint(w, accountPage(""))
@@ -594,6 +711,7 @@ func accountPage(msg string) string {
   <label>Current password</label><input name="current_password" type="password" autofocus>
   <label>New username</label><input name="new_username" value="` + html.EscapeString(currentUsername()) + `" spellcheck="false" autocapitalize="off">
   <label>New password</label><input name="new_password" type="password">
+  <label>Confirm new password</label><input name="new_password2" type="password">
   <button type="submit">Save</button>
   <p style="margin-top:14px"><a href="/">← Back to dashboard</a></p>
 </form></body></html>`
@@ -687,10 +805,16 @@ func handleAPIRevoke(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Action   string `json:"action"`
 		Local    bool   `json:"local"`
+		Net      string `json:"net"` // "" / "main" or a secondary network id
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8192))
 	if json.Unmarshal(body, &req) != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	sock, sockErr := netSocketByID(req.Net)
+	if sockErr != nil {
+		http.Error(w, sockErr.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -701,7 +825,7 @@ func handleAPIRevoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		b, _ := json.Marshal(map[string]string{"pubkey": req.PubKey})
-		code, resp, err := ctlPost("/api/local-restore", b)
+		code, resp, err := ctlPostOn(sock, "/api/local-restore", b)
 		proxyJSON(w, code, resp, err)
 		return
 	}
@@ -732,7 +856,7 @@ func handleAPIRevoke(w http.ResponseWriter, r *http.Request) {
 			distributeSealedKey(akf)
 		}
 		recBytes, _ := json.Marshal(rec)
-		code, resp, err := ctlPost("/api/revoke-signed", recBytes)
+		code, resp, err := ctlPostOn(sock, "/api/revoke-signed", recBytes)
 		proxyJSON(w, code, resp, err)
 		return
 	}
@@ -743,7 +867,7 @@ func handleAPIRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, _ := json.Marshal(map[string]string{"remote": req.Remote})
-	code, resp, err := ctlPost("/api/revoke", b)
+	code, resp, err := ctlPostOn(sock, "/api/revoke", b)
 	proxyJSON(w, code, resp, err)
 }
 

@@ -21,9 +21,18 @@ echo "==> Building the native overlay client (../client)"
 APP="APGO.app"
 echo "==> Packaging $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp APGO "$APP/Contents/MacOS/APGO"
 cp ../client/overlay-client "$APP/Contents/MacOS/overlay-client"
+
+# Compile the iconset into APGO.icns and bundle it. Without an app icon, macOS
+# notifications posted by the app have no logo to show.
+if [[ -d AppIcon.iconset ]]; then
+  echo "==> Building app icon (AppIcon.iconset -> APGO.icns)"
+  iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/APGO.icns"
+else
+  echo "!! AppIcon.iconset not found — app will have no icon" >&2
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,6 +42,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>APGO</string>
   <key>CFBundleIdentifier</key><string>org.apgo.macos</string>
   <key>CFBundleExecutable</key><string>APGO</string>
+  <key>CFBundleIconFile</key><string>APGO</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>

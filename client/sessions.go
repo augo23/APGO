@@ -17,8 +17,18 @@ import (
 const sessionIdleTimeout = 5 * time.Minute
 const sessionEvictInterval = 15 * time.Second
 
+// Anti-replay window size, in packets. 8 x 64-bit words = 512 nonces of
+// tolerated reordering. WireGuard uses a comparable window; 64 (the old size)
+// was tight enough that multi-route peers (a device reachable on both its LAN
+// and WAN address at once) could deliver in-flight packets far enough apart to
+// be false-rejected as replays.
+const (
+	replayWindowWords = 8
+	replayWindowBits  = replayWindowWords * 64
+)
+
 // gKeepaliveInterval / sessionStaleTimeout are set from keepalive_seconds at
-// startup (defaults: 10s / 45s). Both sides keepalive every interval, so an
+// startup (defaults: 20s / 75s). Both sides keepalive every interval, so an
 // ESTABLISHED session with no inbound for sessionStaleTimeout has a dead or
 // one-way path (blocked inbound, expired NAT mapping, rebooted peer, …).
 // Tearing it down promptly — instead of waiting out sessionIdleTimeout —
@@ -26,8 +36,8 @@ const sessionEvictInterval = 15 * time.Second
 // rebuild a working path within seconds on ANY kind of network, rather than
 // blackholing traffic for up to 5 minutes.
 var (
-	gKeepaliveInterval  = 10 * time.Second
-	sessionStaleTimeout = 45 * time.Second
+	gKeepaliveInterval  = 20 * time.Second
+	sessionStaleTimeout = 75 * time.Second
 )
 
 // Retransmit / deadline knobs for the handshake state machines.
@@ -110,9 +120,14 @@ type session struct {
 	sendNonce uint64
 
 	// Anti-replay sliding window for inbound data packets. Only touched by
-	// the single UDP read goroutine, so no lock is needed.
+	// the single UDP read goroutine, so no lock is needed. The window is a
+	// little-endian bitmap (word 0 = least-significant): bit d marks the packet
+	// whose nonce is recvHighest-d as already seen. A wide window (512 packets)
+	// tolerates the reordering that legitimately happens when one peer is
+	// reachable over several routes at once (LAN + WAN) or under bursty load —
+	// a narrow window would false-reject those as "replayed or expired nonce".
 	recvHighest uint64
-	recvBitmap  uint64
+	recvWindow  [replayWindowWords]uint64
 	recvAny     bool
 
 	// decryptFails counts consecutive failed decrypts since the last
@@ -145,10 +160,10 @@ func (s *session) replayCheck(nonce uint64) bool {
 		return true
 	}
 	diff := s.recvHighest - nonce
-	if diff >= 64 {
+	if diff >= replayWindowBits {
 		return false // too old — outside the window
 	}
-	return s.recvBitmap&(1<<diff) == 0
+	return s.recvWindow[diff/64]&(1<<(diff%64)) == 0
 }
 
 // replayMark records a successfully authenticated nonce in the window.
@@ -156,22 +171,53 @@ func (s *session) replayMark(nonce uint64) {
 	if !s.recvAny {
 		s.recvAny = true
 		s.recvHighest = nonce
-		s.recvBitmap = 1
+		for i := range s.recvWindow {
+			s.recvWindow[i] = 0
+		}
+		s.recvWindow[0] = 1
 		return
 	}
 	if nonce > s.recvHighest {
-		shift := nonce - s.recvHighest
-		if shift >= 64 {
-			s.recvBitmap = 1
-		} else {
-			s.recvBitmap = (s.recvBitmap << shift) | 1
-		}
+		s.shiftWindow(nonce - s.recvHighest)
 		s.recvHighest = nonce
+		s.recvWindow[0] |= 1 // the new highest sits at diff 0
 		return
 	}
 	diff := s.recvHighest - nonce
-	if diff < 64 {
-		s.recvBitmap |= 1 << diff
+	if diff < replayWindowBits {
+		s.recvWindow[diff/64] |= 1 << (diff % 64)
+	}
+}
+
+// shiftWindow advances the window when a newer nonce arrives, sliding every
+// recorded bit up by `shift` positions (older). The bitmap is a little-endian
+// integer (word 0 = LSB), so this is a left shift by `shift` bits.
+func (s *session) shiftWindow(shift uint64) {
+	if shift >= replayWindowBits {
+		for i := range s.recvWindow {
+			s.recvWindow[i] = 0
+		}
+		return
+	}
+	wordShift := int(shift / 64)
+	bitShift := uint(shift % 64)
+	if wordShift > 0 {
+		for i := replayWindowWords - 1; i >= 0; i-- {
+			if i-wordShift >= 0 {
+				s.recvWindow[i] = s.recvWindow[i-wordShift]
+			} else {
+				s.recvWindow[i] = 0
+			}
+		}
+	}
+	if bitShift > 0 {
+		for i := replayWindowWords - 1; i >= 0; i-- {
+			v := s.recvWindow[i] << bitShift
+			if i > 0 {
+				v |= s.recvWindow[i-1] >> (64 - bitShift)
+			}
+			s.recvWindow[i] = v
+		}
 	}
 }
 
@@ -215,7 +261,20 @@ type SessionTable struct {
 	stopCh        chan struct{}
 	udpConn       *net.UDPConn
 	onSessionLost func(*net.UDPAddr)
+
+	// onNeedRediscovery re-announces to trackers and re-punches peers. It is
+	// nudged (rate-limited by lastRediscovery) when inbound overlay traffic
+	// arrives that we can't associate with any session — the tell that this
+	// node restarted and its peers are still talking to a session it no longer
+	// has. Without this a freshly restarted node can sit deaf for minutes until
+	// some other peer happens to initiate a handshake.
+	onNeedRediscovery func()
+	lastRediscovery   time.Time
 }
+
+// rediscoveryMinGap rate-limits self-rediscovery so a burst of un-decryptable
+// packets triggers at most one re-announce/re-punch per interval.
+const rediscoveryMinGap = 20 * time.Second
 
 func NewSessionTable(conn *net.UDPConn) *SessionTable {
 	t := &SessionTable{
@@ -245,6 +304,14 @@ func (t *SessionTable) evictLoop() {
 func (t *SessionTable) evictStale() {
 	t.mu.Lock()
 	now := time.Now()
+	// Prune long-expired back-off entries. Tracker swarms and PEX churn
+	// through endpoints indefinitely; without this the map grows for the
+	// life of the process (a slow leak on a node that runs for months).
+	for k, b := range t.peerBackoff {
+		if now.Sub(b.until) > 10*time.Minute {
+			delete(t.peerBackoff, k)
+		}
+	}
 	var lost []*net.UDPAddr
 	var lostKeys [][32]byte
 	for addr, s := range t.byAddr {
@@ -315,7 +382,36 @@ func (t *SessionTable) SetSessionLostCallback(fn func(*net.UDPAddr)) {
 	t.mu.Unlock()
 }
 
+// SetRediscoveryCallback registers the re-announce/re-punch action used by
+// NudgeRediscovery.
+func (t *SessionTable) SetRediscoveryCallback(fn func()) {
+	t.mu.Lock()
+	t.onNeedRediscovery = fn
+	t.mu.Unlock()
+}
+
+// NudgeRediscovery asks the node to re-announce and re-punch, at most once per
+// rediscoveryMinGap. Call it when overlay traffic arrives from a peer we have
+// no session for: after a restart the peers still hold their old sessions and
+// keep sending, so this turns their traffic into the trigger that pulls us back
+// onto the mesh instead of waiting to be re-found. It never replies to the
+// sender (no reflection/amplification) — it only re-announces us.
+func (t *SessionTable) NudgeRediscovery() {
+	t.mu.Lock()
+	cb := t.onNeedRediscovery
+	if cb == nil || time.Since(t.lastRediscovery) < rediscoveryMinGap {
+		t.mu.Unlock()
+		return
+	}
+	t.lastRediscovery = time.Now()
+	t.mu.Unlock()
+	go cb()
+}
+
 func (t *SessionTable) GetByAddr(addr *net.UDPAddr) *session {
+	if addr == nil {
+		return nil
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.byAddr[addr.String()]
@@ -418,8 +514,16 @@ func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 			if old.addr != nil {
 				others = append(others, old.addr)
 			}
-			if isPrivateUDPAddr(old.addr) && !newPrivate {
-				takeover = false // existing LAN route stays primary
+			// Only a PROVEN-LIVE LAN route outranks the new WAN session.
+			// A dead-but-established LAN route used to hold primary here,
+			// which parked the fresh working path as "backup" and blackholed
+			// the peer until the stale sweep — exactly the "LAN route stays
+			// primary; new <WAN> kept as backup" + 100% loss failure. Inline
+			// lastSeen check because t.mu is held (RouteIsLive would
+			// self-deadlock).
+			if isPrivateUDPAddr(old.addr) && !newPrivate &&
+				time.Since(old.lastSeen) <= routeLiveTimeout() {
+				takeover = false // existing live LAN route stays primary
 			}
 		}
 	}
@@ -437,14 +541,57 @@ func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 	log.Printf("[session] %s is now the primary route for this peer (%d backup route(s) kept for roaming failover)", key, len(others))
 }
 
-// isPrivateUDPAddr reports whether a terminates at an RFC1918/link-local/
-// loopback address — i.e. a directly-routable LAN path rather than a
-// router-hairpin or internet path.
+// isPrivateUDPAddr reports whether a terminates on a directly-attached network
+// — a LAN path rather than a router-hairpin or internet path.
+//
+// "Directly attached" is the property that actually matters here (it is what
+// makes the path low-latency and NAT-free), and it is NOT the same as RFC1918.
+// Testing only IsPrivate() meant that on a LAN using RFC6598 carrier-grade
+// space (100.64/10) or public addressing — both normal on fibre — a genuine
+// LAN route was classified as an internet route, so the LAN-preference rules
+// in ip_learning and the roaming-failover rule above never favoured it.
+// Checking our own attached subnets first covers those cases; the RFC1918
+// test stays as a fallback for addresses on a LAN we reach via another hop.
 func isPrivateUDPAddr(a *net.UDPAddr) bool {
 	if a == nil || a.IP == nil {
 		return false
 	}
+	if isAttachedLANAddr(a) {
+		return true
+	}
 	return a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback()
+}
+
+// EstablishedPeerCount returns the number of distinct DEVICES with an
+// established session — not the number of sessions.
+//
+// The two differ, and the difference is visible to users. A device reached over
+// both its LAN and its WAN address holds two established sessions on purpose:
+// the second is a warm standby so a roaming peer fails over without a new
+// handshake. Snapshot() collapses those into one row (see "Collapse same-key
+// entries"), so a dashboard that reported len(EstablishedAddrs()) as "peers
+// connected" showed a number LARGER than its own peer table — 8 against 6 —
+// with nothing on screen to account for the difference.
+func (t *SessionTable) EstablishedPeerCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var zero [32]byte
+	keys := make(map[[32]byte]struct{}, len(t.byAddr))
+	extra := 0
+	for _, s := range t.byAddr {
+		if !s.established {
+			continue
+		}
+		if s.peerStatic == zero {
+			extra++ // no key yet: cannot dedup it, so count it on its own
+			continue
+		}
+		keys[s.peerStatic] = struct{}{}
+	}
+	return len(keys) + extra
 }
 
 func (t *SessionTable) EstablishedAddrs() []*net.UDPAddr {
@@ -461,6 +608,41 @@ func (t *SessionTable) EstablishedAddrs() []*net.UDPAddr {
 
 func (s *session) Established() bool {
 	return s != nil && s.established && s.send != nil && s.recv != nil
+}
+
+// routeLiveTimeout is how long an established session may go without any
+// DECRYPTED INBOUND packet before we stop treating it as the authoritative
+// path to its peer. Two missed keepalives (plus a little slack) is the same
+// evidence threshold NoteDecryptFailure uses, and it sits well inside
+// sessionStaleTimeout — so a one-way route stops suppressing the relay
+// fallback ~20s before the liveness sweep tears it down.
+func routeLiveTimeout() time.Duration {
+	return 2*gKeepaliveInterval + 2*time.Second
+}
+
+// RouteIsLive reports whether addr's session is not merely ESTABLISHED but
+// PROVEN bidirectional right now.
+//
+// Established() only means a handshake once completed. That is not evidence
+// the path still works: under a symmetric NAT (notably a pod behind the CNI
+// bridge, whose external port is an ephemeral per-destination masquerade
+// mapping) the return path can die while the local session object stays
+// "established" for a further sessionStaleTimeout. Callers that use an
+// ipLearning hit to SUPPRESS the relay/discovery fallback must gate on this
+// instead, or they unicast into a black hole and never try the relay that
+// would have worked — the peer stays visible in the roster while passing no
+// data. See sendControlToward and the TUN egress fast path.
+func (t *SessionTable) RouteIsLive(addr *net.UDPAddr) bool {
+	if t == nil || addr == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.byAddr[addr.String()]
+	if s == nil || !s.established || s.send == nil || s.recv == nil {
+		return false
+	}
+	return time.Since(s.lastSeen) <= routeLiveTimeout()
 }
 
 // TouchLastSeen bumps lastSeen on the session for addr to now. Called when
@@ -537,6 +719,16 @@ func logDecryptError(addr string, err error) {
 	decryptErrMu.Lock()
 	st := decryptErrs[addr]
 	if st == nil {
+		// Opportunistic pruning: drop damper state for peers whose window is
+		// long past, so churning endpoints can't grow this map forever.
+		if len(decryptErrs) > 1024 {
+			cutoff := time.Now().Add(-10 * time.Minute)
+			for k, old := range decryptErrs {
+				if old.windowStart.Before(cutoff) {
+					delete(decryptErrs, k)
+				}
+			}
+		}
 		st = &decryptErrState{}
 		decryptErrs[addr] = st
 	}
@@ -982,10 +1174,14 @@ func (t *SessionTable) Deliver(raddr *net.UDPAddr, typ byte, body []byte, kp key
 	}
 	t.mu.Unlock()
 
-	// Push body onto pending.msgs. If the channel is full, drop —
-	// retransmits will cover for us.
+	// Push a COPY of body onto pending.msgs. body aliases the UDP read loop's
+	// shared receive buffer, which is overwritten by the very next datagram —
+	// but the handshake goroutine consumes the channel asynchronously. Without
+	// the copy, a busy socket corrupts in-flight msg2/msg3 bodies and the
+	// handshake fails with a bogus "crypto mismatch" (then backs off for up to
+	// 60s). If the channel is full, drop — retransmits will cover for us.
 	select {
-	case p.msgs <- body:
+	case p.msgs <- append([]byte(nil), body...):
 	default:
 	}
 
@@ -1112,10 +1308,19 @@ waitForS:
 		initiator:   false,
 	})
 	log.Printf("session established with %s (responder)", addr)
+	// PROOF OF INBOUND REACHABILITY. Being the responder means a peer's
+	// handshake arrived here UNSOLICITED — i.e. this node's advertised
+	// endpoint is genuinely reachable from where that peer sits. The
+	// converse is the diagnosis that matters: a node that has NEVER been a
+	// responder (while peers exist and it keeps having to initiate) is
+	// almost always behind a firewall dropping inbound UDP on its port.
+	// That is invisible otherwise — the node looks "connected", just
+	// permanently relayed to anyone it cannot punch to.
+	noteInboundSession(addr)
 
 	// Announce our overlay IP immediately so the peer can route to us (and
 	// act as our relay) without waiting for the first keepalive.
-	if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && myOverlayIP != "" {
+	if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && myOverlayIP() != "" {
 		_ = sendPacket(conn, addr, s, buildAddrAnnounce())
 	}
 

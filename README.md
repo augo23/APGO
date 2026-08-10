@@ -212,16 +212,25 @@ Trackers still run alongside it, so a mixed fleet (some blocked, some not) conve
 By default APGO only carries traffic **between** overlay nodes. You can also use
 it as a full VPN: route *all* your internet traffic out through one of your nodes.
 
-- **Make a node an exit.** On a Linux node set `EXIT_NODE=1` (compose env, or
-  `exit_node: true` in config). It enables IP forwarding + NAT and advertises
-  itself as an exit to the mesh. Exit nodes must be Linux (they use `iptables`);
-  they need `NET_ADMIN`, which the compose stack already grants.
+- **Make a node an exit.** On a Linux, macOS, or Windows node set `EXIT_NODE=1`
+  (compose env, or `exit_node: true` in config; on the desktop apps it's the
+  **"Be an exit node"** checkbox in Settings). It enables IP forwarding + NAT
+  (`iptables` on Linux, `pf` on macOS, WinNAT on Windows) and advertises
+  itself as an exit to the mesh — shown to every device as a small green **E**
+  next to the node. Linux exits need `NET_ADMIN` (the compose stack already
+  grants it); desktop exits need the client running privileged (the macOS
+  LaunchDaemon and the Windows elevated launch already are). Phones can *use*
+  an exit but not *be* one (the mobile OS sandbox doesn't allow NAT).
 - **Use it.** Flip **Full VPN** in the iOS/Android app or the macOS/Windows
   app's Settings (raw client: `use_exit: true` / `USE_EXIT=1`). The client
   routes every non-overlay packet to the exit, so all your traffic egresses
   there. On macOS/Windows the client also installs the two half-default routes
   (`0.0.0.0/1` + `128.0.0.0/1`) via the overlay TUN and pins its transport
   socket to the physical interface, so no extra routing setup is needed.
+  Full VPN is **fail-closed**: while no exit is reachable, internet traffic is
+  paused rather than leaked around the tunnel — the apps show a warning when
+  that happens, so if you see "no internet" in full-VPN mode, check that at
+  least one device in the peer list carries the green **E**.
 - **Pick the exit.** Two modes:
   - **Fastest (default).** Leave the exit choice blank and the client picks the
     **fastest** reachable exit automatically (latency-probed), re-measures every
@@ -363,14 +372,11 @@ This program is free software: you can redistribute it and/or modify it under th
 ## Support This Project
 If you found this software helpful please support by buying me a cup of coffee, or a beer. These gifts help fund the iOS app and all hosting costs etc..
 
-YOU NEVER HAVE TO GIVE ANYTHING TO ENJOY THIS SOFTWARE!!!
-
 Anything is appreciated!
 
-**Please note:** APGO is not a charity or a registered non-profit, and any support you send is a personal gift to the project — not a tax-deductible donation. It cannot be written off on your taxes, and no goods or services are provided in exchange.
+**Please note:** APGO is not a charity or a registered non-profit. Any support you send is a personal gift to the project and is not tax-deductible. No goods or services are provided in exchange.
 
-CashAPP: $APGOverlay
-
+CashApp: [$APGOverlay](https://cash.app/$APGOverlay)
 Venmo: https://www.venmo.com/u/APGOverlay
 
 Monero : 463y7FwfniMAsR2a3hQAQCh4FVuv2bKU86yFBj1SGUmkdgieFi2U4qaSuyyJNfgqEHd7gciN8YfnuGES3dEb1uimLnaQSTr

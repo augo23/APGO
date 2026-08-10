@@ -1,0 +1,557 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0218577A9AB8B0DC3C55E1D1 /* LocalNetworkPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FD7D4943C11669509D440F1 /* LocalNetworkPrompt.swift */; };
+		221F7209B42A3D675B0A3CDE /* OverlayConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6234183D5B85E276CF72CADE /* OverlayConfig.swift */; };
+		476E61D8302BD6AC2D1F4356 /* Overlaymobile.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */; };
+		478E6B458D42F25FD7A16A26 /* QRScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC3FCF5095690A3F563812BC /* QRScanner.swift */; };
+		4DB18FC266F58394BC8EE267 /* SupportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53C47826E4AF62087395CC63 /* SupportView.swift */; };
+		66196F87C25F5F7E4561ECC8 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A99E2A38E8BA5E6E708CE6 /* ContentView.swift */; };
+		705C666255196AB57CCE0BC4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8141F769148D848FBC6B9F6C /* Assets.xcassets */; };
+		71A8AE3D34056C91FAC9A060 /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3A0D60FC4C87046D79A6EAF /* TunnelManager.swift */; };
+		8C57ED03DB7A058FC162F525 /* Overlaymobile.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		D0B45766314C93DB2019D68D /* APGOApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D8225F3DC5369E28EB5B97C /* APGOApp.swift */; };
+		D53DF51313BAEE07F9958500 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D2412986976AAF4337DBA54 /* SettingsView.swift */; };
+		E79B8D4EA183DBB132C86BA5 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72B63BC4222287A09CB3BEF5 /* PacketTunnelProvider.swift */; };
+		E88E0E990522A0DD2039D2FB /* Overlaymobile.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */; };
+		F79F1C09621C0E63C8C8F3E1 /* AppLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946E15B0854EFBB0C32803AF /* AppLock.swift */; };
+		FD25C45779CE467100CC234E /* APGOTunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 0C9C71F268E1E0EAF17A1B4D /* APGOTunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		206D2EC331D186CAD70BE8C6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9481E4A2264650A389C903B1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B04F3F8936C0857479F32040;
+			remoteInfo = APGOTunnel;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		0C18CBFEFA67E62B5F557DB8 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				FD25C45779CE467100CC234E /* APGOTunnel.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A088D63EED2FBB0222E174F9 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				8C57ED03DB7A058FC162F525 /* Overlaymobile.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0C9C71F268E1E0EAF17A1B4D /* APGOTunnel.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = APGOTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		118EDD17A12C2016EF2A6031 /* APGO.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = APGO.entitlements; sourceTree = "<group>"; };
+		36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Overlaymobile.xcframework; sourceTree = "<group>"; };
+		3D2412986976AAF4337DBA54 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		53C47826E4AF62087395CC63 /* SupportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportView.swift; sourceTree = "<group>"; };
+		5FD7D4943C11669509D440F1 /* LocalNetworkPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalNetworkPrompt.swift; sourceTree = "<group>"; };
+		6234183D5B85E276CF72CADE /* OverlayConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayConfig.swift; sourceTree = "<group>"; };
+		72B63BC4222287A09CB3BEF5 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		8141F769148D848FBC6B9F6C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		905E4237EAA437F90E4133E0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		946E15B0854EFBB0C32803AF /* AppLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLock.swift; sourceTree = "<group>"; };
+		9D8225F3DC5369E28EB5B97C /* APGOApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APGOApp.swift; sourceTree = "<group>"; };
+		AC3FCF5095690A3F563812BC /* QRScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScanner.swift; sourceTree = "<group>"; };
+		C5A99E2A38E8BA5E6E708CE6 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		E8C11933626E51E2275D4B26 /* APGO.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = APGO.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F29F560C822A6AA92571725E /* APGOTunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = APGOTunnel.entitlements; sourceTree = "<group>"; };
+		F3A0D60FC4C87046D79A6EAF /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
+		F88D3F00CD1AEA01206679A5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		9869DA49EFFD1902B17454C4 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				476E61D8302BD6AC2D1F4356 /* Overlaymobile.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D07B878B65D17A28B87CEDB8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E88E0E990522A0DD2039D2FB /* Overlaymobile.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		188D759E203D4BA7B2D174F2 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				E8C11933626E51E2275D4B26 /* APGO.app */,
+				0C9C71F268E1E0EAF17A1B4D /* APGOTunnel.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		3D2A51D2577EFD3E8E1ADF04 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				118EDD17A12C2016EF2A6031 /* APGO.entitlements */,
+				9D8225F3DC5369E28EB5B97C /* APGOApp.swift */,
+				946E15B0854EFBB0C32803AF /* AppLock.swift */,
+				8141F769148D848FBC6B9F6C /* Assets.xcassets */,
+				C5A99E2A38E8BA5E6E708CE6 /* ContentView.swift */,
+				905E4237EAA437F90E4133E0 /* Info.plist */,
+				5FD7D4943C11669509D440F1 /* LocalNetworkPrompt.swift */,
+				6234183D5B85E276CF72CADE /* OverlayConfig.swift */,
+				AC3FCF5095690A3F563812BC /* QRScanner.swift */,
+				3D2412986976AAF4337DBA54 /* SettingsView.swift */,
+				53C47826E4AF62087395CC63 /* SupportView.swift */,
+				F3A0D60FC4C87046D79A6EAF /* TunnelManager.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		889F766BAE7FC1C6C49A603D = {
+			isa = PBXGroup;
+			children = (
+				3D2A51D2577EFD3E8E1ADF04 /* App */,
+				FB6921C1082653CC42C45BF3 /* Tunnel */,
+				E7A1AFEFA48136F64E5C07B4 /* Frameworks */,
+				188D759E203D4BA7B2D174F2 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E7A1AFEFA48136F64E5C07B4 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		FB6921C1082653CC42C45BF3 /* Tunnel */ = {
+			isa = PBXGroup;
+			children = (
+				F29F560C822A6AA92571725E /* APGOTunnel.entitlements */,
+				F88D3F00CD1AEA01206679A5 /* Info.plist */,
+				72B63BC4222287A09CB3BEF5 /* PacketTunnelProvider.swift */,
+			);
+			path = Tunnel;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B04F3F8936C0857479F32040 /* APGOTunnel */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9F9DB0D578A4A4A1BC7E2B0D /* Build configuration list for PBXNativeTarget "APGOTunnel" */;
+			buildPhases = (
+				8EABBF0CEE68470279F522D9 /* Sources */,
+				D07B878B65D17A28B87CEDB8 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = APGOTunnel;
+			packageProductDependencies = (
+			);
+			productName = APGOTunnel;
+			productReference = 0C9C71F268E1E0EAF17A1B4D /* APGOTunnel.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		C28A270A7AB2CD34B221F72A /* APGO */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5B7DBF0C1F6D7464AD0AC17A /* Build configuration list for PBXNativeTarget "APGO" */;
+			buildPhases = (
+				C805BD1A09D3B270D86386D2 /* Sources */,
+				30ED1BFB4C0E9BC4CFE37647 /* Resources */,
+				9869DA49EFFD1902B17454C4 /* Frameworks */,
+				0C18CBFEFA67E62B5F557DB8 /* Embed Foundation Extensions */,
+				A088D63EED2FBB0222E174F9 /* Embed Frameworks */,
+				00DDFD40579605FF73C3D4F5 /* Generate dSYM for Overlaymobile.framework */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B89F68C3ED259D21775E7705 /* PBXTargetDependency */,
+			);
+			name = APGO;
+			packageProductDependencies = (
+			);
+			productName = APGO;
+			productReference = E8C11933626E51E2275D4B26 /* APGO.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		9481E4A2264650A389C903B1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					B04F3F8936C0857479F32040 = {
+						DevelopmentTeam = 58ZSP5V9AC;
+						ProvisioningStyle = Automatic;
+					};
+					C28A270A7AB2CD34B221F72A = {
+						DevelopmentTeam = 58ZSP5V9AC;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 556401DE69FF2D5D56A6BCA1 /* Build configuration list for PBXProject "APGO" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 889F766BAE7FC1C6C49A603D;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 188D759E203D4BA7B2D174F2 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C28A270A7AB2CD34B221F72A /* APGO */,
+				B04F3F8936C0857479F32040 /* APGOTunnel */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		30ED1BFB4C0E9BC4CFE37647 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				705C666255196AB57CCE0BC4 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		00DDFD40579605FF73C3D4F5 /* Generate dSYM for Overlaymobile.framework */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Generate dSYM for Overlaymobile.framework";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -u\nFW=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}/Overlaymobile.framework/Overlaymobile\"\nif [ -f \"$FW\" ] && [ \"${DEBUG_INFORMATION_FORMAT:-}\" = \"dwarf-with-dsym\" ]; then\n  dsymutil \"$FW\" -o \"${DWARF_DSYM_FOLDER_PATH}/Overlaymobile.framework.dSYM\" || true\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		8EABBF0CEE68470279F522D9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E79B8D4EA183DBB132C86BA5 /* PacketTunnelProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C805BD1A09D3B270D86386D2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D0B45766314C93DB2019D68D /* APGOApp.swift in Sources */,
+				F79F1C09621C0E63C8C8F3E1 /* AppLock.swift in Sources */,
+				66196F87C25F5F7E4561ECC8 /* ContentView.swift in Sources */,
+				0218577A9AB8B0DC3C55E1D1 /* LocalNetworkPrompt.swift in Sources */,
+				221F7209B42A3D675B0A3CDE /* OverlayConfig.swift in Sources */,
+				478E6B458D42F25FD7A16A26 /* QRScanner.swift in Sources */,
+				D53DF51313BAEE07F9958500 /* SettingsView.swift in Sources */,
+				4DB18FC266F58394BC8EE267 /* SupportView.swift in Sources */,
+				71A8AE3D34056C91FAC9A060 /* TunnelManager.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B89F68C3ED259D21775E7705 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B04F3F8936C0857479F32040 /* APGOTunnel */;
+			targetProxy = 206D2EC331D186CAD70BE8C6 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		038D306525A47456AB5CF4B5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Tunnel/APGOTunnel.entitlements;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Tunnel/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO.Tunnel;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		278295F46068F6A0B8F2E682 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/APGO.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		32D60F37AEAA20A6A7EC9F43 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 58ZSP5V9AC;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		5BCC776822531DC677593392 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/APGO.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		C1D35D664B1B81FB6E9BE69E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Tunnel/APGOTunnel.entitlements;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Tunnel/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO.Tunnel;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		ED28C5D3864E5CB67DA6BFE9 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 58ZSP5V9AC;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		556401DE69FF2D5D56A6BCA1 /* Build configuration list for PBXProject "APGO" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				ED28C5D3864E5CB67DA6BFE9 /* Debug */,
+				32D60F37AEAA20A6A7EC9F43 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		5B7DBF0C1F6D7464AD0AC17A /* Build configuration list for PBXNativeTarget "APGO" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				278295F46068F6A0B8F2E682 /* Debug */,
+				5BCC776822531DC677593392 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		9F9DB0D578A4A4A1BC7E2B0D /* Build configuration list for PBXNativeTarget "APGOTunnel" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C1D35D664B1B81FB6E9BE69E /* Debug */,
+				038D306525A47456AB5CF4B5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 9481E4A2264650A389C903B1 /* Project object */;
+}

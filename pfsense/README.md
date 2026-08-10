@@ -49,7 +49,7 @@ device + ifconfig/route), added alongside the Linux/macOS/Windows ones.
 - **Reach the LAN behind the router** (advanced): overlay peers reach the
   router itself out of the box. To reach devices behind it, add on the peer a
   static route for the router's LAN subnet via the router's overlay IP
-  (e.g. `route add -net 192.168.1.0/24 10.28.55.1`), pass that traffic in the
+  (e.g. `route add -net 192.168.1.0/24 10.22.55.1`), pass that traffic in the
   APGO interface rules, and add an Outbound NAT rule on LAN for the overlay
   subnet so replies return (or add a matching static route on LAN hosts).
 
@@ -58,7 +58,7 @@ device + ifconfig/route), added alongside the Linux/macOS/Windows ones.
 `exit_node: true` works, but unlike Linux the NAT isn't set up automatically
 (that path uses iptables). Add it in the GUI once: Firewall → NAT → Outbound
 → switch to Hybrid mode, and add a rule translating source =
-your `overlay_cidr` (e.g. `10.28.55.0/24`) → WAN address. Devices that enable
+your `overlay_cidr` (e.g. `10.22.55.0/24`) → WAN address. Devices that enable
 "Route all traffic via an exit node" will then egress through your pfSense
 WAN.
 

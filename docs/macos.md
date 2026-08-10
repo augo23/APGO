@@ -28,7 +28,7 @@ Create a `client.yaml` somewhere writable, e.g. `~/.apgo/client.yaml`:
 ```yaml
 network_name: "my-overlay-CHANGE-ME"     # same on every node
 psk: "base64:<the network PSK>"          # same on every node
-overlay_cidr: "10.28.55.0/24"            # same on every node
+overlay_cidr: "10.22.55.0/24"            # same on every node
 node_private_key: "/Users/you/.apgo/node.key"   # created on first run
 udp_listen_port: 6969
 cipher: "aesgcm"
@@ -37,7 +37,7 @@ tun:
 
 # Optional: pin this node's overlay IP instead of deriving it from the key
 # tun:
-#   address_cidr: "10.28.55.9/24"
+#   address_cidr: "10.22.55.9/24"
 ```
 
 To join an existing network, use the **same** `network_name`, `psk`,
@@ -61,7 +61,7 @@ and the usual tracker/STUN/handshake logs. Verify with:
 
 ```bash
 ifconfig utun<N>            # shows your overlay IP
-ping 10.28.55.X            # another node's overlay IP
+ping 10.22.55.X            # another node's overlay IP
 ```
 
 To stop: Ctrl-C (the route and interface are torn down by the kernel when the

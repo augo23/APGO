@@ -51,7 +51,6 @@ func createAndConfigureTUN(cfg *ClientConfig) error {
 	// If the adapter name is taken (another client instance still running),
 	// iterate upward: APGO → APGO1 → APGO2 … so a stale adapter never blocks us.
 	var dev tun.Device
-	var err error
 	for n := 0; n < 8; n++ {
 		name := "APGO"
 		if n > 0 {

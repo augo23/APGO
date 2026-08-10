@@ -35,7 +35,7 @@ if [ ! -f .env ]; then
 # node/device that should join this network.
 NETWORK_NAME=apgo-$(rand 6 | tr -dc 'a-z0-9' | cut -c1-8)
 PSK=base64:$(rand 32)
-OVERLAY_CIDR=10.28.55.0/24
+OVERLAY_CIDR=10.22.55.0/24
 FRIENDLY_NAME=$(hostname)
 # Set EXIT_NODE=1 to make this host an internet exit / outproxy.
 EXIT_NODE=

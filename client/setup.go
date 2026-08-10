@@ -110,7 +110,7 @@ func runSetupServerAndWait(sock string) {
 			return
 		}
 		if s.OverlayCIDR == "" {
-			s.OverlayCIDR = "10.28.55.0/24"
+			s.OverlayCIDR = "10.22.55.0/24"
 		}
 		blob, _ := json.MarshalIndent(s, "", "  ")
 		tmp := setupFilePath() + ".tmp"
@@ -122,6 +122,32 @@ func runSetupServerAndWait(sock string) {
 		log.Printf("[setup] network configured via dashboard — restarting to apply")
 		go func() { time.Sleep(500 * time.Millisecond); _ = ln.Close(); os.Exit(0) }()
 	})
+
+	// The web-setup POST is not the only way a parked node gets configured. On
+	// desktop installs the menu-bar app writes CLIENT_CONFIG directly and then
+	// checks /api/info before launching — and this instance answers, so the
+	// app concluded "already connected" and never started anything. The result
+	// was a deadlock: a valid config on disk, and a client parked here forever
+	// logging "waiting". (Classic trigger: the macOS installer wipes ~/.apgo,
+	// the KeepAlive boot daemon restarts the client unconfigured, THEN the
+	// user fills in Settings.) So poll the config sources; the moment they
+	// turn valid, exit(0) and let the supervisor (launchd KeepAlive / compose
+	// restart policy / Kubernetes) restart the client configured.
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			cfg, err := loadConfig()
+			if err != nil || cfg == nil {
+				continue
+			}
+			applySetupFile(cfg)
+			if !needsSetup(cfg) {
+				log.Printf("[setup] network configuration detected — restarting to apply")
+				_ = ln.Close()
+				os.Exit(0)
+			}
+		}
+	}()
 
 	srv := &http.Server{Handler: mux}
 	log.Printf("[setup] node not configured — open the admin dashboard to set the network name + PSK (waiting)…")

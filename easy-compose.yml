@@ -10,7 +10,7 @@
 services:
   client:
     image: apgoclient:latest
-    restart: unless-stopped
+    restart: always
     # Host networking is required for reliable NAT hole punching.
     network_mode: host
     cap_add:
@@ -22,7 +22,7 @@ services:
       - NETWORK_NAME=${NETWORK_NAME:?set NETWORK_NAME in .env}
       - PSK=${PSK:?set PSK in .env (base64:...)}
       # --- optional ---
-      - OVERLAY_CIDR=${OVERLAY_CIDR:-10.28.55.0/24}
+      - OVERLAY_CIDR=${OVERLAY_CIDR:-10.22.55.0/24}
       - FRIENDLY_NAME=${FRIENDLY_NAME:-}
       # Set EXIT_NODE=1 to make this host an internet exit / outproxy.
       - EXIT_NODE=${EXIT_NODE:-}
@@ -57,7 +57,7 @@ services:
 
   admin:
     image: apgoadmin:latest
-    restart: unless-stopped
+    restart: always
     depends_on:
       - client
     environment:

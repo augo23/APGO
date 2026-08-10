@@ -87,11 +87,11 @@ func startAdminServer() {
 	mux.HandleFunc("/api/policy", apiAuth(handleAdminPolicy))
 	// Connect / disconnect the local overlay client from the dashboard.
 	mux.HandleFunc("/api/connect", apiAuth(func(w http.ResponseWriter, r *http.Request) {
-		go doConnect()
+		safeGo("connect", doConnect)
 		writeJSON(w, map[string]any{"ok": true})
 	}))
 	mux.HandleFunc("/api/disconnect", apiAuth(func(w http.ResponseWriter, r *http.Request) {
-		go doDisconnect()
+		safeGo("disconnect", doDisconnect)
 		writeJSON(w, map[string]any{"ok": true})
 	}))
 	mux.HandleFunc("/settings", requirePage(func(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +107,14 @@ func startAdminServer() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, settingsPage(loadConfig()))
+		// ?new=1 seeds a blank form for adding a brand-new network. The current
+		// network is snapshotted to its profile by doAddNetwork before we get here,
+		// so saving the blank form switches to the new network without losing it.
+		cfg := loadConfig()
+		if r.URL.Query().Get("new") == "1" {
+			cfg = blankConfig()
+		}
+		fmt.Fprint(w, settingsPage(cfg))
 	}))
 
 	// API (session-gated).
@@ -120,6 +127,7 @@ func startAdminServer() {
 	mux.HandleFunc("/api/logs", apiAuth(handleAdminLogs))
 	mux.HandleFunc("/api/revoke", apiAuth(handleAdminRevoke))
 	mux.HandleFunc("/api/provision", apiAuth(handleAdminProvision))
+	registerMultinetPanel(mux)
 
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -161,6 +169,12 @@ func setupAdminKey() {
 	if pw == "" {
 		return
 	}
+	// Ask twice — a typo here would leave the signing key permanently locked
+	// behind a password nobody knows.
+	if promptPassword("Confirm the admin key password:") != pw {
+		notify("Admin key: the passwords didn't match — nothing was created. Try again.")
+		return
+	}
 	pub, err := genAdminKey(pw)
 	if err != nil {
 		notify("Admin key: " + err.Error())
@@ -171,7 +185,7 @@ func setupAdminKey() {
 	c := loadConfig()
 	c.AdminPublicKey = pub
 	_ = saveConfig(c)
-	go pushAdminPubKey(pub)
+	safeGo("push-admin-pubkey", func() { pushAdminPubKey(pub) })
 	notify("Admin key created — it will be seeded to your peers.")
 	openAdminKeyPage()
 }
@@ -266,6 +280,10 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, setupPage("Enter a username and a password of at least 6 characters."))
 			return
 		}
+		if p != r.FormValue("password2") {
+			fmt.Fprint(w, setupPage("The passwords don't match — type the same password in both boxes."))
+			return
+		}
 		nc, err := newCreds(u, p)
 		if err == nil {
 			err = saveCreds(nc)
@@ -295,6 +313,10 @@ func handleAccount(w http.ResponseWriter, r *http.Request) {
 		p := r.FormValue("new_password")
 		if u == "" || len(p) < 6 {
 			fmt.Fprint(w, accountPage("Username is required and the new password must be at least 6 characters."))
+			return
+		}
+		if p != r.FormValue("new_password2") {
+			fmt.Fprint(w, accountPage("The new passwords don't match — type the same password in both boxes."))
 			return
 		}
 		nc, err := newCreds(u, p)
@@ -350,6 +372,7 @@ func setupPage(msg string) string {
 		`<p style="color:var(--muted);font-size:13px;text-align:center;margin:0 0 6px">Set a username and password for this Mac's admin panel.</p>
 		<label>Username</label><input name="username" autofocus spellcheck="false" autocapitalize="off">
 		<label>Password</label><input name="password" type="password">
+		<label>Confirm password</label><input name="password2" type="password">
 		<button type="submit">Create</button>`+m)
 }
 
@@ -362,6 +385,7 @@ func accountPage(msg string) string {
 		`<label>Current password</label><input name="current_password" type="password" autofocus>
 		<label>New username</label><input name="new_username" value="`+htmlEsc(currentUsername())+`" spellcheck="false" autocapitalize="off">
 		<label>New password</label><input name="new_password" type="password">
+		<label>Confirm new password</label><input name="new_password2" type="password">
 		<button type="submit">Save</button>
 		<p style="margin-top:12px;text-align:center"><a href="/">← Back to dashboard</a></p>`+m)
 }
@@ -406,10 +430,16 @@ func handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Action   string `json:"action"`
 		Local    bool   `json:"local"`
+		Net      string `json:"net"` // "" / "main" or a secondary network id
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8192))
 	if json.Unmarshal(body, &req) != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	sock, sockErr := netSocketByID(req.Net)
+	if sockErr != nil {
+		http.Error(w, sockErr.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -420,7 +450,7 @@ func handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		b, _ := json.Marshal(map[string]string{"pubkey": req.PubKey})
-		proxyCtl(w, "POST", "/api/local-restore", b)
+		proxyCtlOn(w, sock, "POST", "/api/local-restore", b)
 		return
 	}
 
@@ -450,7 +480,7 @@ func handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 			pushAdminPubKey(pub)
 		}
 		recBytes, _ := json.Marshal(rec)
-		proxyCtl(w, "POST", "/api/revoke-signed", recBytes)
+		proxyCtlOn(w, sock, "POST", "/api/revoke-signed", recBytes)
 		return
 	}
 
@@ -460,7 +490,7 @@ func handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, _ := json.Marshal(map[string]string{"remote": req.Remote})
-	proxyCtl(w, "POST", "/api/revoke", b)
+	proxyCtlOn(w, sock, "POST", "/api/revoke", b)
 }
 
 // handleAdminProvision signs an overlay-address / friendly-name assignment for a

@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"sync"
 
 	"github.com/cloudflare/circl/sign"
 	mldsa65 "github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -25,8 +26,19 @@ var adminSig sign.Scheme = mldsa65.Scheme()
 // adminPubParsed is the parsed form of adminPub (kept in sync by setAdminPubBytes).
 var adminPubParsed sign.PublicKey
 
+// adminPubMu guards adminPub + adminPubParsed. The trusted key is adopted at
+// RUNTIME (TOFU seeding from a peer frame, the local control API) while the
+// UDP read goroutine calls adminVerify concurrently — an interface value is
+// two words, so an unguarded write against a concurrent read is a torn-read
+// crash risk, not just a stale value.
+var adminPubMu sync.RWMutex
+
 // adminKeySet reports whether this node trusts a network admin public key.
-func adminKeySet() bool { return adminPubParsed != nil }
+func adminKeySet() bool {
+	adminPubMu.RLock()
+	defer adminPubMu.RUnlock()
+	return adminPubParsed != nil
+}
 
 // adminPubValid reports whether raw is a well-formed admin (ML-DSA) public key.
 func adminPubValid(raw []byte) bool {
@@ -44,18 +56,42 @@ func setAdminPubBytes(raw []byte) bool {
 	if err != nil {
 		return false
 	}
+	adminPubMu.Lock()
 	adminPub = append([]byte(nil), raw...)
 	adminPubParsed = pk
+	adminPubMu.Unlock()
 	return true
 }
 
+// clearAdminPub wipes the trusted key (factory reset).
+func clearAdminPub() {
+	adminPubMu.Lock()
+	adminPub = nil
+	adminPubParsed = nil
+	adminPubMu.Unlock()
+}
+
+// adminPubBytes returns the marshaled trusted admin key, or nil.
+func adminPubBytes() []byte {
+	adminPubMu.RLock()
+	defer adminPubMu.RUnlock()
+	return adminPub
+}
+
 // adminSameKey reports whether raw equals the currently-trusted admin key.
-func adminSameKey(raw []byte) bool { return bytes.Equal(raw, adminPub) }
+func adminSameKey(raw []byte) bool {
+	adminPubMu.RLock()
+	defer adminPubMu.RUnlock()
+	return bytes.Equal(raw, adminPub)
+}
 
 // adminVerify checks an ML-DSA signature over msg against the trusted admin key.
 func adminVerify(msg, sig []byte) bool {
-	if adminPubParsed == nil {
+	adminPubMu.RLock()
+	pk := adminPubParsed
+	adminPubMu.RUnlock()
+	if pk == nil {
 		return false
 	}
-	return adminSig.Verify(adminPubParsed, msg, sig, nil)
+	return adminSig.Verify(pk, msg, sig, nil)
 }

@@ -20,7 +20,7 @@ render_config() {
 	config_get network_name main network_name
 	config_get psk main psk
 	config_get friendly main friendly_name 'openwrt-router'
-	config_get overlay_cidr main overlay_cidr '10.28.55.0/24'
+	config_get overlay_cidr main overlay_cidr '10.22.55.0/24'
 	config_get overlay_address main overlay_address
 	config_get port main udp_listen_port '6969'
 	config_get mtu main mtu '1280'

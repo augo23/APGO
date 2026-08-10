@@ -68,26 +68,11 @@ func credsConfigured() bool {
 	return ok
 }
 
-// bootstrapPassword is a random one-time password generated at startup when no
-// saved credentials and no ADMIN_PASSWORD env exist. It is printed to the logs;
-// signing in with it forces the operator to set a real password.
-var bootstrapPassword string
-
 // mustSetup is true when there is no real login yet (no saved creds and no env
-// password) — the random bootstrap password is in effect and the operator must
-// create proper credentials.
+// password). While true, /setup is open (unauthenticated) so the operator can
+// create the login on first visit — the page disappears the moment credentials
+// are saved.
 func mustSetup() bool { return !credsConfigured() && adminPass == "" }
-
-// initBootstrap generates the random bootstrap password when mustSetup().
-func initBootstrap() {
-	if !mustSetup() {
-		return
-	}
-	b := make([]byte, 12)
-	if _, err := rand.Read(b); err == nil {
-		bootstrapPassword = base64.RawURLEncoding.EncodeToString(b)
-	}
-}
 
 func (c webCreds) matches(username, pw string) bool {
 	salt, _ := base64.StdEncoding.DecodeString(c.Salt)
@@ -97,7 +82,7 @@ func (c webCreds) matches(username, pw string) bool {
 }
 
 // checkLogin verifies a username+password against the stored creds file, or the
-// env bootstrap credentials if none has been set yet.
+// env (compose) credentials if none has been set yet.
 func checkLogin(username, pw string) bool {
 	if c, ok := loadCreds(); ok {
 		return c.matches(username, pw)
@@ -105,10 +90,6 @@ func checkLogin(username, pw string) bool {
 	if adminPass != "" {
 		return subtle.ConstantTimeCompare([]byte(username), []byte(adminUser)) == 1 &&
 			subtle.ConstantTimeCompare([]byte(pw), []byte(adminPass)) == 1
-	}
-	if bootstrapPassword != "" {
-		return subtle.ConstantTimeCompare([]byte(username), []byte(adminUser)) == 1 &&
-			subtle.ConstantTimeCompare([]byte(pw), []byte(bootstrapPassword)) == 1
 	}
 	return false
 }

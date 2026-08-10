@@ -62,7 +62,7 @@ func createAndConfigureTUN(cfg *ClientConfig) error {
 		log.Printf("warning: set mtu on %s: %v (%s)", name, err, out)
 	}
 
-	netCIDR := ipnet.String() // e.g. 10.28.55.0/24
+	netCIDR := ipnet.String() // e.g. 10.22.55.0/24
 	if out, err := runCmd("route", "-n", "add", "-inet", "-net", netCIDR, "-interface", name); err != nil {
 		if !strings.Contains(out, "File exists") {
 			return fmt.Errorf("route add %s: %v (%s)", netCIDR, err, out)

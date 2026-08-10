@@ -1,0 +1,73 @@
+# XcodeGen spec — generates APGO.xcodeproj with the app + packet-tunnel extension.
+#   brew install xcodegen
+#   cd ios && bash build-xcframework.sh && xcodegen generate && open APGO.xcodeproj
+# Then set your Team on both targets and Run on a device.
+name: APGO
+options:
+  bundleIdPrefix: org.apgo
+  # iOS 16.0: the SwiftUI UI uses NavigationStack (ContentView, SupportView),
+  # which is 16.0+. iOS 16 covers iPhone 8 and newer, so this isn't a real
+  # reach limitation.
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    # Apple Developer team: AUSTIN PAUL GOULD. Baked in here so the selection
+    # survives every `xcodegen generate` (picking it in Xcode's Signing editor
+    # only writes to the generated .xcodeproj, which regeneration overwrites).
+    DEVELOPMENT_TEAM: "58ZSP5V9AC"
+    CODE_SIGN_STYLE: Automatic
+
+packages: {}
+
+targets:
+  APGO:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      - target: APGOTunnel
+        embed: true
+      - framework: Overlaymobile.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.apgo.APGO
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/APGO.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    postBuildScripts:
+      # gomobile never produces a dSYM for Overlaymobile.framework, but App
+      # Store validation requires one (matched by UUID) for every embedded
+      # framework. Generate it from the framework binary at archive time —
+      # dsymutil emits a dSYM with the right UUIDs even when the binary
+      # carries little/no DWARF, which is exactly what the validator checks.
+      - name: Generate dSYM for Overlaymobile.framework
+        basedOnDependencyAnalysis: false
+        script: |
+          set -u
+          FW="${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}/Overlaymobile.framework/Overlaymobile"
+          if [ -f "$FW" ] && [ "${DEBUG_INFORMATION_FORMAT:-}" = "dwarf-with-dsym" ]; then
+            dsymutil "$FW" -o "${DWARF_DSYM_FOLDER_PATH}/Overlaymobile.framework.dSYM" || true
+          fi
+
+  APGOTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+    dependencies:
+      - framework: Overlaymobile.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.apgo.APGO.Tunnel
+        INFOPLIST_FILE: Tunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Tunnel/APGOTunnel.entitlements
+        GENERATE_INFOPLIST_FILE: NO

@@ -16,8 +16,14 @@ import (
 	"strconv"
 )
 
+// bdecodeMaxDepth bounds nesting. Tracker responses are 2-3 levels deep; a
+// hostile tracker replying with thousands of nested "l"/"d" bytes would
+// otherwise recurse until the goroutine stack limit KILLS THE WHOLE PROCESS
+// (stack exhaustion is a fatal error in Go, not a recoverable panic).
+const bdecodeMaxDepth = 32
+
 func bdecode(data []byte) (interface{}, error) {
-	v, rest, err := bdecodeValue(data)
+	v, rest, err := bdecodeValue(data, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -25,7 +31,10 @@ func bdecode(data []byte) (interface{}, error) {
 	return v, nil
 }
 
-func bdecodeValue(data []byte) (interface{}, []byte, error) {
+func bdecodeValue(data []byte, depth int) (interface{}, []byte, error) {
+	if depth > bdecodeMaxDepth {
+		return nil, nil, errors.New("bencode: nesting too deep")
+	}
 	if len(data) == 0 {
 		return nil, nil, errors.New("bencode: unexpected end of data")
 	}
@@ -67,7 +76,7 @@ func bdecodeValue(data []byte) (interface{}, []byte, error) {
 			}
 			var v interface{}
 			var err error
-			v, rest, err = bdecodeValue(rest)
+			v, rest, err = bdecodeValue(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -86,7 +95,7 @@ func bdecodeValue(data []byte) (interface{}, []byte, error) {
 			}
 			var k, v interface{}
 			var err error
-			k, rest, err = bdecodeValue(rest)
+			k, rest, err = bdecodeValue(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -94,7 +103,7 @@ func bdecodeValue(data []byte) (interface{}, []byte, error) {
 			if !ok {
 				return nil, nil, errors.New("bencode: dict key is not a string")
 			}
-			v, rest, err = bdecodeValue(rest)
+			v, rest, err = bdecodeValue(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}

@@ -28,6 +28,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Winsock socket options (ws2ipdef.h). Defined locally because the pinned
+// golang.org/x/sys/windows version doesn't export them.
+const (
+	sockoptIPUnicastIF   = 31 // IP_UNICAST_IF   (IPPROTO_IP)
+	sockoptIPv6UnicastIF = 31 // IPV6_UNICAST_IF (IPPROTO_IPV6)
+)
+
 func enableFullTunnelRoutes() error {
 	if tunName == "" {
 		return fmt.Errorf("no TUN interface")
@@ -60,10 +67,10 @@ func pinTransportToPhysicalInterface(conn *net.UDPConn) error {
 	be := ((idx & 0xff) << 24) | ((idx & 0xff00) << 8) | ((idx >> 8) & 0xff00) | ((idx >> 24) & 0xff)
 	var errV4, errV6 error
 	if cerr := raw.Control(func(fd uintptr) {
-		errV4 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, windows.IP_UNICAST_IF, be)
+		errV4 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, sockoptIPUnicastIF, be)
 		// Dual-stack sockets need the v6 side bound too; on a v4-only socket
 		// this fails harmlessly.
-		errV6 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, windows.IPV6_UNICAST_IF, idx)
+		errV6 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, sockoptIPv6UnicastIF, idx)
 	}); cerr != nil {
 		return cerr
 	}
@@ -90,7 +97,7 @@ func pinAuxUDPSocket(conn *net.UDPConn) {
 	idx := physIfIndex
 	be := ((idx & 0xff) << 24) | ((idx & 0xff00) << 8) | ((idx >> 8) & 0xff00) | ((idx >> 24) & 0xff)
 	_ = raw.Control(func(fd uintptr) {
-		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, windows.IP_UNICAST_IF, be)
-		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, windows.IPV6_UNICAST_IF, idx)
+		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, sockoptIPUnicastIF, be)
+		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, sockoptIPv6UnicastIF, idx)
 	})
 }

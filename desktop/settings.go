@@ -25,7 +25,15 @@ func randToken() string {
 	return hex.EncodeToString(b)
 }
 
-func openSettingsWindow() {
+// openSettingsWindow edits the CURRENT network.
+func openSettingsWindow() { serveSettingsForm(loadConfig()) }
+
+// openNewNetworkWindow starts a blank form for adding a new network. The POST
+// path is identical — saving writes the entered values as the active config and
+// registers them as a new switchable profile.
+func openNewNetworkWindow() { serveSettingsForm(blankConfig()) }
+
+func serveSettingsForm(initial mConfig) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		notify("Could not open Settings: " + err.Error())
@@ -55,7 +63,7 @@ func openSettingsWindow() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, settingsPage(loadConfig()))
+		fmt.Fprint(w, settingsPage(initial))
 	})
 
 	srv := &http.Server{Handler: mux}
@@ -86,11 +94,12 @@ func saveSettingsForm(r *http.Request) error {
 	// Post-quantum is controlled network-wide from the Security policy page
 	// (one place), not here — leave c.PostQuantum as loaded (default on).
 	c.IPv6 = r.FormValue("ipv6") == "on"
+	c.ExitNode = r.FormValue("exit_node") == "on"
 	c.UseExit = r.FormValue("use_exit") == "on"
 	c.ExitPeer = strings.TrimSpace(r.FormValue("exit_peer"))
 	c.OverlayCIDR = strings.TrimSpace(r.FormValue("overlay_cidr"))
 	if c.OverlayCIDR == "" {
-		c.OverlayCIDR = "10.28.55.0/24"
+		c.OverlayCIDR = "10.22.55.0/24"
 	}
 	if p, err := strconv.Atoi(strings.TrimSpace(r.FormValue("port"))); err == nil && p > 0 {
 		c.UDPListenPort = p
@@ -98,6 +107,15 @@ func saveSettingsForm(r *http.Request) error {
 		c.UDPListenPort = 6969
 	}
 	c.Tun.AddressCIDR = overlayAddrFromInput(r.FormValue("last_octet"), c.OverlayCIDR)
+	// Recombine the two credential boxes into the single string the client
+	// takes: "user:pass" = Basic, bare = Bearer, "" = no credential.
+	if u := strings.TrimSpace(r.FormValue("rendezvous_user")); u == "" {
+		c.RendezvousAuth = ""
+	} else if p := strings.TrimSpace(r.FormValue("rendezvous_pass")); p == "" {
+		c.RendezvousAuth = u
+	} else {
+		c.RendezvousAuth = u + ":" + p
+	}
 	c.RendezvousServers = nil
 	for _, s := range strings.Split(r.FormValue("rendezvous"), ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -130,6 +148,30 @@ func saveSettingsForm(r *http.Request) error {
 		notify("Network admin password changed — redistributing the key.")
 	}
 
+	// Dashboard login change (inline on this page; was the separate /account
+	// window). Only when a new password was entered; typed twice + current
+	// password verified, so a typo can't lock the user out.
+	if np := r.FormValue("dash_new_password"); np != "" {
+		if np != r.FormValue("dash_new_password_confirm") {
+			return fmt.Errorf("the new dashboard passwords don't match — type the same one in both boxes")
+		}
+		u := strings.TrimSpace(r.FormValue("dash_username"))
+		if u == "" || len(np) < 6 {
+			return fmt.Errorf("dashboard username is required and the new password must be at least 6 characters")
+		}
+		if !verifyCurrentPassword(r.FormValue("dash_current_password")) {
+			return fmt.Errorf("current dashboard password is incorrect")
+		}
+		nc, err := newCreds(u, np)
+		if err == nil {
+			err = saveCreds(nc)
+		}
+		if err != nil {
+			return err
+		}
+		notify("Dashboard login updated.")
+	}
+
 	applyDefaults(&c)
 	if err := saveConfig(c); err != nil {
 		return err
@@ -149,7 +191,7 @@ func settingsPage(c mConfig) string {
 	}
 	cidr := c.OverlayCIDR
 	if cidr == "" {
-		cidr = "10.28.55.0/24"
+		cidr = "10.22.55.0/24"
 	}
 	lastOctet := ""
 	if a := c.Tun.AddressCIDR; a != "" {
@@ -169,18 +211,31 @@ func settingsPage(c mConfig) string {
 	if c.UseExit {
 		useExitChecked = "checked"
 	}
+	exitNodeChecked := ""
+	if c.ExitNode {
+		exitNodeChecked = "checked"
+	}
+	// Split the stored rendezvous credential back into its two boxes.
+	rvUser, rvPass := c.RendezvousAuth, ""
+	if u, p, ok := strings.Cut(c.RendezvousAuth, ":"); ok {
+		rvUser, rvPass = u, p
+	}
 	return strings.NewReplacer(
 		"{{NETWORK}}", html.EscapeString(c.NetworkName),
 		"{{PSK}}", html.EscapeString(c.PSK),
 		"{{FRIENDLY}}", html.EscapeString(c.FriendlyName),
 		"{{IPV6CHECK}}", ipv6Checked,
 		"{{USEEXITCHECK}}", useExitChecked,
+		"{{EXITNODECHECK}}", exitNodeChecked,
 		"{{EXITPEER}}", html.EscapeString(c.ExitPeer),
 		"{{CIDR}}", html.EscapeString(cidr),
 		"{{PORT}}", html.EscapeString(port),
 		"{{LASTOCTET}}", html.EscapeString(lastOctet),
 		"{{RENDEZVOUS}}", html.EscapeString(strings.Join(c.RendezvousServers, ", ")),
+		"{{RVUSER}}", html.EscapeString(rvUser),
+		"{{RVPASS}}", html.EscapeString(rvPass),
 		"{{ADMINSECTION}}", adminSectionHTML(),
+		"{{DASHSECTION}}", dashboardSectionHTML(),
 	).Replace(settingsTmpl)
 }
 
@@ -211,6 +266,27 @@ func adminSectionHTML() string {
     <label for="admin_key_password_confirm">Confirm the network admin password</label>
     <input id="admin_key_password_confirm" name="admin_key_password_confirm" type="password" spellcheck="false" autocapitalize="off">
     <div class="hint">No network admin key exists yet. Enter a <b>network admin password</b> (min 8 chars) to create one now — it's seeded (encrypted) to all your devices automatically and unlocks network-wide revocation, approvals, and node changes. This is separate from your dashboard login password. Leave blank to skip.</div>`
+}
+
+// dashboardSectionHTML renders the dashboard-login (account) change fields
+// inline on the Settings page — previously a separate /account page/window.
+// Only shown once a dashboard login exists (first run creates it via the
+// admin-panel gate before Settings is reachable).
+func dashboardSectionHTML() string {
+	u := currentUsername()
+	if u == "" {
+		return ""
+	}
+	return `<label>Dashboard login</label>
+    <div class="hint">Change the username/password used to open THIS device's dashboard (separate from the network admin password). Leave blank to keep the current login.</div>
+    <label for="dash_current_password">Current dashboard password</label>
+    <input id="dash_current_password" name="dash_current_password" type="password" autocomplete="off">
+    <label for="dash_username">Dashboard username</label>
+    <input id="dash_username" name="dash_username" type="text" value="` + html.EscapeString(u) + `" spellcheck="false" autocapitalize="off">
+    <label for="dash_new_password">New dashboard password (min 6)</label>
+    <input id="dash_new_password" name="dash_new_password" type="password" autocomplete="off">
+    <label for="dash_new_password_confirm">Confirm new dashboard password</label>
+    <input id="dash_new_password_confirm" name="dash_new_password_confirm" type="password" autocomplete="off">`
 }
 
 const settingsTmpl = `<!DOCTYPE html>
@@ -264,19 +340,24 @@ const settingsTmpl = `<!DOCTYPE html>
 
     <label for="last_octet">This node's overlay IP (optional)</label>
     <div style="display:flex;align-items:center;gap:8px">
-      <span id="ipprefix" style="color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:nowrap">10.28.55.</span>
+      <span id="ipprefix" style="color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:nowrap">10.22.55.</span>
       <input id="last_octet" name="last_octet" type="text" inputmode="numeric" maxlength="3" value="{{LASTOCTET}}" style="max-width:96px" spellcheck="false">
     </div>
     <div class="hint">Type just the last number (1–254). Blank = auto-assign. The prefix follows the subnet above.</div>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" name="exit_node" {{EXITNODECHECK}} style="width:auto"> Be an exit node — share this device's internet with the mesh
+    </label>
+    <div class="hint">Other devices in full-VPN mode can egress their internet traffic through this one (shown to them with a green <b style="color:#3fb950">E</b>). Works on Linux, macOS, and Windows; needs the client to run privileged. Applies on reconnect.</div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
       <input type="checkbox" name="use_exit" {{USEEXITCHECK}} style="width:auto"> Full VPN — route all traffic via an exit node
     </label>
-    <div class="hint">Sends ALL of this device's internet traffic through an exit node on your mesh (a Linux node with <b>EXIT_NODE=1</b>). Encrypted device→exit; traffic leaves the internet from the exit's IP. Applies on reconnect.</div>
+    <div class="hint">Sends ALL of this device's internet traffic through an exit node on your mesh (any Linux, macOS, or Windows node with exit-node mode on). Encrypted device→exit; traffic leaves the internet from the exit's IP. Applies on reconnect.</div>
 
     <label for="exit_peer">Exit node (blank = fastest)</label>
     <input id="exit_peer" name="exit_peer" type="text" value="{{EXITPEER}}" spellcheck="false" autocapitalize="off" placeholder="auto — fastest exit">
-    <div class="hint">Leave blank to auto-pick the fastest reachable exit (re-probed every ~5 min, switches if it goes down). Or pin ONE node — by overlay IP (e.g. 10.28.55.7), device name, or key fingerprint — to always egress there; traffic pauses rather than re-routing if it's offline.</div>
+    <div class="hint">Leave blank to auto-pick the fastest reachable exit (re-probed every ~5 min, switches if it goes down). Or pin ONE node — by overlay IP (e.g. 10.22.55.7), device name, or key fingerprint — to always egress there; traffic pauses rather than re-routing if it's offline.</div>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
       <input type="checkbox" name="ipv6" {{IPV6CHECK}} style="width:auto"> IPv6 dual-stack transport
@@ -286,11 +367,19 @@ const settingsTmpl = `<!DOCTYPE html>
     <label for="port">UDP listen port</label>
     <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535">
 
-    <label for="rendezvous">Discovery servers (optional)</label>
+    <label for="rendezvous">Discovery (rendezvous) servers (optional)</label>
     <input id="rendezvous" name="rendezvous" type="text" value="{{RENDEZVOUS}}" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">
     <div class="hint">For networks that block BitTorrent. Comma-separated HTTP(S) rendezvous URLs (see rendezvous/). Leave blank to use trackers.</div>
 
+    <label for="rendezvous_user">Rendezvous username or token (optional)</label>
+    <input id="rendezvous_user" name="rendezvous_user" type="text" value="{{RVUSER}}" spellcheck="false" autocapitalize="off" placeholder="leave blank if the server is open">
+    <label for="rendezvous_pass">Rendezvous password</label>
+    <input id="rendezvous_pass" name="rendezvous_pass" type="password" value="{{RVPASS}}" placeholder="blank if using a token">
+    <div class="hint">Only needed if your rendezvous server requires a credential. Enter a username <b>and</b> password (HTTP Basic), or just a token in the first box (Bearer). These are included in the Join QR, so phones that scan it get discovery working with no typing.</div>
+
     {{ADMINSECTION}}
+
+    {{DASHSECTION}}
 
     <button class="save" type="submit">Save</button>
 
@@ -298,13 +387,12 @@ const settingsTmpl = `<!DOCTYPE html>
       <div class="hint" style="margin-bottom:8px">More:</div>
       <a href="/network" style="color:var(--fg)">Security policy &amp; identity rotation →</a><br>
       <a href="/trackers" style="color:var(--fg)">Trackers →</a><br>
-      <a href="/account" style="color:var(--fg)">Dashboard login (account) →</a>
     </div>
   </form>
   <script>
     (function(){
       var cidr=document.getElementById('overlay_cidr'), pre=document.getElementById('ipprefix'), oct=document.getElementById('last_octet');
-      function upd(){ var p=((cidr.value||'10.28.55.0/24').split('/')[0]).split('.'); pre.textContent = p.length>=3 ? (p[0]+'.'+p[1]+'.'+p[2]+'.') : ''; }
+      function upd(){ var p=((cidr.value||'10.22.55.0/24').split('/')[0]).split('.'); pre.textContent = p.length>=3 ? (p[0]+'.'+p[1]+'.'+p[2]+'.') : ''; }
       cidr.addEventListener('input', upd);
       oct.addEventListener('input', function(){ this.value=this.value.replace(/[^0-9]/g,'').slice(0,3); });
       upd();

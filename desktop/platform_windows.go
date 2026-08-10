@@ -45,6 +45,8 @@ func doConnect() {
 	b.WriteString("set \"NETCONFIG_FILE=" + netConfigPath() + "\"\r\n")
 	b.WriteString("set \"TRACKERS_FILE=" + trackersPath() + "\"\r\n")
 	b.WriteString("set \"POLICY_FILE=" + policyPath() + "\"\r\n")
+	b.WriteString("set \"NETSHARES_FILE=" + netSharesPath() + "\"\r\n")
+	b.WriteString("set \"APGO_NETWORKS_DIR=" + networksStateDir() + "\"\r\n")
 	if c.AdminPublicKey != "" {
 		b.WriteString("set \"ADMIN_PUBLIC_KEY=" + c.AdminPublicKey + "\"\r\n")
 	}

@@ -26,6 +26,29 @@ type rendezvousResponse struct {
 	Peers []string `json:"peers"`
 }
 
+// gRendezvousCred is the credential presented to rendezvous servers that
+// require one. ONE field covers both schemes the server accepts:
+//
+//	"user:password" (contains a colon) -> HTTP Basic
+//	"sometoken"     (no colon)         -> Bearer
+//
+// Empty = send no Authorization header (open server). See rendezvous/auth.go.
+var gRendezvousCred string
+
+// applyRendezvousAuth sets the Authorization header for the configured
+// credential style. No-op when no credential is configured.
+func applyRendezvousAuth(req *http.Request) {
+	cred := strings.TrimSpace(gRendezvousCred)
+	if cred == "" {
+		return
+	}
+	if user, pass, isBasic := strings.Cut(cred, ":"); isBasic {
+		req.SetBasicAuth(user, pass)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+}
+
 // rendezvousAnnounce announces to one server and returns the peers it reports.
 func rendezvousAnnounce(server string, infoHash []byte, peerID, endpoint string) ([]string, error) {
 	reqBody, _ := json.Marshal(map[string]string{
@@ -33,13 +56,27 @@ func rendezvousAnnounce(server string, infoHash []byte, peerID, endpoint string)
 		"endpoint": endpoint,
 		"peer_id":  peerID,
 	})
+	req, err := http.NewRequest(http.MethodPost,
+		strings.TrimRight(server, "/")+"/api/rendezvous", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyRendezvousAuth(req)
+
 	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Post(strings.TrimRight(server, "/")+"/api/rendezvous",
-		"application/json", bytes.NewReader(reqBody))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		// Distinct message: this is a CREDENTIAL problem, not an outage —
+		// the single most confusing failure to debug from a generic "status
+		// 401" line.
+		return nil, fmt.Errorf("rendezvous %s rejected our credential (401) — "+
+			"check the rendezvous username/password or token in Settings", server)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("rendezvous %s status %d", server, resp.StatusCode)
 	}

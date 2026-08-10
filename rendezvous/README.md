@@ -73,3 +73,32 @@ some not) all converges.
 | `LISTEN_ADDR` | `:8080` | bind address |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | — | serve HTTPS directly (optional) |
 | `PEER_TTL_SECONDS` | `300` | how long an endpoint stays advertised |
+
+## Authentication
+
+Set either (or both) on the server; with neither set it runs **open** and logs
+a warning:
+
+| Env | Meaning | Example |
+|---|---|---|
+| `AUTH_TOKENS` | comma-separated bearer tokens | `AUTH_TOKENS="tok1,tok2"` |
+| `AUTH_USERS` | comma-separated `user:password` pairs (HTTP Basic) | `AUTH_USERS="alice:pw1,bob:pw2"` |
+
+Generate a good token with `openssl rand -hex 24`.
+
+Clients configure **one** field that covers both schemes — a value containing a
+colon is sent as HTTP Basic, anything else as a Bearer token:
+
+- **Desktop (macOS/Windows)**: Settings → *Rendezvous username or token* / *password*
+- **Container / headless**: `rendezvous_auth` in `client.yaml`, or
+  `RENDEZVOUS_AUTH` / `RENDEZVOUS_TOKEN` / `RENDEZVOUS_USER`+`RENDEZVOUS_PASSWORD`
+- **Admin panel** (any platform): Settings → *Rendezvous discovery*
+- **Mobile**: carried automatically in the **Join QR**, or Settings → *Rendezvous servers*
+
+`/healthz` stays unauthenticated (probes and load balancers have no
+credential, and it reveals nothing). `/api/auth-check` requires the credential
+and is a cheap way to verify one is correct.
+
+**Always run this behind TLS.** Both schemes send the secret in a header; the
+auth protects the *service* from abuse and endpoint enumeration, not the
+overlay itself — network membership stays gated by the Noise handshake + PSK.

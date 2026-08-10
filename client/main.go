@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,7 +64,7 @@ type ClientConfig struct {
 	// admin dashboard). Optional; also settable via the FRIENDLY_NAME env var and
 	// remotely by an admin-signed provision.
 	FriendlyName string `yaml:"friendly_name"`
-	// OverlayCIDR is the overlay subnet (e.g. "10.28.55.0/24"). Each node
+	// OverlayCIDR is the overlay subnet (e.g. "10.22.55.0/24"). Each node
 	// derives its own address inside this subnet from its public key, so
 	// no per-node IP configuration is needed. Overridable per node by
 	// setting tun.address_cidr explicitly, and per deployment with the
@@ -71,6 +72,40 @@ type ClientConfig struct {
 	OverlayCIDR                string    `yaml:"overlay_cidr"`
 	Tun                        TunConfig `yaml:"tun"`
 	UDPListenPort              int       `yaml:"udp_listen_port"`
+	// AdvertisePort is a KNOWN-GOOD inbound port that peers can reach this node
+	// at, when that port cannot be discovered by observation. STUN reports the
+	// port your NAT chose for the packet you sent IT — which is the right answer
+	// behind a home router, and the wrong answer whenever the real inbound path
+	// was configured rather than negotiated.
+	//
+	// The case that motivated this: a client in a Kubernetes pod. The CNI
+	// masquerades outbound traffic and rewrites the source port per destination,
+	// so the node presents as a symmetric NAT and every STUN-derived endpoint is
+	// useless to a peer. But the pod also has a hostPort, which is a stable,
+	// DNAT'd inbound port that always works — the client simply had no way to
+	// know about it. Set advertise_port to the hostPort and peers get an
+	// endpoint that actually accepts traffic.
+	//
+	// Also correct for a manual router port-forward. Leave unset (0) to use the
+	// observed STUN port, which is right for everyone else. Env: ADVERTISE_PORT.
+	AdvertisePort int `yaml:"advertise_port"`
+	// ExtraCandidates are endpoints this node is reachable at that it has NO
+	// way to observe for itself. Advertised verbatim, ahead of anything STUN
+	// derived, and treated as LAN-class (tried first).
+	//
+	// The case this exists for: a client inside a Kubernetes pod. Its own
+	// network namespace contains only the pod address (10.42.x.y), which is
+	// meaningless outside the cluster. The address that actually reaches it is
+	// its NODE's LAN address paired with the hostPort — and the pod cannot see
+	// that, because the node's interfaces are in a different namespace and STUN
+	// only ever reports what the CNI masquerade rewrote the source to. So a pod
+	// sitting one switch hop from a laptop advertises nothing the laptop can
+	// dial, and the pair relays across the internet to reach each other.
+	//
+	// Kubernetes will tell the pod its node address via the downward API
+	// (status.hostIP); anything else that knows its own reachable endpoint can
+	// pass it the same way. Comma-separated. Env: EXTRA_CANDIDATES.
+	ExtraCandidates []string `yaml:"extra_candidates"`
 	STUNServers                []string  `yaml:"stun_servers"`
 	AnnounceOnlyOnIPChange     bool      `yaml:"announce_only_on_ip_change"`
 	Trackers                   []string  `yaml:"trackers"`
@@ -81,6 +116,12 @@ type ClientConfig struct {
 	// POSTs to <url>/api/rendezvous. Also settable via RENDEZVOUS_SERVERS
 	// (comma-separated).
 	RendezvousServers []string `yaml:"rendezvous_servers"`
+	// RendezvousAuth is the credential for servers that require one. ONE
+	// field, two schemes, auto-detected: "user:password" sends HTTP Basic,
+	// anything without a colon is sent as a Bearer token. Also settable via
+	// RENDEZVOUS_AUTH (or RENDEZVOUS_TOKEN / RENDEZVOUS_USER+RENDEZVOUS_PASSWORD).
+	// Blank = send no credential (open server).
+	RendezvousAuth string `yaml:"rendezvous_auth"`
 	ControllerURL              string    `yaml:"controller_url"`
 	MinAnnounceIntervalSeconds int       `yaml:"min_announce_interval_seconds"`
 	Compression                bool      `yaml:"compression"`
@@ -142,12 +183,28 @@ type ClientConfig struct {
 	// elsewhere — while the pinned exit is unreachable). Also settable via
 	// the EXIT_PEER environment variable.
 	ExitPeer string `yaml:"exit_peer"`
+	// Networks are ADDITIONAL overlay networks this node participates in
+	// concurrently (e.g. guest networks). Each runs as a supervised child
+	// instance with its own TUN, port and state — see multinet.go.
+	Networks []SecondaryNetwork `yaml:"networks"`
 }
 
-// myOverlayIP is this node's overlay address (no mask), set once in main()
-// before any traffic goroutine starts. Announced to peers in control frames
-// for routing and address-conflict detection.
-var myOverlayIP string
+// myOverlayIPVal holds this node's overlay address (no mask). It is set in
+// main() before traffic starts but ALSO rewritten at runtime by conflict
+// self-healing and admin provisions (applyAddressLive) while every traffic
+// goroutine reads it — so access must be synchronized. A plain string var
+// here was a data race: Go strings are two words, and a torn read under a
+// concurrent write can crash. atomic.Value keeps the hot-path read at a
+// single atomic load.
+var myOverlayIPVal atomic.Value // string
+
+// myOverlayIP() returns this node's current overlay address ("" until set).
+func myOverlayIP() string {
+	s, _ := myOverlayIPVal.Load().(string)
+	return s
+}
+
+func setMyOverlayIP(ip string) { myOverlayIPVal.Store(ip) }
 
 // noiseCipher is the AEAD used for handshakes and transport. Default is
 // ChaCha20-Poly1305 (fast everywhere, no hardware needed). "aesgcm" uses
@@ -202,8 +259,55 @@ func shouldTryConnect(dstIP string) bool {
 	if t, ok := connectAttempt[dstIP]; ok && time.Since(t) < connectAttemptInterval {
 		return false
 	}
+	// Bounded: with a wide overlay CIDR (or hostile roster gossip) the set of
+	// distinct destinations is unbounded — drop entries old enough to be
+	// meaningless for throttling so the map cannot grow forever.
+	if len(connectAttempt) > 4096 {
+		cutoff := time.Now().Add(-4 * connectAttemptInterval)
+		for k, t := range connectAttempt {
+			if t.Before(cutoff) {
+				delete(connectAttempt, k)
+			}
+		}
+	}
 	connectAttempt[dstIP] = time.Now()
 	return true
+}
+
+// logUnprovenRoute announces, at most once per destination per 30s, that we
+// are addressing a peer over a route with no recent decrypted inbound and are
+// therefore relaying in parallel rather than trusting it.
+//
+// This exists because the silent version of this state is close to
+// undiagnosable from the outside: the peer keeps appearing in the roster (it
+// is gossiped by mutual neighbours, not by the dead route), ping reports 100%
+// loss, and NOTHING is logged on either end — the sender is transmitting into
+// a black hole and the receiver never sees a packet to complain about. One
+// line here names the peer, the dead endpoint, and the fact that a relay is
+// being tried.
+var (
+	unprovenRouteMu  sync.Mutex
+	unprovenRouteLog = map[string]time.Time{}
+)
+
+func logUnprovenRoute(dstIP string, addr *net.UDPAddr) {
+	unprovenRouteMu.Lock()
+	if t, ok := unprovenRouteLog[dstIP]; ok && time.Since(t) < 30*time.Second {
+		unprovenRouteMu.Unlock()
+		return
+	}
+	unprovenRouteLog[dstIP] = time.Now()
+	if len(unprovenRouteLog) > 1024 {
+		cutoff := time.Now().Add(-5 * time.Minute)
+		for k, t := range unprovenRouteLog {
+			if t.Before(cutoff) {
+				delete(unprovenRouteLog, k)
+			}
+		}
+	}
+	unprovenRouteMu.Unlock()
+	log.Printf("[route] %s: no decrypted inbound from %s in %v — direct path unproven, relaying in parallel",
+		dstIP, addr, routeLiveTimeout())
 }
 
 // currentPublicEndpoint returns our best-known public UDP endpoint (the STUN
@@ -225,18 +329,84 @@ func buildConnectFrame(kind byte, dstIP, srcIP, srcEndpoint string) []byte {
 // to every established peer so whichever one can reach the destination
 // relays it. Safe to broadcast because relays forward with
 // forwardControlToward (unicast-only), so a frame is never re-broadcast.
+//
+// The unicast shortcut may only SUPPRESS the broadcast when the direct route
+// is proven live (RouteIsLive), not merely established. A session whose
+// return path has died still reports Established() for up to
+// sessionStaleTimeout, and this function is how connect-request/ack signaling
+// reaches a peer we cannot address directly — so trusting a dead route here
+// is self-sealing: the punch signaling that would rebuild the path is itself
+// unicast into the black hole, no relay ever sees it, and the two nodes stay
+// mutually unreachable indefinitely while each still lists the other in its
+// roster. Sending both ways costs one small frame per peer.
 func sendControlToward(overlayIP string, frame []byte) {
+	var direct *net.UDPAddr
 	if a := ipLearning.Lookup(overlayIP); a != nil {
 		if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() {
 			_ = sendPacket(GlobalConn, a, s, frame)
-			return
+			if GlobalSessions.RouteIsLive(a) {
+				return
+			}
+			// Established but unproven: fall through and ALSO relay-broadcast.
+			direct = a
 		}
 	}
 	for _, addr := range GlobalSessions.EstablishedAddrs() {
+		if direct != nil && addr.String() == direct.String() {
+			continue // already sent directly above
+		}
 		if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
 			_ = sendPacket(GlobalConn, addr, s, frame)
 		}
 	}
+}
+
+
+// --- duplicate connect-signaling suppression -------------------------------
+//
+// sendControlToward BROADCASTS a connect frame to every established peer, and
+// every one of those that holds a direct route to the target relays it on. The
+// target therefore receives one copy per relay — routinely eight or more on a
+// modest mesh — and, before this, ran the FULL punch for each copy:
+//
+//   13:08:02 punch-ack from 10.22.22.117 (candidates: ...); punching   x8
+//
+// Eight duplicates times ten candidates is eighty handshake goroutines for a
+// single logical event, every fifteen seconds, per peer. It also poisons the
+// per-address back-off, because the same endpoint is dialled eight times
+// concurrently and seven of those lose the race and count as failures.
+//
+// The fan-out itself is deliberate and worth keeping — it is what makes the
+// signalling survive a dead route. The duplicates just must not each trigger a
+// punch. Key on the source AND the candidate list, so a peer that genuinely
+// roams to new endpoints is never suppressed: its candidate list changes, so
+// the key changes, and the new punch runs immediately.
+var (
+	connectSeenMu sync.Mutex
+	connectSeen   = map[string]time.Time{}
+)
+
+const connectDedupWindow = 3 * time.Second
+
+// shouldHandleConnect reports whether this connect frame is the first copy of
+// its kind within the dedup window.
+func shouldHandleConnect(kind byte, srcIP, cands string) bool {
+	key := string(kind) + "|" + srcIP + "|" + cands
+	now := time.Now()
+	connectSeenMu.Lock()
+	defer connectSeenMu.Unlock()
+	if t, ok := connectSeen[key]; ok && now.Sub(t) < connectDedupWindow {
+		return false
+	}
+	if len(connectSeen) > 512 {
+		for k, t := range connectSeen {
+			if now.Sub(t) > connectDedupWindow {
+				delete(connectSeen, k)
+			}
+		}
+	}
+	connectSeen[key] = now
+	return true
 }
 
 // forwardControlToward relays SOMEONE ELSE'S control frame one hop, and ONLY
@@ -305,13 +475,40 @@ func loadConfig() (*ClientConfig, error) {
 		cfg.OverlayCIDR = env
 	}
 	if cfg.OverlayCIDR == "" {
-		cfg.OverlayCIDR = "10.28.55.0/24"
+		cfg.OverlayCIDR = "10.22.55.0/24"
 	}
 	if env := strings.TrimSpace(os.Getenv("RENDEZVOUS_SERVERS")); env != "" {
 		for _, s := range strings.Split(env, ",") {
 			if s = strings.TrimSpace(s); s != "" {
 				cfg.RendezvousServers = append(cfg.RendezvousServers, s)
 			}
+		}
+	}
+	// Rendezvous credential. RENDEZVOUS_AUTH takes the combined form
+	// ("user:pass" or a bare token); the split forms exist because Kubernetes
+	// Secrets / OpenBao usually project each field separately.
+	if env := strings.TrimSpace(os.Getenv("RENDEZVOUS_AUTH")); env != "" {
+		cfg.RendezvousAuth = env
+	}
+	if env := strings.TrimSpace(os.Getenv("RENDEZVOUS_TOKEN")); env != "" {
+		cfg.RendezvousAuth = env
+	}
+	if u := strings.TrimSpace(os.Getenv("RENDEZVOUS_USER")); u != "" {
+		if p := os.Getenv("RENDEZVOUS_PASSWORD"); p != "" {
+			cfg.RendezvousAuth = u + ":" + p
+		}
+	}
+	if env := strings.TrimSpace(os.Getenv("EXTRA_CANDIDATES")); env != "" {
+		cfg.ExtraCandidates = nil
+		for _, c := range strings.Split(env, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				cfg.ExtraCandidates = append(cfg.ExtraCandidates, c)
+			}
+		}
+	}
+	if env := os.Getenv("ADVERTISE_PORT"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 && n < 65536 {
+			cfg.AdvertisePort = n
 		}
 	}
 	switch strings.ToLower(os.Getenv("PORT_PREDICTION")) {
@@ -340,7 +537,7 @@ func loadConfig() (*ClientConfig, error) {
 	}
 	// OVERLAY_ADDRESS pins this node's overlay IP (static assignment),
 	// overriding both tun.address_cidr and the key-derived auto IP.
-	// Accepts "10.28.55.2" or "10.28.55.2/24"; a bare IP inherits the
+	// Accepts "10.22.55.2" or "10.22.55.2/24"; a bare IP inherits the
 	// subnet mask from overlay_cidr.
 	if env := os.Getenv("OVERLAY_ADDRESS"); env != "" {
 		cfg.Tun.AddressCIDR = env
@@ -372,11 +569,19 @@ func loadConfig() (*ClientConfig, error) {
 	default:
 		return nil, fmt.Errorf("cipher must be \"chacha\" or \"aesgcm\", got %q", cfg.Cipher)
 	}
-	// NAT keepalive cadence: default 10s, clamped 5..120. A healthy session
+	// NAT keepalive cadence: default 25s, clamped 5..120. A healthy session
 	// receives the peer's keepalive every interval, so anything quiet for ~3
 	// intervals is a dead path — that drives sessionStaleTimeout below.
+	//
+	// 20s instead of 10s: every keepalive a desktop/server sends also WAKES
+	// the radio of every phone peer it has a session with, so mobile battery
+	// is only as good as the chattiest node on the mesh. But stay BELOW 25s —
+	// the sessions that matter here include ones to phones on carrier NAT,
+	// which commonly expires UDP mappings around 30s; a missed mapping costs
+	// a full re-punch. Matches the mobile core's default. Override with
+	// keepalive_seconds if your NAT is unusually tight or unusually generous.
 	if cfg.KeepaliveSeconds == 0 {
-		cfg.KeepaliveSeconds = 10
+		cfg.KeepaliveSeconds = 20
 	}
 	if cfg.KeepaliveSeconds < 5 {
 		cfg.KeepaliveSeconds = 5
@@ -399,7 +604,7 @@ func loadConfig() (*ClientConfig, error) {
 // inside the overlay subnet. Every node runs the same computation on its
 // own key, so no coordination, DHCP, or per-node config is required: bring
 // a new machine up with the same network_name/PSK/overlay_cidr and it picks
-// its own stable IP (e.g. 10.28.55.213/24). Network and broadcast addresses
+// its own stable IP (e.g. 10.22.55.213/24). Network and broadcast addresses
 // are never produced. With a /24 (253 usable hosts) the birthday-collision
 // odds stay negligible for small fleets; if two nodes ever do collide, pin
 // one of them with an explicit tun.address_cidr.
@@ -476,7 +681,7 @@ func handleAddrConflict(raddr *net.UDPAddr, ip string) {
 			break
 		}
 		candIP := stripMask(cand)
-		if candIP == myOverlayIP || ipLearning.Lookup(candIP) != nil {
+		if candIP == myOverlayIP() || ipLearning.Lookup(candIP) != nil {
 			continue // that one's taken too — keep hopping
 		}
 		lastAddrHop = time.Now()
@@ -495,18 +700,18 @@ func handleAddrConflict(raddr *net.UDPAddr, ip string) {
 // and re-announces so peers relearn the mapping. Runs entirely in-process with
 // the privileges the client already holds — no restart or prompt.
 func applyAddressLive(newCIDR string) {
-	oldIP := myOverlayIP
+	oldIP := myOverlayIP()
 	if err := reAddressTUN(oldIP, newCIDR); err != nil {
 		log.Printf("[provision] live re-address to %s failed: %v (applies on next restart)", newCIDR, err)
 		return
 	}
 	if ip, _, err := net.ParseCIDR(newCIDR); err == nil && ip.To4() != nil {
-		myOverlayIP = ip.To4().String()
+		setMyOverlayIP(ip.To4().String())
 	}
 	pendingAddrMu.Lock()
 	pendingAddress = ""
 	pendingAddrMu.Unlock()
-	log.Printf("[provision] overlay address changed %s -> %s (applied live)", oldIP, myOverlayIP)
+	log.Printf("[provision] overlay address changed %s -> %s (applied live)", oldIP, myOverlayIP())
 	if GlobalSessions != nil && GlobalConn != nil {
 		frame := buildAddrAnnounce()
 		for _, addr := range GlobalSessions.EstablishedAddrs() {
@@ -553,6 +758,10 @@ var (
 	stunPendingMu sync.Mutex
 	stunPendingCb func(reflexive string)
 	stunPendingTx [12]byte
+	// stunQueryMu serialises whole queries (see stunQueryOnSocket). Distinct
+	// from stunPendingMu, which only guards the callback slot itself and must
+	// stay free while a query is in flight so dispatchSTUN can deliver.
+	stunQueryMu sync.Mutex
 )
 
 // dispatchSTUN parses a candidate STUN binding-response message and, if the
@@ -642,6 +851,17 @@ func dispatchSTUN(pkt []byte) bool {
 // ephemeral UDP socket, so STUN's reported port was useless for inbound
 // peer traffic.
 func stunQueryOnSocket(conn *net.UDPConn, stunServer string, timeout time.Duration) (string, error) {
+	// One query at a time. There is a SINGLE pending-callback slot (dispatchSTUN
+	// matches one transaction id), so two overlapping queries mean the second
+	// one's registration displaces the first and the first can only time out.
+	// That was survivable while the announce loop was effectively the only
+	// caller; now that NAT probing also runs periodically on every node, the
+	// two would collide on a regular cadence and each collision costs a real
+	// STUN timeout — and a missed public endpoint on the announce path.
+	// Serialising costs nothing: these are infrequent and short.
+	stunQueryMu.Lock()
+	defer stunQueryMu.Unlock()
+
 	addr := stunServer
 	if strings.HasPrefix(addr, "stun:") {
 		addr = addr[5:]
@@ -674,8 +894,14 @@ func stunQueryOnSocket(conn *net.UDPConn, stunServer string, timeout time.Durati
 	stunPendingTx = txid
 	stunPendingMu.Unlock()
 	defer func() {
+		// Only clear the slot if it is still OURS. Two STUN queries can be in
+		// flight at once (the announce loop and the session-lost re-poll both
+		// call fetchPublicEndpoint); unconditionally nil-ing the callback here
+		// silently cancelled whichever query registered after us.
 		stunPendingMu.Lock()
-		stunPendingCb = nil
+		if stunPendingTx == txid {
+			stunPendingCb = nil
+		}
 		stunPendingMu.Unlock()
 	}()
 
@@ -728,13 +954,68 @@ type natMapping struct {
 	port      int    // most recently observed external port
 	stride    int    // per-allocation port increment (0 = port-stable)
 	symmetric bool
+	// samples is how many STUN servers actually answered. Classification needs
+	// at least TWO different servers: with one sample "all ports agree" is
+	// vacuously true, and reporting that as a port-stable NAT is a lie that
+	// hides the exact failure this struct exists to detect. Callers must treat
+	// samples < 2 as UNKNOWN, not as port-stable.
+	samples int
 }
 
 var (
-	natMu            sync.Mutex
-	natInfo          natMapping
-	portPredictionOn bool
+	natMu   sync.Mutex
+	natInfo natMapping
+	// portPredictionOn is the EFFECTIVE state: forced on by config, or turned
+	// on automatically once probing observes a symmetric NAT (see
+	// startNATProbing). Behind a symmetric NAT prediction is not an optional
+	// extra — it is the only thing that produces a punchable candidate — so
+	// waiting for an operator to set a flag just means "everything is relayed"
+	// with nothing in the log to say why.
+	//
+	// Atomic because the probe goroutine now flips it at runtime while the
+	// connect-signaling path reads it on every candidate build.
+	portPredictionOn atomic.Bool
+	// portPredictionForced records the config/env setting, so the UI can tell
+	// "operator asked for this" apart from "we detected a symmetric NAT".
+	portPredictionForced atomic.Bool
 )
+
+// natTypeLabel is a short human classification of this node's NAT, for logs
+// and the admin UI: "" (not probed yet), "unknown", "port-stable" or
+// "symmetric". A node that shows "symmetric" cannot be hole-punched by another
+// NATed peer using a single advertised endpoint — that pair falls back to
+// relay — which is precisely the state that used to be invisible.
+func natTypeLabel() string {
+	natMu.Lock()
+	m := natInfo
+	natMu.Unlock()
+	switch {
+	case m.ip == "":
+		return ""
+	case m.samples < 2:
+		return "unknown"
+	case m.symmetric:
+		return "symmetric"
+	default:
+		return "port-stable"
+	}
+}
+
+// natSummary returns the machine-readable NAT state for /api/info.
+func natSummary() map[string]any {
+	natMu.Lock()
+	m := natInfo
+	natMu.Unlock()
+	return map[string]any{
+		"type":              natTypeLabel(),
+		"external_ip":       m.ip,
+		"external_port":     m.port,
+		"stride":            m.stride,
+		"stun_samples":      m.samples,
+		"prediction_on":     portPredictionOn.Load(),
+		"prediction_forced": portPredictionForced.Load(),
+	}
+}
 
 // ipv6Enabled gates the dual-stack transport (bind ::, advertise/dial global
 // IPv6). ON by default; set by config/env before the socket is opened.
@@ -753,7 +1034,19 @@ func probeNAT(conn *net.UDPConn, stunServers []string, timeout time.Duration) (n
 	}
 	var ports []int
 	var ip string
+	// Only count servers at DISTINCT addresses. A symmetric NAT is detected by
+	// two different destinations producing two different external ports, so two
+	// hostnames that resolve to the same anycast IP are one sample, not two —
+	// counting them twice makes a symmetric NAT look port-stable.
+	seenServer := map[string]bool{}
 	for _, s := range stunServers {
+		host := strings.TrimPrefix(s, "stun:")
+		if ra, err := net.ResolveUDPAddr("udp", host); err == nil {
+			if seenServer[ra.String()] {
+				continue
+			}
+			seenServer[ra.String()] = true
+		}
 		ep, err := stunQueryOnSocket(conn, s, perServer)
 		if err != nil || ep == "" {
 			continue
@@ -775,7 +1068,7 @@ func probeNAT(conn *net.UDPConn, stunServers []string, timeout time.Duration) (n
 	if len(ports) == 0 {
 		return natMapping{}, errors.New("no STUN reflexive address")
 	}
-	m := natMapping{ip: ip, port: ports[len(ports)-1]}
+	m := natMapping{ip: ip, port: ports[len(ports)-1], samples: len(ports)}
 	if len(ports) >= 2 {
 		allSame := true
 		for _, p := range ports[1:] {
@@ -793,6 +1086,27 @@ func probeNAT(conn *net.UDPConn, stunServers []string, timeout time.Duration) (n
 			if m.stride == 0 {
 				m.stride = 1
 			}
+			// Prediction is only honest when the allocation is ARITHMETIC.
+			// Check every consecutive delta, not just the average: a NAT that
+			// allocates randomly can still average out to a plausible-looking
+			// stride. Observed in the wild behind a Kubernetes CNI masquerade,
+			// which advertised ports 485 apart one cycle and 1 apart the next,
+			// from a fresh random base each time — nine guesses per cycle,
+			// every one of them wrong, on every peer in the mesh.
+			//
+			// stride 0 means "symmetric, but unpredictable": the NAT type is
+			// still reported and logged, we simply stop pretending we can guess
+			// the next port. Relay handles it, which is the honest outcome.
+			uniform := true
+			for i := 1; i+1 < len(ports); i++ {
+				if ports[i+1]-ports[i] != ports[1]-ports[0] {
+					uniform = false
+					break
+				}
+			}
+			if !uniform || m.stride > 64 || m.stride < -64 {
+				m.stride = 0
+			}
 		}
 	}
 	return m, nil
@@ -800,7 +1114,21 @@ func probeNAT(conn *net.UDPConn, stunServers []string, timeout time.Duration) (n
 
 // startNATProbing keeps natInfo fresh in the background so connect signaling
 // always advertises current predictions. Runs on the overlay socket.
+//
+// This runs UNCONDITIONALLY — it is classification, not an optional feature.
+// It used to be started only when port_prediction was configured on, which
+// meant that on the two builds that can't set that flag (the desktop menu-bar
+// app and the mobile app) a symmetric NAT was never probed, never logged and
+// never shown. Moving onto a router with symmetric NAT therefore looked like
+// "every peer is suddenly RELAYED" with an empty log and no way to tell why.
+//
+// Detection also ENABLES prediction by itself. Behind a symmetric NAT the
+// single STUN endpoint we would otherwise advertise is valid only toward the
+// STUN server, so a peer punching it always misses; predicted ports are the
+// only candidates with any chance. The config flag stays as a way to force
+// prediction on a NAT we classified as port-stable.
 func startNATProbing(conn *net.UDPConn, stunServers []string) {
+	var lastLabel string
 	update := func() {
 		m, err := probeNAT(conn, stunServers, 6*time.Second)
 		if err != nil {
@@ -809,15 +1137,41 @@ func startNATProbing(conn *net.UDPConn, stunServers []string) {
 		natMu.Lock()
 		natInfo = m
 		natMu.Unlock()
-		if m.symmetric {
-			log.Printf("[nat] symmetric NAT detected (ext %s, port ~%d, stride %d) — enabling port prediction",
-				m.ip, m.port, m.stride)
-		} else {
+		if m.symmetric && portPredictionOn.CompareAndSwap(false, true) {
+			log.Printf("[nat] port prediction auto-enabled (symmetric NAT)")
+		}
+		// Log on CHANGE only: this ticks every 60s for the life of the
+		// process, and two identical lines a minute apart taught nobody
+		// anything while burying the lines that mattered.
+		label := natTypeLabel()
+		if label == lastLabel {
+			return
+		}
+		lastLabel = label
+		switch label {
+		case "symmetric":
+			log.Printf("[nat] SYMMETRIC NAT (ext %s, port ~%d, stride %d) — this router assigns a new external port per destination. "+
+				"Peers behind their own NAT cannot hole-punch to us and will fall back to RELAY. "+
+				"Fixes: forward UDP %d on the router, enable NAT-PMP/PCP on it, or enable IPv6.",
+				m.ip, m.port, m.stride, myUDPPort)
+		case "port-stable":
 			log.Printf("[nat] port-stable NAT (ext %s:%d) — direct punch should work", m.ip, m.port)
+		default:
+			log.Printf("[nat] NAT type unknown: only %d STUN server(s) answered — need 2 at different addresses to classify", m.samples)
 		}
 	}
-	update()
+	// The first probe runs in the BACKGROUND. It costs a DNS resolve plus a
+	// STUN round-trip per server — several seconds if the network is still
+	// settling, which it usually is at this point in startup — and nothing
+	// downstream needs the answer. Running it inline held up LAN discovery,
+	// the first tracker announce and the peer-connect loop behind it, which
+	// looked from the outside like a client that simply never came up.
 	go func() {
+		// Let startup finish first: the initial fetchPublicEndpoint, the first
+		// tracker announce and LAN discovery all want the socket and the
+		// resolver right now, and the NAT classification is not urgent.
+		time.Sleep(5 * time.Second)
+		update()
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
@@ -834,6 +1188,12 @@ func startNATProbing(conn *net.UDPConn, stunServers []string) {
 // myUDPPort is our actual UDP listen port (no NAT translation on IPv6), used
 // to build directly-dialable IPv6 candidates.
 var myUDPPort int
+
+// advertisePort is the configured known-good inbound port (0 = use STUN's).
+var advertisePort int
+
+// extraCandidates are operator-supplied endpoints we cannot observe ourselves.
+var extraCandidates []string
 
 // hasGlobalIPv6 reports whether this host currently has any global IPv6
 // address (cached briefly — it's called on every connect attempt). Used to
@@ -855,56 +1215,150 @@ func hasGlobalIPv6() bool {
 	return v6CheckHave
 }
 
+// Candidate budget, PER TIER rather than one global cap.
+//
+// A single overall limit looks tidy and is quietly dangerous: a multi-homed
+// host (Wi-Fi + Ethernet + an iPhone-USB link + a VM bridge) can produce eight
+// or more LAN addresses, and with one shared budget those fill the list and
+// starve the PUBLIC endpoint — leaving a node advertising nothing an internet
+// peer could ever dial. Budget each tier separately so no tier can crowd out
+// another, and never cap the public endpoint at all.
+const (
+	maxLANCandidates = 3 // enough for Wi-Fi + Ethernet + one more
+	maxV6Candidates  = 2
+	// predictedPortSpread is how many symmetric-NAT port guesses to advertise.
+	// Was 8; that wide a spread buys very little hit rate and costs every peer
+	// a burst of doomed handshakes.
+	predictedPortSpread = 4
+)
+
 func myConnectCandidates() string {
 	natMu.Lock()
 	m := natInfo
 	natMu.Unlock()
 
 	var cands []string
-	if m.ip == "" {
-		if ep := currentPublicEndpoint(); ep != "" {
-			cands = append(cands, ep)
+	// addN appends up to n entries from one tier. The public endpoint uses
+	// addAlways, so it can never be squeezed out by a chatty tier above it.
+	tier := 0
+	addN := func(s string, n int) {
+		if tier < n {
+			tier++
+			cands = append(cands, s)
 		}
-	} else if !portPredictionOn || !m.symmetric || m.stride == 0 {
-		// Prediction disabled, or a port-stable NAT: advertise the single real
-		// endpoint.
-		cands = append(cands, fmt.Sprintf("%s:%d", m.ip, m.port))
-	} else {
-		// Symmetric: spray predicted next allocations plus the raw observed
-		// port (some NATs briefly reuse the last mapping).
-		for k := 1; k <= 8; k++ {
-			p := m.port + k*m.stride
-			if p > 0 && p < 65536 {
-				cands = append(cands, fmt.Sprintf("%s:%d", m.ip, p))
-			}
+	}
+	addAlways := func(s string) { cands = append(cands, s) }
+
+	// ORDER MATTERS, and it is deliberately cheapest-and-most-likely first.
+	//
+	// A peer punches this list; every entry it tries that cannot work is dead
+	// weight. The pathological case is two devices on the SAME Wi-Fi behind a
+	// symmetric NAT: port prediction fills the list with predicted ports on our
+	// PUBLIC ip — which is also the peer's own public ip — so every one of them
+	// trips the peer's same-site hairpin guard, which returns early for a
+	// minute and then backs off exponentially. Putting the LAN address first
+	// means the one candidate that can actually work is tried immediately
+	// instead of queued behind nine that cannot.
+
+	// 1. LAN: directly-attached addresses. No NAT, no traversal, lowest latency.
+	//
+	// The test is "on a network we are attached to", NOT IsPrivate(): Go's
+	// IsPrivate covers only RFC1918, so on the two LAN styles fibre ISPs
+	// actually ship — RFC6598 carrier space (100.64/10) and public addressing —
+	// every LAN address was silently dropped and this path went dead.
+	// 0. Operator-supplied endpoints we cannot observe ourselves (see
+	// ExtraCandidates). First, because they are known-good by construction.
+	// Operator-supplied endpoints FIRST — known-good by construction.
+	//
+	// This ordering is deliberate and was restored after an experiment:
+	// overlay-subnet candidates (a Kubernetes pod advertising its node's
+	// overlay address) were briefly demoted to the end of the list on the
+	// theory that a mesh-nested path should be a last resort. Peers punch
+	// every candidate in parallel with no cap, so the demotion bought
+	// nothing measurable — and it was an unproven change to the exact path
+	// that gives a pod its only direct session. Not worth the risk.
+	for _, c := range extraCandidates {
+		if c = strings.TrimSpace(c); c != "" && isPunchableAddr(c) {
+			addAlways(c)
 		}
-		cands = append(cands, fmt.Sprintf("%s:%d", m.ip, m.port))
 	}
 
-	// LAN candidates: our private IPv4 addresses (real interfaces only — the
-	// overlay's own TUN is filtered so peers never punch an overlay IP).
-	// When a connect request is relayed through a mutual peer, a device on
-	// the SAME network punches these directly. This is the deterministic
-	// same-Wi-Fi path that needs no beacons at all — critical for iOS peers,
-	// which can't send broadcast (no multicast entitlement) and whose beacon
-	// probes are at the mercy of AP filtering.
 	if myUDPPort > 0 {
 		for _, n := range localIPv4Nets() {
-			if ip4 := n.IP.To4(); ip4 != nil && ip4.IsPrivate() {
-				cands = append(cands, fmt.Sprintf("%s:%d", ip4, myUDPPort))
+			ip4 := n.IP.To4()
+			if ip4 == nil || !ip4.IsGlobalUnicast() || ip4.IsLinkLocalUnicast() {
+				continue
 			}
+			addN(fmt.Sprintf("%s:%d", ip4, myUDPPort), maxLANCandidates)
 		}
 	}
-	// Always advertise our global IPv6 endpoints. Over v6 there is no NAT, so a
-	// v6-capable peer can reach these directly — this is the path that fixes
-	// CGNAT/hotspot without any server. The overlay stays IPv4; only the
-	// transport uses v6.
-	if myUDPPort > 0 {
-		cands = append(cands, globalIPv6Endpoints(myUDPPort)...)
+
+	// 2. A configured, known-good inbound port (Kubernetes hostPort, manual
+	// port-forward). This beats the STUN-observed endpoint because it was set
+	// up deliberately and does not change per destination — which is exactly
+	// what a masquerading CNI or a symmetric NAT breaks about the observed one.
+	if advertisePort > 0 {
+		if host := publicIPOnly(); host != "" {
+			addAlways(net.JoinHostPort(host, strconv.Itoa(advertisePort)))
+		}
 	}
-	// Also advertise a router-mapped (NAT-PMP/PCP) endpoint if we have one.
+
+	// 3. IPv6: no NAT at all, so a v6-capable peer reaches us directly.
+	if myUDPPort > 0 {
+		tier = 0
+		for _, ep := range globalIPv6Endpoints(myUDPPort) {
+			addN(ep, maxV6Candidates)
+		}
+	}
+
+	// 4. A router-granted (NAT-PMP/PCP) pinhole — a real, stable inbound port.
 	if me := getMappedEndpoint(); me != "" {
-		cands = append(cands, me)
+		addAlways(me)
+	}
+
+	// 5. The observed public endpoint.
+	if m.ip == "" {
+		if ep := currentPublicEndpoint(); ep != "" {
+			addAlways(ep)
+		}
+	} else {
+		addAlways(fmt.Sprintf("%s:%d", m.ip, m.port))
+	}
+
+	// 6. Our public IP paired with our OWN LISTEN PORT.
+	//
+	// STUN can only ever report the port our NAT chose for the packet we sent
+	// TO STUN. That is the right answer behind a plain home router and the
+	// wrong answer whenever the real inbound path was configured rather than
+	// negotiated — a forwarded port, a DMZ host, or a Kubernetes hostPort.
+	//
+	// In all three of those cases inbound traffic to <public ip>:<listen port>
+	// is delivered to us untouched, and because conntrack reverses the mapping
+	// our replies leave from that same port. The path works in both directions
+	// and is completely stable. It was simply never advertised, so no peer ever
+	// tried it — which is how a node with a perfectly good forwarded port sits
+	// on relay forever, and why a CNI-masqueraded pod looks unreachable despite
+	// having a hostPort that works.
+	//
+	// Cost when there is no such path: one extra candidate that fails its
+	// handshake and backs off, exactly like a wrong predicted port — except
+	// this one is a real configured endpoint rather than a guess, so it is
+	// tried BEFORE the predictions.
+	if m.ip != "" && myUDPPort > 0 && m.port != myUDPPort {
+		addAlways(fmt.Sprintf("%s:%d", m.ip, myUDPPort))
+	}
+
+	// 7. LAST: predicted ports for a symmetric NAT. These are guesses — most
+	// are wrong by construction — so they go behind everything that is known
+	// to be real. The spread is deliberately small: a wide spray buys very
+	// little extra hit rate and costs every peer a burst of doomed handshakes.
+	if m.ip != "" && portPredictionOn.Load() && m.symmetric && m.stride != 0 {
+		for k := 1; k <= predictedPortSpread; k++ {
+			p := m.port + k*m.stride
+			if p > 0 && p < 65536 {
+				addAlways(fmt.Sprintf("%s:%d", m.ip, p))
+			}
+		}
 	}
 	return strings.Join(cands, ",")
 }
@@ -928,6 +1382,32 @@ func punchCandidates(candidateList string, kp keypair, psk []byte) {
 	}
 }
 
+
+// NOTE ON A FILTER THAT USED TO BE HERE
+//
+// This function once dropped any private candidate that was not on one of our
+// directly-attached subnets, to stop peers wasting handshakes on addresses like
+// a Kubernetes pod IP (10.42.x.y) that exist only inside someone else's cluster.
+// The reasoning was wrong, and the bug it caused is worth remembering.
+//
+// "Private and not on my subnet" does NOT mean unreachable. A pod reaches the
+// node's LAN through its node's gateway; a host on a VPN reaches the far side;
+// an office machine reaches a second subnet through a router. The case that
+// broke: an APGO pod scheduled onto a node on the SAME LAN as a laptop. The
+// working path was pod -> laptop, egressing via the node and SNAT'd to the
+// node's LAN address — a genuine direct connection. The laptop's candidate
+// (10.202.3.60) is private and is not on the pod's 10.42.1.0/24, so the filter
+// discarded it and the pair fell back to relay. The one path that worked was
+// the one thrown away.
+//
+// The asymmetry matters: trying an unreachable candidate costs one packet and a
+// back-off entry, and says so in the log. Discarding a reachable one costs the
+// direct path entirely and is completely silent. Candidate lists are already
+// bounded per tier, and duplicate connect frames are deduplicated in
+// shouldHandleConnect, so the noise this was meant to solve is solved where it
+// actually originated. Do not reintroduce a reachability heuristic here.
+
+
 // isPunchableAddr validates a punch candidate: well-formed host:port, not
 // loopback/unspecified/multicast — private LAN addresses allowed.
 func isPunchableAddr(addr string) bool {
@@ -940,8 +1420,57 @@ func isPunchableAddr(addr string) bool {
 		ip.IsLinkLocalUnicast() {
 		return false
 	}
+	// THE OVERLAY IS NEVER A TRANSPORT. An address inside the overlay subnet
+	// is something the tunnel CARRIES; it is not a place the tunnel can be
+	// reached. This single rule is what keeps a node's advertised endpoint
+	// honest, and it is enforced at every entry point (here, isValidPeer,
+	// addKnownPeer, connectToPeer, and the PEX gossip).
+	//
+	// The failure it prevents, seen in this project: a Kubernetes pod whose
+	// k3s node-IP is itself an overlay address advertised "reach me at
+	// 10.22.22.7:6970" — another node's address. Desktops COULD dial it (a
+	// desktop's own sockets do traverse its TUN), so a session formed and
+	// looked "direct". But that path is a lie in three ways: every dashboard
+	// showed the pod living at an IP it does not own, the route silently
+	// depended on a third node's client staying up, and phones could not use
+	// it at all (a tunnel process's sockets bypass its own tunnel), so they
+	// were relayed forever with no explanation.
+	//
+	// Allowing it was tried and reverted. A node must be reachable at an
+	// address it OWNS: its public endpoint (STUN + advertise_port) or its
+	// LAN address. If neither works, relay is the honest answer.
+	if isOverlayTransportAddr(ip) {
+		return false
+	}
 	p, err := strconv.Atoi(portStr)
-	return err == nil && p > 0 && p < 65535
+	return err == nil && p > 0 && p <= 65535
+}
+
+// isOverlayTransportAddr reports whether ip falls inside the overlay subnet —
+// i.e. it is an overlay-layer address and therefore invalid as a transport
+// (UDP dial) endpoint.
+func isOverlayTransportAddr(ip net.IP) bool {
+	return overlayNet != nil && ip != nil && overlayNet.Contains(ip)
+}
+
+// firstPublicExtraCandidateHost returns the host of the first operator-supplied
+// candidate that is a genuinely public address — skipping overlay addresses
+// (mesh-nested, desktop-only) and private/LAN ones (not reachable off-site).
+// "" when none is configured. Used to override a misleading STUN result.
+func firstPublicExtraCandidateHost() string {
+	for _, c := range extraCandidates {
+		h, _, err := net.SplitHostPort(strings.TrimSpace(c))
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(h)
+		if ip == nil || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+			isOverlayTransportAddr(ip) {
+			continue
+		}
+		return h
+	}
+	return ""
 }
 
 type TrackerResponse struct {
@@ -1532,7 +2061,7 @@ func (t *SessionTable) RoamData(raddr *net.UDPAddr, body []byte) bool {
 // keepalive, so peers always have a fresh overlay-IP -> endpoint mapping
 // (which is also what the relay path routes with).
 func buildAddrAnnounce() []byte {
-	return append(append(append([]byte{}, ctlMagic...), 'A'), []byte(myOverlayIP)...)
+	return append(append(append([]byte{}, ctlMagic...), 'A'), []byte(myOverlayIP())...)
 }
 
 // handleControl processes a decrypted control payload from raddr.
@@ -1586,6 +2115,11 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// Admin-signed network policy (e.g. post-quantum on/off), applied live.
 		handlePolicyGossip(body[1:])
 		return
+	case 'S':
+		// Admin-signed network share/unshare (join or leave a secondary
+		// network), gossiped. Applied by the target's main instance.
+		handleNetShareGossip(body[1:])
+		return
 	case 'p':
 		// Peer advertises its live post-quantum state (for the admin per-node view).
 		if s := GlobalSessions.GetByAddr(raddr); s != nil && len(body) >= 2 {
@@ -1611,6 +2145,10 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// Peer exchange: dial any public peers we're told about.
 		handlePeerExchange(body[1:], gKP, gPSK)
 		return
+	case 'T':
+		// Roster gossip: the sender and its direct peers (network directory).
+		handleRoster(body[1:])
+		return
 	case 'E':
 		// Peer advertises it's an internet exit node.
 		handleExitAnnounce(raddr)
@@ -1629,21 +2167,40 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		if net.ParseIP(ip) == nil {
 			return
 		}
-		if ip == myOverlayIP {
+		if ip == myOverlayIP() {
 			handleAddrConflict(raddr, ip)
 			return
 		}
-		ipLearning.Learn(ip, raddr)
+		// Only LEARN a route to an ADMITTED peer. approvals.go promises an
+		// unapproved node's overlay IP is not learned, and an ipLearning entry
+		// is exactly what makes this node (and anything relaying through it)
+		// willing to send to that peer. The identity binding below still runs
+		// either way, so a pending device shows up correctly in the dashboard
+		// with its announced address — it just isn't routable yet.
 		if s := GlobalSessions.GetByAddr(raddr); s != nil {
+			if admissionOK(s.peerStatic, "announce") {
+				ipLearning.Learn(ip, raddr)
+			}
 			setPeerOverlayIP(s.peerStatic, ip)
 		}
 		// A peer just announced itself (right after a handshake) — hand it our
-		// peer list so a node with fewer connections catches up immediately, and
-		// push the full admin/network state so it converges without waiting for
-		// the slow gossip tick.
+		// peer list AND the node roster so a node with fewer connections
+		// catches up immediately, and push the full admin/network state so it
+		// converges without waiting for the slow gossip tick.
 		sendPeerExchangeTo(raddr)
+		sendRosterTo(raddr)
 		syncAdminStateTo(raddr)
 	case 'R':
+		// ADMISSION CONTROL for the relay path. Control frames bypass the
+		// ingress admission gate by design (an unapproved peer needs them to
+		// learn the admin key), and 'R' is a control frame carrying DATA — so
+		// without this check an unapproved node reaches the entire mesh simply
+		// by wrapping every packet in a relay frame. That is the bypass that
+		// let pending devices talk to other nodes through this one.
+		if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "relay-in") {
+			return
+		}
+
 		// Relay request: forward the inner IPv4 packet ONE hop, and only
 		// over a direct established session (never relay-of-relay, so a
 		// routing loop is impossible).
@@ -1657,14 +2214,17 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		if isOverlayIPRevoked(dst) || isOverlayIPRevoked(extractIPv4Src(pkt)) {
 			return
 		}
-		if dst == myOverlayIP {
+		if dst == myOverlayIP() {
 			// We were the destination all along (sender had no direct
 			// mapping yet). Deliver locally.
 			tunIF.Write(pkt)
 			return
 		}
 		if a := ipLearning.Lookup(dst); a != nil {
-			if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() {
+			// admitted() on the OUTBOUND session too: we relay only between
+			// nodes that are both admitted, so this node can never be used as
+			// a bridge into or out of a pending device.
+			if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-out") {
 				// Forward as a NORMAL data frame. The destination sees the
 				// original src IP arriving from our endpoint and learns
 				// "reach that src via this relay" — return traffic then
@@ -1682,7 +2242,7 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		}
 		dstIP, srcIP, srcCands := parts[0], parts[1], parts[2]
 
-		if dstIP != myOverlayIP {
+		if dstIP != myOverlayIP() {
 			// We're the relay: forward the intact frame one hop toward
 			// dstIP, unicast-only (never re-broadcast — loop prevention).
 			full := append(append([]byte{}, ctlMagic...), body...)
@@ -1690,9 +2250,22 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			return
 		}
 
-		// This signaling is for us. Punch at every candidate endpoint the
-		// peer advertised (a spread of predicted ports if it's behind a
-		// symmetric NAT).
+		// This signaling is for us. Reaching us at all proves srcIP is alive
+		// AND that a relay path to it exists right now — which is the only
+		// evidence we get for a node that holds no direct sessions of its own,
+		// since nothing gossips such a node into our roster and ip_learning
+		// forgets it between bursts of traffic. Record it so the peer list can
+		// show it as relayed rather than omitting it entirely. See heard.go.
+		noteHeardFrom(srcIP, relayViaLabel(raddr))
+
+		// Drop duplicate copies of the same signalling event (see
+		// shouldHandleConnect). The relay fan-out delivers one per relay.
+		if !shouldHandleConnect(body[0], srcIP, srcCands) {
+			return
+		}
+
+		// Punch at every candidate endpoint the peer advertised (a spread of
+		// predicted ports if it's behind a symmetric NAT).
 		if body[0] == 'C' {
 			log.Printf("[connect] punch-request from %s (candidates: %s); punching + acking", srcIP, srcCands)
 		} else {
@@ -1704,7 +2277,7 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// punches back at the same time (relayed the reverse way).
 		if body[0] == 'C' {
 			if myCands := myConnectCandidates(); myCands != "" {
-				ack := buildConnectFrame('K', srcIP, myOverlayIP, myCands)
+				ack := buildConnectFrame('K', srcIP, myOverlayIP(), myCands)
 				sendControlToward(srcIP, ack)
 			}
 		}
@@ -1809,6 +2382,16 @@ var (
 const knownPeerExpiry = 30 * time.Minute
 
 func addKnownPeer(p string) {
+	// Never MEMORISE an overlay-subnet endpoint. This is the step that made a
+	// bad endpoint outlive its cause: once dialled, it lived in knownPeers and
+	// holePunchRetryLoop re-established it every 10 seconds, so fixing the
+	// config that first advertised it changed nothing until every client was
+	// restarted. Refusing it here means a corrected mesh converges by itself.
+	if h, _, err := net.SplitHostPort(strings.TrimSpace(p)); err == nil {
+		if isOverlayTransportAddr(net.ParseIP(h)) {
+			return
+		}
+	}
 	knownPeersMu.Lock()
 	knownPeers[p] = time.Now()
 	knownPeersMu.Unlock()
@@ -1864,8 +2447,15 @@ func isValidPeer(addr string) bool {
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return false
 	}
+	// Tracker/rendezvous peer lists are PUBLIC endpoint directories: an
+	// overlay address arriving from one is always junk (a node that
+	// mis-advertised, or a stale record), never a route this node could use.
+	// Punch candidates are different — see isPunchableAddr, which allows them.
+	if isOverlayTransportAddr(ip) {
+		return false
+	}
 	p, err := strconv.Atoi(portStr)
-	if err != nil || p <= 0 || p >= 65535 {
+	if err != nil || p <= 0 || p > 65535 {
 		return false
 	}
 	return true
@@ -1885,6 +2475,82 @@ func isSelf(addr string, stunEndpoint string, listenPort int) bool {
 	return addr == net.JoinHostPort(host, strconv.Itoa(listenPort))
 }
 
+var (
+	sameSiteMu        sync.Mutex
+	sameSiteFirstSeen = map[string]time.Time{}
+	sameSiteLastTry   = map[string]time.Time{}
+	sameSiteTries     = map[string]int{}
+)
+
+const (
+	// Give LAN discovery + relay this long before resorting to a hairpin dial
+	// of a same-site peer's public endpoint.
+	//
+	// 25s (was 60s): when LAN discovery is dead — AP isolation, or an iPhone
+	// whose Local Network permission got reset by a reinstall — this grace is
+	// the FLOOR on how long two same-Wi-Fi devices stay relay-only. A minute
+	// of "why won't my own devices connect" is a long minute; one hairpin
+	// attempt 25s in is cheap, and the exponential ladder below still quiets
+	// routers whose NAT loopback misbehaves.
+	sameSiteHairpinGrace = 25 * time.Second
+	// Retry ladder bounds. A router without clean NAT loopback would re-form
+	// and desync the session on a tight loop — the exact churn hairpin dialing
+	// was disabled to avoid — so attempts back off exponentially from the
+	// minimum to the maximum. The old flat 10-minute window meant a peer whose
+	// FIRST attempt was lost stayed invisible for 10+ minutes even though it
+	// was reachable the whole time.
+	sameSiteHairpinRetryMin = 30 * time.Second
+	sameSiteHairpinRetryMax = 10 * time.Minute
+)
+
+// allowSameSiteHairpin reports whether to attempt a LAST-RESORT hairpin dial of
+// a same-site peer's public endpoint (its IP equals our own public IP). Same-
+// site peers are normally reached over the LAN (+ relay), so we skip the
+// hairpin during a grace window to let that happen. But when the LAN path never
+// forms — client isolation, or the peer sits on a different subnet/VLAN this
+// device can't sweep — the hairpin is the ONLY route to a DIRECT session;
+// without it the peer stays relay-only and never appears in the peer list. We
+// then allow one attempt per retry window so a misbehaving router can't churn.
+func allowSameSiteHairpin(key string) bool {
+	now := time.Now()
+	sameSiteMu.Lock()
+	defer sameSiteMu.Unlock()
+	// Bound the ladder state: same-site candidates churn with tracker noise,
+	// and these three maps were never pruned (a slow leak on long-lived nodes).
+	if len(sameSiteFirstSeen) > 1024 {
+		cutoff := now.Add(-2 * time.Hour)
+		for k, f := range sameSiteFirstSeen {
+			if lt, ok := sameSiteLastTry[k]; f.Before(cutoff) && (!ok || lt.Before(cutoff)) {
+				delete(sameSiteFirstSeen, k)
+				delete(sameSiteLastTry, k)
+				delete(sameSiteTries, k)
+			}
+		}
+	}
+	first, ok := sameSiteFirstSeen[key]
+	if !ok {
+		sameSiteFirstSeen[key] = now
+		return false
+	}
+	if now.Sub(first) < sameSiteHairpinGrace {
+		return false
+	}
+	// Exponential ladder: 1m, 2m, 4m, 8m, then every 10m. Fast enough to
+	// surface a same-site peer within a couple of minutes when a single
+	// attempt is lost, while still quieting a router whose NAT loopback
+	// misbehaves (each failed attempt widens the window).
+	wait := sameSiteHairpinRetryMin << sameSiteTries[key]
+	if wait <= 0 || wait > sameSiteHairpinRetryMax {
+		wait = sameSiteHairpinRetryMax
+	}
+	if last, ok := sameSiteLastTry[key]; ok && now.Sub(last) < wait {
+		return false
+	}
+	sameSiteTries[key]++
+	sameSiteLastTry[key] = now
+	return true
+}
+
 // connectToPeer is the worker spawned per tracker-discovered candidate.
 func connectToPeer(annPeer string, kp keypair, psk []byte) {
 	addr, _ := net.ResolveUDPAddr("udp", annPeer)
@@ -1896,6 +2562,13 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 	// leave a trail of stale v6 endpoints in trackers/PEX that used to spam
 	// the log with pointless punches every cycle. Skip silently.
 	if v4 := addr.IP.To4(); v4 == nil && !hasGlobalIPv6() {
+		return
+	}
+	// The overlay is never a transport (see isPunchableAddr). A desktop CAN
+	// physically dial such an address — it routes into our own TUN — which is
+	// exactly why it must be refused explicitly here: the resulting session
+	// would advertise another node's address as this peer's endpoint.
+	if isOverlayTransportAddr(addr.IP) {
 		return
 	}
 	// Same-site candidate: this endpoint is on OUR OWN public IP — a LAN-mate
@@ -1913,7 +2586,15 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 	mu.Unlock()
 	if pubSelf != "" {
 		if host, _, err := net.SplitHostPort(pubSelf); err == nil && addr.IP.String() == host {
-			return
+			// Same-site peer. Prefer LAN discovery + relay; only once that has
+			// clearly failed to produce a path (grace elapsed, no session yet)
+			// do we fall back to a hairpin dial so the peer can still form a
+			// DIRECT session and show up, instead of staying relay-only and
+			// invisible in the peer list.
+			if !allowSameSiteHairpin(addr.String()) {
+				return
+			}
+			log.Printf("[same-site] no LAN path to %s after grace — trying a last-resort hairpin dial", annPeer)
 		}
 	}
 	if GlobalSessions.ShouldSkip(addr) {
@@ -1928,7 +2609,7 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 		GlobalSessions.RecordSuccess(addr)
 		// Announce our overlay IP immediately so the peer can route to us
 		// (and act as our relay) without waiting for the first keepalive.
-		if s != nil && s.Established() && myOverlayIP != "" {
+		if s != nil && s.Established() && myOverlayIP() != "" {
 			_ = sendPacket(GlobalConn, addr, s, buildAddrAnnounce())
 		}
 		// Kick off the post-quantum handshake right away so the PQ layer is up
@@ -1963,10 +2644,35 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 func announceAndConnect(trackers []string, infoHash []byte, peerID string,
 	port int, pubEndpoint string, kp keypair, psk []byte, passive bool) int {
 
+	// A CONFIGURED public candidate wins over the STUN-observed IP.
+	//
+	// STUN reports where our packets APPEAR TO COME FROM, which is not always
+	// where we can be REACHED. The case that breaks badly: a Kubernetes pod
+	// published on a hostPort, in a cluster whose egress leaves through a
+	// different node than the one the pod runs on. STUN then reports the
+	// egress node's address, the pod announces it, and every peer dials a
+	// machine that has no DNAT rule for this pod — so they all fall back to
+	// relay while the endpoint looks perfectly plausible in the dashboard.
+	//
+	// An operator-supplied candidate (EXTRA_CANDIDATES) is a deliberate
+	// statement of "this is where I am reachable", so it outranks inference.
+	if h := firstPublicExtraCandidateHost(); h != "" && h != publicIPOnly() {
+		if pubEndpoint != "" {
+			log.Printf("[announce] using configured public address %s instead of the STUN-observed %s "+
+				"(STUN sees our egress, which is not where our inbound port lives)", h, publicIPOnly())
+		}
+		pubEndpoint = net.JoinHostPort(h, strconv.Itoa(port))
+	}
+
 	announcePort := port
-	// Prefer the reflexive port from STUN — that's the port other peers
-	// can actually reach us at through our NAT.
-	if pubEndpoint != "" {
+	// A CONFIGURED inbound port wins outright: it was set up on purpose and is
+	// stable, whereas the reflexive port is only whatever the NAT happened to
+	// pick for the STUN probe. Behind a masquerading CNI those differ on every
+	// destination, so announcing the observed one publishes an endpoint that
+	// can never be reached.
+	if advertisePort > 0 {
+		announcePort = advertisePort
+	} else if pubEndpoint != "" {
 		if _, portStr, err := net.SplitHostPort(pubEndpoint); err == nil {
 			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
 				announcePort = p
@@ -2090,7 +2796,7 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 				continue
 			}
 			peerPort, err := strconv.Atoi(parts[2])
-			if err != nil || peerPort <= 0 || peerPort >= 65535 {
+			if err != nil || peerPort <= 0 || peerPort > 65535 {
 				continue
 			}
 			// Use the sender's LAN IP with the port they advertised.
@@ -2215,7 +2921,21 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 		sweepNo := 0
 		for {
 			sweepNo++
+			targets := sweepTargets()
 			sweep()
+			// Periodic, self-explaining status. LAN discovery used to fail
+			// completely silently: if no beacon was ever heard and no sweep
+			// reply came back, the log said nothing at all and the only symptom
+			// was two devices on one Wi-Fi staying relayed forever. There is no
+			// way to tell "the AP is filtering us", "we are alone on this
+			// subnet" and "discovery never started" apart without this line.
+			if sweepNo%6 == 0 || sweepNo == 1 {
+				log.Printf("[local-discovery] status: %d sweep target(s) on our subnet(s), established LAN peer=%v (port %d)",
+					len(targets), hasEstablishedLANPeer(), discPort)
+				if len(targets) == 0 {
+					log.Printf("[local-discovery] no sweep targets — no usable IPv4 subnet found; LAN peers can only be reached via relay")
+				}
+			}
 			wait := 30 * time.Second
 			if sweepNo < 12 {
 				wait = 5 * time.Second
@@ -2226,7 +2946,36 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 }
 
 // localIPv4Nets returns the IPv4 subnet of every up, non-virtual interface.
+//
+// CACHED, because this is no longer a cold-path helper. isAttachedLANAddr —
+// and through it isPrivateUDPAddr — calls it to decide whether an endpoint is
+// on a directly-attached network, and those run inside the ip_learning write
+// lock on the packet path and inside the peer-list sort comparator. The
+// uncached form issues a routing-table syscall (sysctl NET_RT_IFLIST on
+// macOS/BSD, a netlink dump on Linux) and allocates on every call; doing that
+// per packet and per comparison stalled the data path and made the peer list
+// API crawl. Interface addresses change on the order of seconds at worst (a
+// Wi-Fi roam or a DHCP renew), so a short TTL costs nothing in accuracy.
+const localNetsCacheTTL = 2 * time.Second
+
+var (
+	localNetsMu  sync.Mutex
+	localNetsVal []*net.IPNet
+	localNetsAt  time.Time
+)
+
 func localIPv4Nets() []*net.IPNet {
+	localNetsMu.Lock()
+	defer localNetsMu.Unlock()
+	if time.Since(localNetsAt) < localNetsCacheTTL && localNetsVal != nil {
+		return localNetsVal
+	}
+	localNetsVal = scanLocalIPv4Nets()
+	localNetsAt = time.Now()
+	return localNetsVal
+}
+
+func scanLocalIPv4Nets() []*net.IPNet {
 	var out []*net.IPNet
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -2422,6 +3171,11 @@ func subnetBroadcastAddrs() []net.IP {
 }
 
 func main() {
+	// Secondary-network child instances tag every log line so the shared log
+	// stays readable when several networks write to it (see multinet.go).
+	if id := os.Getenv("APGO_NET_CHILD"); id != "" {
+		log.SetPrefix("[net:" + id + "] ")
+	}
 	// Optional file logging: when LOG_FILE is set (the admin dashboard tails
 	// this shared file), mirror all log output to it in addition to stderr so
 	// `docker logs` still works.
@@ -2455,7 +3209,24 @@ func main() {
 	// panel can render a "join QR" for phones. Never leaves the localhost socket.
 	gNetworkName = cfg.NetworkName
 	gPSKString = cfg.PSK
+	// Admin-panel overrides (persisted node settings) win over file/env, the
+	// same way the IPv6 toggle and exit pin do — otherwise a container admin
+	// could set a rendezvous server in the panel and watch it be ignored.
+	if ns := loadNodeSettings(); ns.RendezvousServers != nil {
+		cfg.RendezvousServers = *ns.RendezvousServers
+	}
+	if ns := loadNodeSettings(); ns.RendezvousAuth != nil {
+		cfg.RendezvousAuth = *ns.RendezvousAuth
+	}
 	gRendezvous = cfg.RendezvousServers
+	gRendezvousCred = strings.TrimSpace(cfg.RendezvousAuth)
+	if gRendezvousCred != "" {
+		style := "bearer token"
+		if strings.Contains(gRendezvousCred, ":") {
+			style = "username/password"
+		}
+		log.Printf("[config] rendezvous credential configured (%s)", style)
+	}
 	// Tracker management (admin UI add/remove): the managed file, when present, is
 	// authoritative over the config list.
 	gConfigTrackers = cfg.Trackers
@@ -2572,7 +3343,7 @@ func main() {
 	} else {
 		// Static assignment. Allow a bare IP by inheriting the mask from
 		// overlay_cidr (default /24) so operators can write just
-		// OVERLAY_ADDRESS=10.28.55.2.
+		// OVERLAY_ADDRESS=10.22.55.2.
 		if !strings.Contains(cfg.Tun.AddressCIDR, "/") {
 			ones := 24
 			if cfg.OverlayCIDR != "" {
@@ -2585,6 +3356,23 @@ func main() {
 		log.Printf("[overlay] TUN address %s (static)", cfg.Tun.AddressCIDR)
 	}
 
+	// SINGLE-INSTANCE GUARD, before anything with side effects.
+	//
+	// startControlServer already refuses to start when the control socket
+	// answers — but it runs AFTER the TUN is created, the node key is
+	// generated and the UDP port is bound. So a second instance would create
+	// and configure a utun, mint a fresh X25519 identity, then discover the
+	// conflict and exit, leaving the interface behind and the key file
+	// possibly overwritten. Every retry leaked another utun.
+	//
+	// Two supervisors legitimately try to start this client: the boot
+	// LaunchDaemon (KeepAlive) and the menu-bar app's Connect. Whichever is
+	// second must be a clean no-op, not a partial start.
+	if sock := os.Getenv("CONTROL_SOCKET"); anotherClientIsLive(sock) {
+		log.Printf("[startup] another overlay client is already running (control socket %s is live) — exiting quietly.", sock)
+		return
+	}
+
 	if err := createAndConfigureTUN(cfg); err != nil {
 		log.Fatalf("create TUN: %v", err)
 	}
@@ -2595,7 +3383,7 @@ func main() {
 	// filter inbound packets so only traffic addressed to us reaches the
 	// TUN, and (c) detect address conflicts.
 	if ip, _, err := net.ParseCIDR(cfg.Tun.AddressCIDR); err == nil && ip.To4() != nil {
-		myOverlayIP = ip.To4().String()
+		setMyOverlayIP(ip.To4().String())
 	}
 
 	udpConn, port, err := udpListener(cfg.UDPListenPort)
@@ -2615,6 +3403,13 @@ func main() {
 	if sock := os.Getenv("CONTROL_SOCKET"); sock != "" {
 		go startControlServer(sock)
 	}
+
+	// Secondary networks (guest networks): load any admin-signed share records,
+	// re-apply the ones that target this device, then start one supervised
+	// child instance per enabled secondary network. No-ops in child instances.
+	netShares.load()
+	applyStoredNetSharesAtStartup()
+	startNetSupervisor(cfg)
 
 	// Exit-node / full-VPN outproxy setup (NAT if we're an exit; selection loop
 	// if we route our traffic through one). A panel-set exit pin persisted in
@@ -2636,6 +3431,22 @@ func main() {
 		if err := enableFullTunnelRoutes(); err != nil {
 			log.Printf("[exit] could not install full-tunnel routes: %v", err)
 		}
+	}
+
+	// Overlay/LAN subnet collision: a mesh whose overlay CIDR equals the
+	// physical LAN's subnet half-works in confusing ways (wrong-looking peer
+	// IPs, exits that NAT fine but can't route replies back into the tunnel).
+	// Nothing in the data path can fix a config like that — detect it and
+	// surface it in the log and every dashboard.
+	// Two overlay clients in ONE network namespace (hostNetwork alongside an
+	// existing client) would otherwise install two identical connected routes
+	// for the overlay subnet, and the kernel would choose between them
+	// arbitrarily. Detect that and switch to /32 + source-based policy
+	// routing so both coexist. No-op when this is the only client here.
+	setupOverlayCoexistence(cfg.Tun.AddressCIDR)
+
+	if overlayLANConflict = detectOverlayLANConflict(); overlayLANConflict != "" {
+		log.Printf("[config] WARNING: %s — pick an overlay subnet your networks don't use (e.g. 10.66.0.0/24), or overlay and LAN traffic will be indistinguishable and exit-node return routing will break", overlayLANConflict)
 	}
 
 	// When an admin assigns this node a new overlay IP, apply it live and
@@ -2716,6 +3527,14 @@ func main() {
 					s = GlobalSessions.GetByAddr(raddr)
 				}
 				if s == nil || !s.Established() {
+					// A data packet we can't place: a peer is talking to a session
+					// we no longer have (classic post-restart state). Nudge a
+					// re-announce/re-punch so we rejoin promptly instead of sitting
+					// deaf until someone else initiates. Rate-limited inside; safe
+					// (it never answers the sender).
+					if typ == PktData {
+						GlobalSessions.NudgeRediscovery()
+					}
 					continue
 				}
 			}
@@ -2755,13 +3574,38 @@ func main() {
 				handleControl(pt[len(ctlMagic):], raddr)
 				continue
 			}
+
+			// ADMISSION CONTROL — enforced here, on the DATA path.
+			//
+			// Control frames above are deliberately EXEMPT from this: an
+			// unapproved peer must still be able to exchange them, because
+			// that is how it learns the admin key and its own approval record
+			// (see approvals.go). Everything past this point is overlay data,
+			// so a peer that is not admitted gets nothing — no TUN delivery,
+			// no relay transit, and crucially no ipLearning entry, since
+			// learning its overlay IP is what makes the rest of this node
+			// willing to route to it.
+			//
+			// Before this existed, admitted() was consulted in exactly ONE
+			// place — control.go's SessionInfo.Approved, i.e. the dashboard
+			// badge — so admission control was purely cosmetic: a pending
+			// device had full overlay access and could reach every other node
+			// through this one's relay paths.
+			//
+			// Safe by construction on networks that never opted in: admitted()
+			// returns true whenever admissionRequired() is false (no admin key
+			// set), so this cannot lock anyone out of such a deployment.
+			if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "ingress") {
+				continue
+			}
+
 			// Keepalive carrying the sender's overlay IP: [0x00][4-byte IPv4].
 			// Learn the mapping so overlay-IP routing stays current even when
 			// no data traffic flows (bare 1-byte noops from old versions fall
 			// through to the non-IPv4 drop below).
 			if len(pt) == 5 && pt[0] == 0x00 {
 				srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
-				if srcIP == myOverlayIP {
+				if srcIP == myOverlayIP() {
 					handleAddrConflict(raddr, srcIP)
 					continue
 				}
@@ -2785,8 +3629,8 @@ func main() {
 			// enabled re-injects it into the overlay — packets then loop
 			// between nodes until TTL expiry (duplicate pings with stepped-
 			// down TTLs, ICMP redirects).
-			if myOverlayIP != "" {
-				if dst := extractIPv4Dst(pt); dst != "" && dst != myOverlayIP {
+			if myOverlayIP() != "" {
+				if dst := extractIPv4Dst(pt); dst != "" && dst != myOverlayIP() {
 					// As an exit node, forward internet-bound packets to the TUN so
 					// the kernel routes + NATs them out (return traffic comes back
 					// via the overlay). Otherwise it's not for us — drop it.
@@ -2806,7 +3650,10 @@ func main() {
 					if !isInternetDst(dst) &&
 						!isOverlayIPRevoked(dst) && !isOverlayIPRevoked(extractIPv4Src(pt)) {
 						if a := ipLearning.Lookup(dst); a != nil && a.String() != raddr.String() {
-							if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() {
+							// …and admitted, matching the 'R' handler: an
+							// unapproved destination is never reachable
+							// through us, on the return path either.
+							if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-return") {
 								_ = sendPacket(GlobalConn, a, s, pt)
 							}
 						}
@@ -2821,11 +3668,26 @@ func main() {
 	// Encrypt path (TUN -> UDP)
 	go func() {
 		pkt := make([]byte, 65535)
+		var tunErrs int
 		for {
 			n, err := tunIF.Read(pkt)
 			if err != nil {
-				return
+				// A silently-exited TUN reader leaves a half-dead node: the
+				// process looks healthy (announces, keepalives) but forwards
+				// nothing. Retry transient errors; if the device is truly
+				// gone, exit so the supervisor (Kubernetes/compose) restarts
+				// us with a fresh interface instead of blackholing traffic.
+				tunErrs++
+				if tunErrs <= 3 || tunErrs%50 == 0 {
+					log.Printf("[tun] read error (%d consecutive; recovering): %v", tunErrs, err)
+				}
+				if tunErrs >= 100 {
+					log.Fatalf("[tun] persistent TUN read failure (%v) — exiting for a clean supervisor restart", err)
+				}
+				time.Sleep(20 * time.Millisecond)
+				continue
 			}
+			tunErrs = 0
 			ip := pkt[:n]
 
 			// The overlay carries IPv4 only — drop IPv6 immediately instead of
@@ -2854,30 +3716,49 @@ func main() {
 
 			// Fast path: we know which endpoint owns dst and have a live
 			// session — unicast directly.
+			//
+			// "Live" must mean PROVEN live (RouteIsLive), not just
+			// Established(). An established session whose return path has
+			// died — an expired or per-destination NAT mapping, which is the
+			// normal failure mode behind a symmetric NAT such as the CNI
+			// bridge — keeps this branch taking `continue` for up to
+			// sessionStaleTimeout, blackholing every packet while the relay
+			// path that would have delivered them is never attempted. When
+			// the route is unproven we send direct AND fall through to the
+			// relay/discovery flood: whichever copy lands first wins, and the
+			// duplicate costs one packet.
 			if dst != "" {
 				if a := ipLearning.Lookup(dst); a != nil {
-					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() {
+					// Admission is belt-and-braces here — an unadmitted peer
+					// should never have got an ipLearning entry in the first
+					// place — but the table can also be seeded from provisions
+					// (control.go), so gate the send itself rather than trust
+					// every writer of the table.
+					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "egress") {
 						// PQ wrapping (if enabled + ready) happens inside sendPacket.
 						_ = sendPacket(udpConn, a, s, ip)
-						continue
+						if GlobalSessions.RouteIsLive(a) {
+							continue
+						}
+						logUnprovenRoute(dst, a)
+					} else {
+						// Stale mapping (peer's NAT endpoint changed and the
+						// old session died). Forget it and fall through to
+						// discovery below.
+						ipLearning.ForgetAddr(a)
 					}
-					// Stale mapping (peer's NAT endpoint changed and the
-					// old session died). Forget it and fall through to
-					// discovery below.
-					ipLearning.ForgetAddr(a)
 				}
 			}
 
-			// Unknown or unreachable destination. Two-pronged discovery:
-			//  1. RAW to every direct peer — if one of them IS the
-			//     destination, it accepts (others filter on dst != self).
-			//  2. RELAY-wrapped to every direct peer — if one of them has
-			//     a direct session to the destination (which we can't
-			//     reach, e.g. CGNAT-to-CGNAT), it forwards ONE hop.
-			// Whichever copy arrives first teaches the destination our
-			// return path, and its reply teaches us the forward path — so
-			// the mesh converges on the fastest working route (direct if
-			// possible, else via the most responsive relay) automatically.
+			// Unknown or unreachable destination: RELAY-wrapped copy to every
+			// direct peer. The 'R' handler covers BOTH discovery roles in one
+			// frame — a peer that IS the destination delivers it locally, and
+			// a peer with a direct session to the destination forwards it ONE
+			// hop. (A raw copy used to be flooded alongside, doubling the
+			// bandwidth of every discovery flood for zero additional
+			// coverage.) Whichever copy arrives first teaches the destination
+			// our return path, and its reply teaches us the forward path — so
+			// the mesh converges on the fastest working route automatically.
 			relayFrame := append(append(append([]byte{}, ctlMagic...), 'R'), ip...)
 
 			// Coordinated-connect: while relaying keeps traffic flowing,
@@ -2887,15 +3768,25 @@ func main() {
 			// forms — after which the fast path above takes over and the
 			// relay falls silent.
 			var connectReq []byte
-			if dst != "" && dst != myOverlayIP {
-				if myCands := myConnectCandidates(); myCands != "" && shouldTryConnect(dst) {
-					connectReq = buildConnectFrame('C', dst, myOverlayIP, myCands)
+			if dst != "" && dst != myOverlayIP() {
+				// Cheap gate first: shouldTryConnect is a map+clock check that
+				// rejects almost always (one attempt per destination per 15s),
+				// while myConnectCandidates enumerates every interface and
+				// builds a string. Evaluating it first collapsed a
+				// per-packet interface walk during discovery floods into one
+				// per 15s.
+				if shouldTryConnect(dst) {
+					if myCands := myConnectCandidates(); myCands != "" {
+						connectReq = buildConnectFrame('C', dst, myOverlayIP(), myCands)
+					}
 				}
 			}
 
 			for _, addr := range GlobalSessions.EstablishedAddrs() {
-				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
-					_ = sendPacket(udpConn, addr, s, ip)
+				// This is a BROADCAST of real payload to every direct peer, so
+				// it is the easiest place to leak data to a pending device.
+				// Admitted peers only.
+				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && admissionOK(s.peerStatic, "egress-flood") {
 					_ = sendPacket(udpConn, addr, s, relayFrame)
 					if connectReq != nil {
 						_ = sendPacket(udpConn, addr, s, connectReq)
@@ -2926,14 +3817,70 @@ func main() {
 		}
 	}
 
-	// Symmetric-NAT port prediction (opt-in). When enabled, probe the NAT's
-	// port-allocation pattern in the background so connect signaling can
-	// advertise predicted ports.
-	portPredictionOn = cfg.PortPrediction
-	if portPredictionOn {
-		log.Printf("[config] port_prediction=on")
-		startNATProbing(udpConn, cfg.STUNServers)
+	// NAT classification ALWAYS runs. It is what tells a symmetric NAT apart
+	// from a port-stable one, and a symmetric NAT is the single most common
+	// reason a node that used to hold direct sessions suddenly shows every
+	// peer as RELAYED after moving to a different router. Gating the probe on
+	// the port_prediction flag (the old behaviour) meant that exact failure
+	// produced no log line at all. The flag now only FORCES prediction on;
+	// probing turns it on by itself when it sees a symmetric NAT.
+	// Keep only candidates that can actually be dialled. An unusable entry
+	// here is not harmless: it is advertised AHEAD of everything STUN-derived,
+	// so peers spend their punch attempts on it. The two that show up in the
+	// wild are an unexpanded/blank template (":6970" from an empty
+	// NODE_PUBLIC_IP) and an OVERLAY address (a Kubernetes node whose k3s
+	// node-IP is itself an overlay address) — both are dropped, loudly,
+	// rather than quietly poisoning discovery.
+	extraCandidates = nil
+	for _, c := range cfg.ExtraCandidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if !isPunchableAddr(c) {
+			if h, _, err := net.SplitHostPort(c); err == nil && h == "" {
+				log.Printf("[config] ignoring extra candidate %q — no address in it (unexpanded template?)", c)
+			} else {
+				log.Printf("[config] ignoring malformed extra candidate %q", c)
+			}
+			continue
+		}
+		if h, _, err := net.SplitHostPort(c); err == nil && isOverlayTransportAddr(net.ParseIP(h)) {
+			// An OVERLAY address here is nearly always a misconfiguration —
+			// classically a Kubernetes pod whose node-IP is itself an overlay
+			// address, told to advertise "$(NODE_IP):port". Advertising it
+			// publishes ANOTHER node's address as our own endpoint: every
+			// dashboard then shows this node at an IP it does not own,
+			// desktops reach us only by nesting the transport inside the
+			// overlay (an extra hop, dead if that node's client stops), and
+			// phones cannot use it at all because a tunnel process's sockets
+			// bypass its own tunnel.
+			//
+			// A node must only ever advertise an address it OWNS, so this is
+			// dropped rather than published. Set the candidate to this host's
+			// real public/LAN address, or leave it unset and let STUN +
+			// advertise_port derive the correct endpoint automatically.
+			log.Printf("[config] IGNORING extra candidate %q — that is an address inside the overlay "+
+				"subnet (%s), i.e. another node's overlay IP, not an endpoint this host owns. "+
+				"Leave it unset to advertise <public IP>:<advertise_port> instead.", c, overlayNet)
+			continue
+		}
+		extraCandidates = append(extraCandidates, c)
 	}
+	if len(extraCandidates) > 0 {
+		log.Printf("[config] extra_candidates=%s — advertised to peers ahead of anything STUN-derived",
+			strings.Join(extraCandidates, ","))
+	}
+	advertisePort = cfg.AdvertisePort
+	if advertisePort > 0 {
+		log.Printf("[config] advertise_port=%d — peers will be told to reach us here, not at the STUN-observed port", advertisePort)
+	}
+	portPredictionForced.Store(cfg.PortPrediction)
+	portPredictionOn.Store(cfg.PortPrediction)
+	if cfg.PortPrediction {
+		log.Printf("[config] port_prediction=on (forced)")
+	}
+	startNATProbing(udpConn, cfg.STUNServers)
 
 	mu.Lock()
 	lastAnnounceTime = time.Now().Add(-time.Duration(cfg.MinAnnounceIntervalSeconds) * time.Second)
@@ -2994,6 +3941,26 @@ func main() {
 		}()
 	})
 
+	// Self-rediscovery: when peers keep sending us overlay data we have no
+	// session for (we restarted; they still hold the old session), re-announce
+	// to trackers and re-punch so we climb back onto the mesh in seconds rather
+	// than waiting for the periodic loop or an inbound handshake. Rate-limited
+	// inside NudgeRediscovery; applies to every node, not just bootstraps.
+	GlobalSessions.SetRediscoveryCallback(func() {
+		log.Printf("[rejoin] receiving overlay traffic with no matching session — re-announcing and re-punching")
+		pubNow, _ := fetchPublicEndpoint(udpConn, cfg.STUNServers, 8*time.Second)
+		if pubNow == "" {
+			mu.Lock()
+			pubNow = lastPublicIP
+			mu.Unlock()
+		}
+		announceAndConnect(loadTrackerList(cfg), infoHash, peerID, port, pubNow, kp, psk, true)
+		for _, p := range cfg.StaticPeers {
+			peer := p
+			go connectToPeer(peer, kp, psk)
+		}
+	})
+
 	// NAT keep-alive every gKeepaliveInterval (default 10s, configurable via
 	// keepalive_seconds / KEEPALIVE_SECONDS), encrypted under the session's
 	// send state. Payload is [0x00][our 4-byte overlay IPv4] so the receiver
@@ -3018,18 +3985,36 @@ func main() {
 		for {
 			<-ticker.C
 			tickN++
-			heavy := tickN%slowGossipEvery == 1 // first tick + every ~5 min
+			// First tick + every ~minute. With slowGossipEvery == 1 (keepalive
+			// ≥ 60s), tickN%1 is always 0 — the old `== 1` test meant heavy
+			// gossip NEVER ran and admin state never re-flooded on such nodes.
+			heavy := slowGossipEvery == 1 || tickN%slowGossipEvery == 1
 			// Rebuild the keepalive payload each tick so a live address change
 			// (admin provision) is reflected immediately.
 			keepalive := []byte{0x00}
-			if ip := net.ParseIP(myOverlayIP); ip != nil && ip.To4() != nil {
+			if ip := net.ParseIP(myOverlayIP()); ip != nil && ip.To4() != nil {
 				keepalive = append(keepalive, ip.To4()...)
 			}
 			targets := GlobalSessions.EstablishedAddrs()
 			exitAd := buildExitAnnounce() // nil unless we're an exit node
-
-			var seed, sealed []byte
+			// BATTERY (yes, on the desktop/server too): every packet this node
+			// sends to a PHONE peer powers up that phone's radio. So the
+			// mobile idle drain is bounded by the chattiest node on the mesh,
+			// and trimming it here helps battery on devices this code never
+			// runs on.
+			//
+			// Only the KEEPALIVE needs the keepalive cadence — that is what
+			// holds the NAT mapping open. Peer exchange, roster and PQ status
+			// are DIRECTORY state that nobody needs fresher than ~a minute.
+			// Before: 4 packets per peer per tick. Now: 1, plus the directory
+			// set once a minute.
+			//
+			// Frames identical for every recipient are also built ONCE per
+			// tick (they used to be re-marshalled per peer).
+			var rosterFrame, pqStatus, seed, sealed []byte
 			if heavy {
+				rosterFrame = buildRosterFrame()
+				pqStatus = buildPQStatus()
 				seed = buildAdminSeed()        // nil unless we trust an admin key
 				sealed = buildSealedKeyFrame() // nil unless we hold the sealed blob
 			}
@@ -3049,20 +4034,41 @@ func main() {
 				if exitAd != nil {
 					_ = sendPacket(GlobalConn, addr, s, exitAd)
 				}
-				// PEX is per-recipient: same-site peers also get LAN endpoints.
+				// PEX carries ENDPOINTS — connectivity machinery, not display
+				// state: it is how peers learn the addresses to punch, so it
+				// stays on the fast tick. (Per-recipient: same-site peers also
+				// get LAN endpoints.)
 				if pex := buildPeerExchangeFor(addr); pex != nil {
 					_ = sendPacket(GlobalConn, addr, s, pex)
 				}
-				// Post-quantum: the initiator offers an ML-KEM public key until the
-				// hybrid layer is established for this peer.
+				// Roster + PQ status are DISPLAY state; new peers get the full
+				// set instantly on connect, so a ~minute refresh is plenty.
+				if heavy {
+					if rosterFrame != nil {
+						_ = sendPacket(GlobalConn, addr, s, rosterFrame)
+					}
+					if pqStatus != nil {
+						_ = sendPacket(GlobalConn, addr, s, pqStatus)
+					}
+				}
+				// Post-quantum NEGOTIATION is not directory state — it gates
+				// encryption coming up and stops by itself once ready, so it
+				// keeps the fast cadence.
 				if pqEnabled && pqInitiator(s.peerStatic) && !pqReady(s.peerStatic) {
 					if offer := buildPQOffer(s.peerStatic); offer != nil {
 						_ = sendPacket(GlobalConn, addr, s, offer)
 					}
 				}
-				// Advertise our live PQ state so admin panels can show a per-node box.
-				_ = sendPacket(GlobalConn, addr, s, buildPQStatus())
 			}
+			// Upgrade roster-known nodes without a direct session to direct
+			// (relayed punch signaling; throttled per node inside).
+			// Upgrade roster-known nodes to direct sessions — every tick.
+			// This is what converts relayed peers into direct ones; throttling
+			// it to the slow tick stretched convergence from ~10s to a minute,
+			// which phones feel constantly. shouldTryConnect already caps
+			// attempts at one per node per 15s, so the usual call is a map
+			// lookup with no packets sent.
+			connectRosterNodes()
 			if heavy {
 				// Periodic safety refresh of the signed records (seq-deduped on
 				// receipt); the primary delivery is on-connect + on-change.
@@ -3071,6 +4077,7 @@ func main() {
 				gossipApprovals()
 				gossipNetConfig()
 				gossipPolicy()
+				gossipNetShares()
 			}
 		}
 	}()
@@ -3145,11 +4152,13 @@ func main() {
 		const probe = 15 * time.Second
 		for {
 			before := time.Now().Round(0) // .Round(0) strips monotonic → wall clock
-			select {
-			case <-stop:
-				return
-			case <-time.After(probe):
-			}
+			// NOTE: this loop must NOT select on the `stop` signal channel. A
+			// signal is delivered to the channel ONCE; with two goroutines
+			// receiving from it, this prober could consume the SIGTERM meant
+			// for the main loop — the node would then ignore graceful shutdown
+			// (Kubernetes would hang out the grace period and SIGKILL it).
+			// Plain sleep instead; the goroutine dies with the process.
+			time.Sleep(probe)
 			if gap := time.Now().Round(0).Sub(before); gap > probe+20*time.Second {
 				log.Printf("[wake] resumed after ~%v suspended — forcing reconnect", gap.Round(time.Second))
 				select {
@@ -3209,7 +4218,7 @@ func main() {
 				// every live peer from the NEW source address so they roam our
 				// session onto it instantly (PEX) — no tracker round-trip.
 				ka := []byte{0x00}
-				if ip := net.ParseIP(myOverlayIP); ip != nil && ip.To4() != nil {
+				if ip := net.ParseIP(myOverlayIP()); ip != nil && ip.To4() != nil {
 					ka = append(ka, ip.To4()...)
 				}
 				peers := GlobalSessions.EstablishedAddrs()
@@ -3224,7 +4233,9 @@ func main() {
 			trackers := loadTrackerList(cfg)
 			var subset []string
 			fullAnnounce := changed || staleRegistration || needHeal
-			if fullAnnounce {
+			if fullAnnounce || len(trackers) <= trackersPerTick {
+				// Also takes the empty/tiny-list path: rotating over a list the
+				// admin emptied out used to divide by zero and crash the loop.
 				subset = trackers
 			} else {
 				trackerOffsetMu.Lock()
