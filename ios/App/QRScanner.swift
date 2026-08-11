@@ -10,7 +10,6 @@ struct JoinCode: Decodable {
     var psk: String
     var overlay_cidr: String?
     var rendezvous_servers: [String]?
-    var rendezvous_auth: String? // credential for servers that require one
     var trackers: [String]?      // this network's top trackers (incl. private ones)
     // Crypto profile — must match every node, so the QR carries it too.
     var cipher: String?          // "chacha" or "aesgcm"

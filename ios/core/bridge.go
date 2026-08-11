@@ -34,10 +34,7 @@ type mobileConfig struct {
 	OverlayCIDR  string   `json:"overlay_cidr"`  // e.g. 10.22.55.0/24
 	Trackers          []string `json:"trackers"`
 	RendezvousServers []string `json:"rendezvous_servers"`
-	// RendezvousAuth: credential for servers that require one. "user:pass"
-	// (with a colon) = HTTP Basic; anything else = Bearer token. Blank = none.
-	RendezvousAuth string   `json:"rendezvous_auth"`
-	STUNServers    []string `json:"stun_servers"`
+	STUNServers       []string `json:"stun_servers"`
 	AdminPubKey string   `json:"admin_public_key"`
 	KeyPath     string   `json:"key_path"` // writable path for the node key
 	UseExit     bool     `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
@@ -181,14 +178,8 @@ func Start(tunFD int, configJSON string) error {
 	// but the same tuning is a safe footprint reduction there.)
 	debug.SetMemoryLimit(30 << 20) // 30 MB ceiling for the whole Go runtime
 	debug.SetGCPercent(20)
-	// FreeOSMemory is a full STOP-THE-WORLD GC plus a scavenge — it is what
-	// keeps the extension inside iOS's hard memory cap, but it is genuinely
-	// expensive CPU (and therefore battery) to run every 30 seconds forever.
-	// Every 2 minutes holds the footprint just as well in practice: the cap
-	// is about a ceiling, not about instantaneous reclaim, and the runtime's
-	// own GC (SetGCPercent(20) above) is doing the real work between passes.
 	go func() {
-		t := time.NewTicker(2 * time.Minute)
+		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
 		for {
 			select {
@@ -261,106 +252,6 @@ func PendingAddress() string {
 	return getPendingAddress()
 }
 
-// NetworkStatusJSON reports this device's own transport situation:
-//
-//	{"nat_type":"symmetric","public_endpoint":"1.2.3.4:5678","ipv6":false,
-//	 "candidates":"1.2.3.4:5678,192.168.1.9:6969"}
-//
-// This is the fact that explains "why is this peer always relayed", and the
-// phone was the one device that never showed it. NAT type decides what is
-// even POSSIBLE: two symmetric NATs have no predictable port on either side,
-// so hole punching cannot work between them no matter how often it retries —
-// that pair is permanently relayed, and no setting will change it. A phone on
-// carrier CGNAT is routinely symmetric, which is why it can behave completely
-// differently from a laptop sitting next to it on the same Wi-Fi.
-func NetworkStatusJSON() string {
-	bridgeMu.Lock()
-	up := running
-	bridgeMu.Unlock()
-	resp := map[string]any{
-		"nat_type": "", "public_endpoint": "", "ipv6": false, "candidates": "",
-	}
-	if !up {
-		b, _ := json.Marshal(resp)
-		return string(b)
-	}
-	resp["nat_type"] = natTypeLabel()
-	resp["public_endpoint"] = currentPublicEndpoint()
-	resp["ipv6"] = hasGlobalIPv6()
-	resp["candidates"] = myConnectCandidates()
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return `{"nat_type":"","public_endpoint":"","ipv6":false,"candidates":""}`
-	}
-	return string(b)
-}
-
-// ExitsJSON returns the live full-VPN outproxy view so the apps can show WHY
-// "no exit is reachable" instead of a dead end: every exit the mesh has
-// advertised to this device, with reachability, latency, and which one is
-// selected. {"use_exit":bool,"pin":"…","exits":[{"overlay_ip","name","rtt_ms",
-// "reachable","selected"},…]} — an empty exits array with use_exit on means NO
-// exit announce has arrived here at all (the exit is off, unreachable, or has
-// no direct session to this device).
-func ExitsJSON() string {
-	bridgeMu.Lock()
-	up := running
-	bridgeMu.Unlock()
-	type exitView struct {
-		OverlayIP string `json:"overlay_ip"`
-		Name      string `json:"name"`
-		RttMs     int64  `json:"rtt_ms"`
-		Reachable bool   `json:"reachable"`
-		Selected  bool   `json:"selected"`
-	}
-	resp := struct {
-		UseExit bool       `json:"use_exit"`
-		Pin     string     `json:"pin"`
-		Exits   []exitView `json:"exits"`
-	}{Exits: []exitView{}}
-	if !up || GlobalSessions == nil {
-		b, _ := json.Marshal(resp)
-		return string(b)
-	}
-	exitMu.Lock()
-	resp.UseExit = useExit
-	resp.Pin = exitPin
-	type raw struct {
-		pub       [32]byte
-		addr      *net.UDPAddr
-		rttMs     int64
-		lastReply time.Time
-		selected  bool
-	}
-	raws := make([]raw, 0, len(exitCandidates))
-	for _, e := range exitCandidates {
-		raws = append(raws, raw{pub: e.pub, addr: e.addr, rttMs: e.rttMs,
-			lastReply: e.lastReply, selected: e == selectedExit})
-	}
-	exitMu.Unlock()
-	for _, r := range raws {
-		v := exitView{
-			OverlayIP: resolvePeerIP(r.pub),
-			Name:      resolvePeerName(r.pub),
-			RttMs:     -1,
-			Selected:  r.selected,
-		}
-		if !r.lastReply.IsZero() {
-			v.RttMs = r.rttMs
-		}
-		if s := GlobalSessions.GetByAddr(r.addr); s != nil && s.Established() &&
-			time.Since(r.lastReply) <= 90*time.Second {
-			v.Reachable = true
-		}
-		resp.Exits = append(resp.Exits, v)
-	}
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return `{"use_exit":false,"pin":"","exits":[]}`
-	}
-	return string(b)
-}
-
 func toClientConfig(mc mobileConfig) *ClientConfig {
 	cfg := &ClientConfig{
 		NetworkName:   mc.NetworkName,
@@ -371,7 +262,6 @@ func toClientConfig(mc mobileConfig) *ClientConfig {
 		STUNServers:       mc.STUNServers,
 		Trackers:          mc.Trackers,
 		RendezvousServers: mc.RendezvousServers,
-		RendezvousAuth:    mc.RendezvousAuth,
 		Cipher:           mc.Cipher,
 		KeepaliveSeconds: mc.KeepaliveSeconds,
 		// Quantum-safe by default: absent flags mean ON.

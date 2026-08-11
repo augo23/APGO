@@ -142,6 +142,8 @@
     <!-- Full-VPN status: fail-closed mode pauses internet while no exit is
          reachable; say so here instead of letting it look like an outage. -->
     <div id="inboundStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
+    <div id="selfApproval" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
+    <div id="dataPath" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="exitStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div class="cards">
       <div class="card">
@@ -482,6 +484,77 @@ async function loadInfo(){
         + "port, so it stays relayed until that port is open. Fix on the host: sudo ufw allow " + port + "/udp";
     } else {
       inb.style.display = "none";
+    }
+
+    // DATA PATH. A peer showing "connected" only proves CONTROL frames flow —
+    // names and rosters gossip over a session that may be carrying no useful
+    // data at all. "The peer is listed but I can't reach anything on it" has
+    // several causes that are indistinguishable from the peer list; these
+    // counters separate them, and the panel states which one in words.
+
+    // NOT APPROVED ON THIS NETWORK. The most misleading state this system can
+    // be in, and until now nothing displayed it. A peer that enforces
+    // admission drops our DATA but not our CONTROL frames — control is exempt
+    // by design — so handshakes complete, names and rosters gossip, and we sit
+    // in that peer's list looking healthy while every packet of real traffic
+    // is discarded. It presents as "the peer is right there and nothing works",
+    // which is indistinguishable from a routing fault from this side.
+    const appr = document.getElementById("selfApproval");
+    if (appr) {
+      const required = j.admission_required;
+      const ok = j.self_approved;
+      if (required === true && ok === false) {
+        appr.style.display = "";
+        appr.style.color = "#ff6b6b"; appr.style.borderColor = "#ff6b6b";
+        appr.textContent = "\u26a0 This node is NOT APPROVED on this network. Peers that enforce "
+          + "admission will still show it as connected — control traffic is exempt — but will "
+          + "SILENTLY DISCARD all of its data, so services on those nodes are unreachable from "
+          + "here while everything looks fine. Approve it from the admin panel of a node that "
+          + "holds the admin key.";
+      } else {
+        appr.style.display = "none";
+      }
+    }
+
+    const dp = document.getElementById("dataPath");
+    if (dp) {
+      const d = j.data_path;
+      if (!d) {
+        // Older client build: no counters reported. Say nothing rather than
+        // render zeros that look like a diagnosis.
+        dp.style.display = "none";
+      } else {
+        const txd = d.tx_direct || 0, txf = d.tx_flood || 0;
+        const rxd = d.rx_data || 0, del = d.rx_delivered || 0;
+        const rel = d.rx_relayed || 0, rep = d.rx_replay_drop || 0, dec = d.rx_decrypt_fail || 0;
+        let problem = "";
+        if (txd === 0 && txf === 0) {
+          problem = "";
+        } else if (rxd === 0) {
+          problem = "Sending, but nothing is coming back — the return path is blocked.";
+        } else if (txd === 0 && txf > 0) {
+          problem = "No direct route learned: every packet is being broadcast to all peers.";
+        } else if (dec > 0 && dec * 4 > rxd) {
+          problem = "Many packets fail to decrypt — session keys are out of sync.";
+        } else if (rep > 0 && rep * 20 > rxd) {
+          problem = "Packets arrive out of order and are dropped as replays.";
+        } else if (del === 0) {
+          problem = "Packets arrive but none are addressed to this node — check its overlay address.";
+        }
+        const counts = "sent " + txd + " direct / " + txf + " broadcast · received " + rxd
+          + ", " + del + " delivered" + (rel > 0 ? " (" + rel + " relayed)" : "")
+          + ((rep || dec) ? " · dropped " + rep + " out-of-order, " + dec + " undecryptable" : "");
+        dp.style.display = "";
+        if (problem) {
+          dp.style.color = "#e6b400"; dp.style.borderColor = "#e6b400";
+          dp.textContent = "⚠ Data path: " + problem + "  " + counts;
+        } else {
+          dp.style.color = ""; dp.style.borderColor = "var(--line)";
+          dp.textContent = (txd === 0 && txf === 0)
+            ? "Data path: idle — no traffic sent to peers yet.  " + counts
+            : "Data path: packets flowing in both directions.  " + counts;
+        }
+      }
     }
   }
   // Full-VPN (use_exit) status banner — mirrors the mobile apps' warning.

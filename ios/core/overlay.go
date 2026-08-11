@@ -74,7 +74,6 @@ type ClientConfig struct {
 	Trackers                   []string  `yaml:"trackers"`
 	TrackerListFile            string    `yaml:"tracker_list_file"`
 	RendezvousServers          []string  `yaml:"rendezvous_servers"`
-	RendezvousAuth             string    `yaml:"rendezvous_auth"`
 	ControllerURL              string    `yaml:"controller_url"`
 	MinAnnounceIntervalSeconds int       `yaml:"min_announce_interval_seconds"`
 	Compression                bool      `yaml:"compression"`
@@ -361,24 +360,11 @@ func loadConfig() (*ClientConfig, error) {
 	default:
 		return nil, fmt.Errorf("cipher must be \"chacha\" or \"aesgcm\", got %q", cfg.Cipher)
 	}
-	// NAT keepalive cadence: default 20s, clamped 5..120. A healthy session
+	// NAT keepalive cadence: default 10s, clamped 5..120. A healthy session
 	// receives the peer's keepalive every interval, so anything quiet for ~3
 	// intervals is a dead path — that drives sessionStaleTimeout.
-	//
-	// 20s, not the old 10s and not WireGuard's 25s. Rationale for each bound:
-	//
-	//   * Well above 10s, because on a phone every tick powers up the radio,
-	//     and this number dominates idle battery. (The directory frames that
-	//     used to ride along on every tick now go once a minute, so a tick is
-	//     one small packet per peer.)
-	//   * BELOW 25s, because CARRIER NAT is the tightest case in the wild:
-	//     mobile networks routinely expire UDP mappings around 30s, and some
-	//     are tighter. 25s leaves almost no margin for a late tick, a
-	//     scheduler stall, or a radio wake delay — and a missed mapping on
-	//     5G costs a full re-punch, which is far more expensive (and far more
-	//     visible) than the packet it saved.
 	if cfg.KeepaliveSeconds == 0 {
-		cfg.KeepaliveSeconds = 20
+		cfg.KeepaliveSeconds = 10
 	}
 	if cfg.KeepaliveSeconds < 5 {
 		cfg.KeepaliveSeconds = 5
@@ -1048,25 +1034,8 @@ func isPunchableAddr(addr string) bool {
 		ip.IsLinkLocalUnicast() {
 		return false
 	}
-	// NEVER a transport target inside the overlay subnet. On mobile this is
-	// fatal, not just wasteful: the tunnel process's own sockets BYPASS the
-	// tunnel by design, so dialing an overlay address sprays packets onto the
-	// local Wi-Fi and the peer stays relay-only forever. (Seen in the wild
-	// with a Kubernetes pod whose k3s node-IP is an overlay address — it
-	// advertised "reach me at 10.x.overlay:6970" to every phone.) Overlay
-	// addresses are what the tunnel CARRIES, never how it is reached.
-	if isOverlayTransportAddr(ip) {
-		return false
-	}
 	p, err := strconv.Atoi(portStr)
 	return err == nil && p > 0 && p < 65535
-}
-
-// isOverlayTransportAddr reports whether ip falls inside the overlay subnet —
-// i.e. it is an overlay-layer address and therefore invalid as a transport
-// (UDP dial) endpoint.
-func isOverlayTransportAddr(ip net.IP) bool {
-	return overlayNet != nil && ip != nil && overlayNet.Contains(ip)
 }
 
 type TrackerResponse struct {
@@ -1981,14 +1950,6 @@ var (
 const knownPeerExpiry = 30 * time.Minute
 
 func addKnownPeer(p string) {
-	// Never MEMORISE an overlay-subnet endpoint (see isPunchableAddr). Once
-	// remembered, the retry loop re-dials it forever, so a bad endpoint would
-	// outlive the config that introduced it.
-	if h, _, err := net.SplitHostPort(strings.TrimSpace(p)); err == nil {
-		if isOverlayTransportAddr(net.ParseIP(h)) {
-			return
-		}
-	}
 	knownPeersMu.Lock()
 	knownPeers[p] = time.Now()
 	knownPeersMu.Unlock()
@@ -2018,12 +1979,6 @@ func holePunchRetryLoop(kp keypair, psk []byte) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		// Nothing to punch toward: skip the whole pass (and its allocations)
-		// rather than walking an empty list every 10s forever. Common on a
-		// phone that is fully connected — every known peer is established.
-		if GlobalSessions == nil {
-			continue
-		}
 		for _, p := range knownPeerList() {
 			addr, _ := net.ResolveUDPAddr("udp", p)
 			if addr == nil {
@@ -2048,9 +2003,6 @@ func isValidPeer(addr string) bool {
 	ip := net.ParseIP(h)
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return false
-	}
-	if isOverlayTransportAddr(ip) { // see isPunchableAddr — never dial overlay addresses
 		return false
 	}
 	p, err := strconv.Atoi(portStr)
@@ -2084,21 +2036,14 @@ var (
 const (
 	// Give LAN discovery + relay this long before resorting to a hairpin dial
 	// of a same-site peer's public endpoint.
-	//
-	// 25s (was 60s): when LAN discovery is dead — AP isolation, or an iPhone
-	// whose Local Network permission got reset by a reinstall — this grace is
-	// the FLOOR on how long two same-Wi-Fi devices stay relay-only. A minute
-	// of "why won't my own devices connect" is a long minute; one hairpin
-	// attempt 25s in is cheap, and the exponential ladder below still quiets
-	// routers whose NAT loopback misbehaves.
-	sameSiteHairpinGrace = 25 * time.Second
+	sameSiteHairpinGrace = 60 * time.Second
 	// Retry ladder bounds. A router without clean NAT loopback would re-form
 	// and desync the session on a tight loop — the exact churn hairpin dialing
 	// was disabled to avoid — so attempts back off exponentially from the
 	// minimum to the maximum. The old flat 10-minute window meant a peer whose
 	// FIRST attempt was lost stayed invisible for 10+ minutes even though it
 	// was reachable the whole time.
-	sameSiteHairpinRetryMin = 30 * time.Second
+	sameSiteHairpinRetryMin = time.Minute
 	sameSiteHairpinRetryMax = 10 * time.Minute
 )
 
@@ -2150,12 +2095,6 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 	// leave a trail of stale v6 endpoints in trackers/PEX that used to spam
 	// the log with pointless punches every cycle. Skip silently.
 	if v4 := addr.IP.To4(); v4 == nil && !hasGlobalIPv6() {
-		return
-	}
-	// Belt-and-braces: overlay addresses are never transport endpoints (see
-	// isPunchableAddr) — catches entries gossiped by old builds through
-	// paths with weaker filters (PEX's attached-LAN allowance).
-	if isOverlayTransportAddr(addr.IP) {
 		return
 	}
 	// Same-site candidate: this endpoint is on OUR OWN public IP — a LAN-mate
@@ -2399,32 +2338,15 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 		}
 	}()
 
-	// Broadcaster goroutine — 255.255.255.255, fast at first then relaxed.
-	//
-	// MOBILE: iOS in particular will not deliver broadcast to (or reliably
-	// from) a tunnel-provider process, so on a phone this is largely a
-	// courtesy transmission for peers that CAN hear it. Worth doing — it is
-	// how a desktop notices us instantly on join — but not worth doing every
-	// 5 seconds forever. Fast for the first minute, then every 30s.
+	// Broadcaster goroutine — send to 255.255.255.255 every 5s.
 	go func() {
 		broadcastAddr := &net.UDPAddr{
 			IP:   net.IPv4bcast,
 			Port: discPort,
 		}
-		beaconNo := 0
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			beaconNo++
-			// Relax only once we actually HAVE a LAN peer. Slowing the beacon
-			// while still alone delays the moment a desktop notices us, which
-			// is the same mistake the sweep cadence made: the quiet case is
-			// exactly the case that needs the announcements.
-			if beaconNo == 12 && hasEstablishedLANPeer() {
-				ticker.Reset(30 * time.Second)
-			} else if beaconNo > 12 && !hasEstablishedLANPeer() {
-				ticker.Reset(5 * time.Second)
-			}
 			// Use a fresh socket per broadcast to avoid send/recv
 			// collision on the same fd.
 			bc, err := net.DialUDP("udp4", nil, broadcastAddr)
@@ -2479,27 +2401,15 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 				time.Sleep(time.Second)
 			}
 		}
-		// Cadence — MOBILE tuning. A /24 sweep is ~508 datagrams (two paced
-		// passes); on a mains-powered desktop that is negligible every 30s,
-		// but on a phone it is the single largest idle drain in this process:
-		// it holds the Wi-Fi radio out of deep power-save around the clock,
-		// screen off, forever.
-		//
-		// So: keep the aggressive phase (first minute) where it earns its
-		// keep — the tunnel usually starts while Wi-Fi is still settling and
-		// the first probes race that — then scale back by what we actually
-		// found:
-		//
-		//   * LAN peer established  -> every 5 min. We already found what is
-		//     here, and a NEW device arriving finds US: desktops sweep on
-		//     mains power every 30s, and we answer their probes instantly
-		//     (receiving costs nothing extra — the radio is already up for
-		//     the keepalive).
-		//   * nothing found         -> 30s, backing off to 4 min. Either the
-		//     subnet is empty or the AP filters client-to-client traffic;
-		//     both mean more sweeping will not help.
-		//
-		// Any wake/network change restarts the fast phase (see resetLANSweep).
+		// Cadence: fast for the first minute (the tunnel usually starts
+		// while Wi-Fi is still settling, and the first probes race that),
+		// then every 30s — ALWAYS, even when we already have LAN peers. The
+		// old 2-minute "maintenance" relaxation made a NEW device on the same
+		// Wi-Fi (a Mac especially — this phone can't send or receive
+		// broadcast, so the unicast sweep is the ONLY way they find each
+		// other) wait up to 2 minutes to be discovered whenever the
+		// aggressive always-on nodes had already claimed the "LAN peer"
+		// slot. A /24 sweep is ≤508 tiny datagrams — negligible every 30s.
 		time.Sleep(2 * time.Second)
 		sweepNo := 0
 		for {
@@ -2519,40 +2429,11 @@ func startLocalDiscovery(infoHash []byte, udpPort int, kp keypair, psk []byte) {
 					log.Printf("[local-discovery] no sweep targets — no usable IPv4 subnet found; LAN peers can only be reached via relay")
 				}
 			}
-			var wait time.Duration
-			switch {
-			case sweepNo < 12:
-				wait = 5 * time.Second // opening phase: Wi-Fi still settling
-			case hasEstablishedLANPeer():
-				// We already found the LAN. Relax hard: a NEW device arriving
-				// finds US (desktops sweep every 30s on mains power and we
-				// answer instantly — receiving costs nothing extra). This is
-				// where the battery saving is, and it is safe because the
-				// "nothing to find" case is the one we are certain about.
-				wait = 5 * time.Minute
-			default:
-				// NOTHING FOUND YET -> keep looking at the steady 30s rate.
-				//
-				// This deliberately does NOT back off. An earlier version
-				// climbed 30s -> 4m here, reasoning that an empty result meant
-				// an empty subnet or AP isolation. That was exactly backwards:
-				// the overwhelmingly common reason for an empty result is that
-				// the other device has not started yet, or this phone just
-				// joined the network. Backing off then means the peer that
-				// appears 40 seconds later is not noticed for MINUTES — the
-				// phone sits relayed to a Mac one hop away. A /24 unicast
-				// sweep every 30s while genuinely alone is a small, bounded
-				// cost; being slow to find a LAN peer is not.
-				wait = 30 * time.Second
+			wait := 30 * time.Second
+			if sweepNo < 12 {
+				wait = 5 * time.Second
 			}
-			// A resume or network change means the whole picture may have
-			// changed — go back to the fast phase instead of waiting out a
-			// long backoff on a network we have never swept.
-			select {
-			case <-lanSweepReset:
-				sweepNo = 0
-			case <-time.After(wait):
-			}
+			time.Sleep(wait)
 		}
 	}()
 }
@@ -2613,21 +2494,6 @@ func scanLocalIPv4Nets() []*net.IPNet {
 
 // hasEstablishedLANPeer reports whether any established session's endpoint is
 // on one of our directly-attached subnets (i.e. LAN discovery already worked).
-// lanSweepReset kicks the LAN sweep back into its fast phase. Buffered and
-// non-blocking: a resume or network change signals it, and if the sweeper is
-// mid-sweep the pending token is consumed on its next wait.
-var lanSweepReset = make(chan struct{}, 1)
-
-// resetLANSweep signals the sweeper that the network picture changed (device
-// resumed from suspend, Wi-Fi switched) so it re-scans promptly instead of
-// waiting out a long idle backoff on a subnet it has never seen.
-func resetLANSweep() {
-	select {
-	case lanSweepReset <- struct{}{}:
-	default:
-	}
-}
-
 func hasEstablishedLANPeer() bool {
 	if GlobalSessions == nil {
 		return false

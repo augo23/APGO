@@ -26,9 +26,11 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cloudflare/circl/kem"
 	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
@@ -47,6 +49,20 @@ var pqMagic = []byte("OVLYPQ1\x00")
 
 type pqPeer struct {
 	aead     cipher.AEAD    // ready once the ML-KEM secret is derived
+
+	// Nonce sequence for this key: a random per-key salt plus a monotonic
+	// counter, the standard AEAD record construction. It replaces a
+	// crypto/rand read PER PACKET — a getentropy syscall on every single
+	// datagram, which on a phone is both a syscall storm and (via the
+	// allocation it needed) GC pressure. Uniqueness is what matters for
+	// AEAD safety, not unpredictability, and salt+counter guarantees it:
+	// the counter is per-key (a fresh pqPeer is built for every new aead,
+	// below) and 2^64 packets is unreachable. The nonce still travels on
+	// the wire, so this is wire-compatible with peers using the old
+	// random-nonce build.
+	nonceSalt [4]byte
+	nonceCtr  atomic.Uint64
+
 	priv     kem.PrivateKey // initiator: kept until the responder's ciphertext arrives
 	offerPKB []byte         // initiator: cached marshaled offer pubkey, so RETRANSMITS reuse the same keypair (a reply to any earlier offer still decapsulates)
 
@@ -66,6 +82,32 @@ var (
 	pqMu    sync.RWMutex
 	pqPeers = map[[32]byte]*pqPeer{}
 )
+
+// newPQPeer builds the per-peer PQ state for a freshly derived key. Going
+// through here (rather than a bare &pqPeer{aead: ...}) is what guarantees the
+// nonce counter restarts from zero against a NEW salt every time the key
+// changes — the one way a counter-based nonce could ever repeat.
+func newPQPeer(aead cipher.AEAD) *pqPeer {
+	p := &pqPeer{aead: aead}
+	if _, err := rand.Read(p.nonceSalt[:]); err != nil {
+		// Salt is defence in depth; the counter alone is already unique
+		// per key. A zero salt is safe, so never fail the handshake here.
+		p.nonceSalt = [4]byte{}
+	}
+	return p
+}
+
+// nextNonce writes this peer's next unique nonce into dst (12 bytes for
+// ChaCha20-Poly1305) and returns it.
+func (p *pqPeer) nextNonce(dst []byte) []byte {
+	copy(dst[:4], p.nonceSalt[:])
+	binary.BigEndian.PutUint64(dst[4:12], p.nonceCtr.Add(1))
+	return dst
+}
+
+// pqWrapPool recycles the buffer pqWrapTo builds into, so the PQ layer stops
+// allocating a fresh frame for every outbound packet.
+var pqWrapPool = sync.Pool{New: func() any { b := make([]byte, maxFrameSize); return &b }}
 
 func pqScheme() kem.Scheme { return mlkem768.Scheme() }
 
@@ -177,7 +219,9 @@ func handlePQOffer(peer [32]byte, pkb []byte) []byte {
 		return nil
 	}
 	pqMu.Lock()
-	pqPeers[peer] = &pqPeer{aead: aead, offerHash: h, replyCT: append([]byte(nil), ct...)}
+	np := newPQPeer(aead)
+	np.offerHash, np.replyCT = h, append([]byte(nil), ct...)
+	pqPeers[peer] = np
 	pqMu.Unlock()
 	log.Printf("[pq] post-quantum layer established with %s (responder)", peerKeyFingerprint(peer[:]))
 
@@ -204,7 +248,7 @@ func handlePQReply(peer [32]byte, ct []byte) {
 		return
 	}
 	pqMu.Lock()
-	pqPeers[peer] = &pqPeer{aead: aead}
+	pqPeers[peer] = newPQPeer(aead)
 	pqMu.Unlock()
 	log.Printf("[pq] post-quantum layer established with %s (initiator)", peerKeyFingerprint(peer[:]))
 }
@@ -212,16 +256,34 @@ func handlePQReply(peer [32]byte, ct []byte) {
 // pqWrap wraps an inner IPv4 packet for a PQ-ready peer, or returns (nil,false)
 // if PQ isn't ready (caller then sends the packet classically).
 func pqWrap(peer [32]byte, pkt []byte) ([]byte, bool) {
+	return pqWrapTo(nil, peer, pkt)
+}
+
+// pqWrapTo is pqWrap writing into a caller-supplied buffer. The hot path hands
+// it a pooled buffer so wrapping allocates nothing: the old version allocated
+// the nonce, the magic prefix, and then grew that prefix twice inside Seal —
+// four allocations and a getentropy syscall on EVERY datagram. At speedtest
+// rates that is tens of thousands of allocations a second, which on iOS (where
+// the extension runs under a hard ~50 MB cap, so the runtime is pinned to a
+// 30 MB soft limit) drives the GC into back-to-back collections and stalls the
+// transfer. dst may be nil, in which case this allocates like before.
+func pqWrapTo(dst []byte, peer [32]byte, pkt []byte) ([]byte, bool) {
 	p := pqGet(peer)
 	if p == nil || p.aead == nil {
 		return nil, false
 	}
-	nonce := make([]byte, p.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, false
+	ns := p.aead.NonceSize()
+	need := len(pqMagic) + ns + len(pkt) + p.aead.Overhead()
+	if cap(dst) < need {
+		dst = make([]byte, 0, need)
 	}
-	out := append([]byte(nil), pqMagic...)
-	out = append(out, nonce...)
+	out := append(dst[:0], pqMagic...)
+	// Extend into the capacity we just guaranteed rather than appending a
+	// freshly made slice — that would reintroduce a per-packet allocation.
+	// The bytes are stale, which is fine: nextNonce overwrites all of them.
+	out = out[:len(pqMagic)+ns]
+	nonce := out[len(pqMagic):]
+	p.nextNonce(nonce)
 	return p.aead.Seal(out, nonce, pkt, nil), true
 }
 
@@ -237,7 +299,11 @@ func pqUnwrap(peer [32]byte, pt []byte) ([]byte, bool) {
 		return nil, false
 	}
 	nonce, ct := body[:ns], body[ns:]
-	pkt, err := p.aead.Open(nil, nonce, ct, nil)
+	// Decrypt IN PLACE (dst == ct[:0]): the AEAD writes the plaintext back
+	// over the ciphertext instead of allocating a fresh buffer per packet.
+	// Safe because pt already aliases the receive buffer — the caller's
+	// existing contract — and we only overwrite bytes we have consumed.
+	pkt, err := p.aead.Open(ct[:0], nonce, ct, nil)
 	if err != nil {
 		return nil, false
 	}

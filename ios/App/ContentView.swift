@@ -25,12 +25,6 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showSupport = false
     @State private var peers: [Peer] = []
-    @State private var exitsInfo: TunnelManager.ExitsView?
-    @State private var netStatus: TunnelManager.NetStatus?
-    /// Mirrors scenePhase == .background into @State so the long-lived poll
-    /// task can read it (an @Environment value captured by that task would be
-    /// frozen at its start-up value forever — see pollPeers).
-    @State private var isBackgrounded = false
 
     private var isBusy: Bool {
         tunnel.status == .connecting || tunnel.status == .disconnecting || tunnel.status == .reasserting
@@ -153,70 +147,13 @@ struct ContentView: View {
                             }
                     }
                     Text(config.useExit
-                         ? "All internet traffic egresses via an exit node on your mesh. Needs at least one device with exit-node mode enabled (a Linux server or a Mac — phones can't be exits). Exit-capable devices show a green E in the peer list."
+                         ? "All internet traffic egresses via an exit node on your mesh. Needs at least one device with exit-node mode enabled (a server or desktop — phones can't be exits)."
                          : "Off: only overlay traffic is tunneled.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    // Full VPN captures ALL traffic, so until an exit is
-                    // selected the internet is deliberately paused (fail-closed,
-                    // no leaks). Show the live outproxy state from the core so
-                    // this is diagnosable on the device instead of a dead end.
-                    if config.useExit && isConnected {
-                        if let sel = exitsInfo?.exits.first(where: { $0.selected }) {
-                            Label("Exit: \(sel.name.isEmpty ? sel.overlayIP : sel.name)" +
-                                  (sel.rttMs >= 0 ? " · \(sel.rttMs) ms" : ""),
-                                  systemImage: "checkmark.circle.fill")
-                                .font(.footnote)
-                                .foregroundStyle(.green)
-                        } else {
-                            Label(peers.contains(where: { $0.isExit })
-                                  ? "Connecting to an exit node… internet is paused until one is selected."
-                                  : "No exit node is reachable — internet is paused. Enable exit-node mode on a Linux, macOS, or Windows node on this mesh (green E), or turn Full VPN off.",
-                                  systemImage: "exclamationmark.triangle.fill")
-                                .font(.footnote)
-                                .foregroundStyle(.orange)
-                            if let ex = exitsInfo {
-                                Text(ex.exits.isEmpty
-                                     ? "Diagnostics: no exit announcement has reached this device. The exit must show “exit-node mode ON” in its log AND have a direct (green-dot) session to this phone — a relayed exit can't carry traffic."
-                                     : "Diagnostics: known exits — " + ex.exits.map {
-                                           ($0.name.isEmpty ? $0.overlayIP : $0.name) +
-                                           ($0.reachable ? "" : " (unreachable)")
-                                       }.joined(separator: ", ") +
-                                       (ex.pin.isEmpty ? "" : " · pinned to “\(ex.pin)” — the pin must match the exit's name, IP, or fingerprint exactly"))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
                 }
 
                 // --- Peers ----------------------------------------------------
-                Section {
-                    // WHY ARE MY PEERS RELAYED? This device's NAT type is the
-                    // fact that answers it, and the phone was the only device
-                    // that never showed it. Two symmetric NATs have no
-                    // predictable port on either side, so that pair can NEVER
-                    // punch — it is permanently relayed and no setting changes
-                    // that. Carrier CGNAT is routinely symmetric, which is why
-                    // a phone can behave differently from a laptop beside it.
-                    if isConnected, let ns = netStatus, !ns.natType.isEmpty {
-                        let symmetric = ns.natType.lowercased().contains("symmetric")
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: symmetric ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                                .foregroundStyle(symmetric ? .orange : .green)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("This device's NAT: \(ns.natType)")
-                                    .font(.footnote.weight(.semibold))
-                                Text(symmetric
-                                     ? "A symmetric NAT gives this device no predictable port, so peers that are ALSO behind one can never connect directly — those stay relayed (still encrypted, just one extra hop). Wi-Fi is usually better than cellular here."
-                                     : "Peers can punch directly to this device when their own network allows it.")
-                                    .font(.caption2).foregroundStyle(.secondary)
-                                if !ns.publicEndpoint.isEmpty {
-                                    Text("Reachable at \(ns.publicEndpoint)")
-                                        .font(.caption2.monospaced()).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
+                Section("Peers (\(peers.count))") {
                     if !isConnected {
                         Text("Connect to see peers.")
                             .font(.footnote).foregroundStyle(.secondary)
@@ -230,24 +167,8 @@ struct ContentView: View {
                                     .fill(p.established ? .green : (p.relayed ? .blue : .orange))
                                     .frame(width: 8, height: 8)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    // A key-DERIVED address is a guess: the peer
-                                    // has not announced one yet. Showing it in
-                                    // the same weight as a confirmed address is
-                                    // what makes peers look like they have "the
-                                    // wrong IP" — mark it instead of hiding it,
-                                    // since it is usually right and always the
-                                    // address that peer would default to.
-                                    HStack(spacing: 4) {
-                                        Text(p.overlayIP.isEmpty ? p.keyFP : p.overlayIP)
-                                            .font(.body.monospaced())
-                                            .foregroundStyle(p.ipDerived ? .secondary : .primary)
-                                        if p.ipDerived {
-                                            Text("?")
-                                                .font(.caption2.weight(.bold))
-                                                .foregroundStyle(.orange)
-                                                .accessibilityLabel("Address not yet confirmed by this peer")
-                                        }
-                                    }
+                                    Text(p.overlayIP.isEmpty ? p.keyFP : p.overlayIP)
+                                        .font(.body.monospaced())
                                     if !p.name.isEmpty {
                                         Text(p.name).font(.caption).foregroundStyle(.secondary)
                                     }
@@ -257,10 +178,9 @@ struct ContentView: View {
                                     }
                                 }
                                 Spacer()
-                                // Exit badges. Green "E" = this device can be an
-                                // exit node for the VPN relay; the solid badge =
-                                // the exit THIS device's internet traffic
-                                // currently egresses through (full VPN).
+                                // Exit badge: solid globe = the exit THIS device's
+                                // internet traffic currently egresses through
+                                // (full VPN); faint globe = advertises as an exit.
                                 if p.activeExit {
                                     Label("Exit", systemImage: "globe.americas.fill")
                                         .labelStyle(.titleAndIcon)
@@ -268,14 +188,9 @@ struct ContentView: View {
                                         .foregroundStyle(.blue)
                                         .padding(.horizontal, 6).padding(.vertical, 2)
                                         .background(.blue.opacity(0.12), in: Capsule())
-                                }
-                                if p.isExit {
-                                    Text("E")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(.green)
-                                        .padding(.horizontal, 5).padding(.vertical, 1)
-                                        .background(.green.opacity(0.15), in: Capsule())
-                                        .accessibilityLabel("Can be an exit node")
+                                } else if p.isExit {
+                                    Image(systemName: "globe")
+                                        .font(.caption).foregroundStyle(.secondary)
                                 }
                                 // Relay badge: reachable through another node
                                 // rather than a direct session (traffic still
@@ -298,8 +213,6 @@ struct ContentView: View {
                             }
                         }
                     }
-                } header: {
-                    Text("Peers (\(peers.count))")
                 }
 
                 // --- Support (bottom) ------------------------------------------
@@ -342,7 +255,6 @@ struct ContentView: View {
         // Re-check when returning from Settings (the user may have just
         // flipped the Local Network toggle for APGO).
         .onChange(of: scenePhase) { phase in
-            isBackgrounded = (phase == .background)
             if phase == .active { lanCheck.check() }
         }
         // Close any open sheet the moment the app locks — sheets present above
@@ -434,60 +346,18 @@ struct ContentView: View {
     /// stored config and reconnect. Without this, renaming/re-addressing an
     /// iOS device from the admin dashboard was silently ignored.
     private func pollPeers() async {
-        // Poll count since the view became active, used to slow down once the
-        // picture has stopped changing.
-        var tick = 0
         while !Task.isCancelled {
-            // BATTERY: don't poll while the app is in the background. The
-            // view is not torn down there, so without this the app kept
-            // waking every 1.5s to run cross-process IPC (sendProviderMessage
-            // into the tunnel extension) to refresh a list nobody is looking
-            // at. The tunnel itself is unaffected — it runs in the extension.
-            //
-            // Read @State, NOT @Environment(\.scenePhase), and gate on
-            // BACKGROUND rather than "not active". Both details are load
-            // bearing:
-            //
-            //  * This closure captures the View STRUCT that existed when
-            //    .task started. @Environment values are resolved at view
-            //    creation, so `scenePhase` read in here is frozen at whatever
-            //    it was then — and at first appearance that is routinely
-            //    .inactive. Gating on it meant the loop parked forever and
-            //    the peer list stayed EMPTY for the whole session while the
-            //    tunnel worked fine. @State is a reference to external
-            //    storage, so reads through the captured struct see current
-            //    values.
-            //  * .inactive is a transient state (app switcher, notification
-            //    shade, permission alert). Pausing on it buys nothing and
-            //    risks exactly the class of bug above, so only .background
-            //    stops the loop.
-            guard !isBackgrounded else {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                tick = 0   // resume at the fast rate when the user comes back
-                continue
-            }
             if isConnected {
                 await refreshPeers()
                 await adoptPendingAddressIfAny()
-                // Exit diagnostics only matter (and only render) in full-VPN mode.
-                exitsInfo = config.useExit ? await tunnel.fetchExits() : nil
-                // Cheap and slow-changing; refresh it every few polls only.
-                if tick % 5 == 0 || netStatus == nil { netStatus = await tunnel.fetchNetStatus() }
             } else {
                 peers = []
-                exitsInfo = nil
-                netStatus = nil
             }
-            tick += 1
-            // On-screen cadence. 1.5s while the mesh is forming, then 2s —
-            // NOT the 5s tried earlier: this list is the app's only feedback
-            // that anything is happening, and at 5s it reads as frozen while
-            // peers appear, change address and go direct. The saving was
-            // measured against foreground IPC, which is not where phone
-            // battery goes; the real wins were background polling (off
-            // entirely) and the core's own radio traffic.
-            let interval: UInt64 = tick <= 20 ? 1_500_000_000 : 2_000_000_000
-            try? await Task.sleep(nanoseconds: interval)
+            // 1.5s cadence: sessions form within a few seconds of connecting, so
+            // a snappier poll makes new peers (and dropped ones) appear promptly
+            // without meaningfully affecting battery — the peers query is a cheap
+            // in-process snapshot in the tunnel extension.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
         }
     }
 

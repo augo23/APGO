@@ -46,10 +46,6 @@ var (
 	// exitRepick nudges the selection loop to re-probe + re-pick immediately
 	// (e.g. after the pin is changed at runtime via the control API).
 	exitRepick = make(chan struct{}, 1)
-
-	// exitNATErr records WHY exit-node mode was requested but disabled
-	// (setupExitNAT failure), gossiped so other dashboards can badge it.
-	exitNATErr string
 )
 
 type exitInfo struct {
@@ -74,7 +70,6 @@ func initExit(cfg *ClientConfig) {
 			// lose ALL internet ("connected to no internet"). Better to be
 			// no exit than a black hole.
 			amExit = false
-			exitNATErr = err.Error()
 			log.Printf("[exit] exit-node mode DISABLED — could not enable internet forwarding (NAT): %v", err)
 		} else {
 			log.Printf("[exit] exit-node mode ON — forwarding internet traffic for overlay clients")
@@ -299,22 +294,11 @@ func exitSelectionLoop() {
 		selectedExit = chosen
 	}
 
-	// Convergence: while NO exit is selected, retry quickly — at startup the
-	// first probe fires before any session (let alone an exit announce)
-	// exists, so a fixed 5-minute tick left full-VPN mode with no internet
-	// for up to 5 minutes after connecting. Once an exit is selected, relax
-	// to a 5-minute re-evaluation (or on demand via exitRepick).
-	//
-	// BATTERY: the no-exit retry now BACKS OFF (4s → 8s → … → 2 min) instead
-	// of probing every 4s indefinitely. The fast retries are what matter —
-	// they cover the startup race, and an exit that shows up later announces
-	// itself, which nudges exitRepick and snaps us straight back to the fast
-	// path. Without the backoff, a phone left in full-VPN mode on a mesh with
-	// NO exit at all (exactly the state this project spent a while debugging)
-	// woke its radio every 4 seconds, all day, to ask a question with no
-	// answer.
-	const probeMin, probeMax = 4 * time.Second, 2 * time.Minute
-	retry := probeMin
+	// Convergence: while NO exit is selected, retry every few seconds — at
+	// startup the first probe fires before any session (let alone an exit
+	// announce) exists, so a fixed 5-minute tick left full-VPN mode with no
+	// internet for up to 5 minutes after connecting. Once an exit is selected,
+	// relax to a 5-minute re-evaluation (or on demand via exitRepick).
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -325,22 +309,15 @@ func exitSelectionLoop() {
 		haveExit := selectedExit != nil
 		exitMu.Unlock()
 		if haveExit {
-			retry = probeMin // reset, so losing this exit re-probes fast
 			select {
 			case <-ticker.C:
 			case <-exitRepick:
 			}
-			continue
-		}
-		select {
-		case <-ticker.C:
-			retry = probeMin
-		case <-exitRepick:
-			// An exit announced itself (or the pin changed) — converge now.
-			retry = probeMin
-		case <-time.After(retry):
-			if retry *= 2; retry > probeMax {
-				retry = probeMax
+		} else {
+			select {
+			case <-ticker.C:
+			case <-exitRepick:
+			case <-time.After(4 * time.Second):
 			}
 		}
 	}

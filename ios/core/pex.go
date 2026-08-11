@@ -97,13 +97,6 @@ func buildPeerExchangeFor(dst *net.UDPAddr) []byte {
 		if dst != nil && s == dst.String() {
 			continue // don't hand a peer its own endpoint
 		}
-		// NEVER gossip an overlay-subnet endpoint (see isPunchableAddr): the
-		// attached-LAN allowance below can be satisfied by the overlay
-		// interface itself, which is how such an address goes viral across
-		// the mesh and outlives the config that introduced it.
-		if isOverlayTransportAddr(addr.IP) {
-			continue
-		}
 		if !isValidPeer(s) && !(includeLAN && isAttachedLANAddr(addr)) {
 			continue
 		}
@@ -133,10 +126,6 @@ func handlePeerExchange(payload []byte, kp keypair, psk []byte) {
 		}
 		addr, _ := net.ResolveUDPAddr("udp", ep)
 		if addr == nil {
-			continue
-		}
-		// Same rule on receipt, whichever gossip path it arrived on.
-		if isOverlayTransportAddr(addr.IP) {
 			continue
 		}
 		if !isValidPeer(ep) && !isAttachedLANAddr(addr) {

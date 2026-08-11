@@ -125,8 +125,52 @@ type SessionInfo struct {
 	ActiveExit   bool   `json:"active_exit"` // the exit THIS device currently egresses through
 	Relayed      bool   `json:"relayed"`     // reachable only via a relay (no direct session)
 	Via          string `json:"via"`         // relayed rows: the relaying node (overlay IP or endpoint)
+	// Path is what packets to this peer ACTUALLY do, as opposed to Established,
+	// which only says a handshake completed once. The two diverge constantly:
+	// a peer can hold a perfectly good established session while the routing
+	// table sends its traffic through a relay (ip_learning rules 2/3, when the
+	// direct route stops being live) or over the router's hairpin instead of
+	// the LAN wire (rule 4). Both reported established=true, relayed=false.
+	//
+	// One of: "lan", "direct", "wan", "relay", "unknown".
+	Path         string `json:"path"`
 	SinceUnix    int64  `json:"since_unix"`     // when the session was created
 	LastSeenUnix int64  `json:"last_seen_unix"` // last inbound activity
+}
+
+// pathLabel classifies how traffic to overlayIP currently leaves this device.
+// addr is the peer's own session endpoint (nil for relay-only rows).
+//
+// It reads the SAME table the send path reads (ipLearning.Lookup(dst) decides
+// where the packet goes), so this cannot drift from reality the way a flag
+// derived from session state does.
+func pathLabel(overlayIP string, addr *net.UDPAddr) string {
+	// GlobalSessions is checked too: GetByAddr guards a nil ADDRESS but not a
+	// nil receiver.
+	if overlayIP == "" || ipLearning == nil || GlobalSessions == nil {
+		return "unknown"
+	}
+	hop := ipLearning.Lookup(overlayIP)
+	if hop == nil {
+		// No learned route: the TUN egress path floods these to every peer
+		// until something comes back.
+		return "unknown"
+	}
+	// Next hop is somebody else's endpoint: this peer is being relayed for,
+	// whatever its own session says.
+	if addr == nil || !sameUDPAddr(hop, addr) {
+		if s := GlobalSessions.GetByAddr(hop); s.Established() && peerOverlayIPByPub(s.peerStatic) != overlayIP {
+			return "relay"
+		}
+	}
+	switch routeClass(hop) {
+	case 2:
+		return "lan"
+	case 1:
+		return "direct"
+	default:
+		return "wan"
+	}
 }
 
 // RevocationInfo is the JSON view of one admin-signed revocation, for the
@@ -150,6 +194,11 @@ func resolvePeerIP(pub [32]byte) string {
 	}
 	if rec, ok := provisions.get(pub); ok && rec.Address != "" {
 		return stripMask(normalizeOverlayAddr(rec.Address))
+	}
+	// Gossiped self-entry beats key derivation: it is what the node actually
+	// uses, whereas a derived address is only what it WOULD default to.
+	if ip := rosterIPByKey(pub); ip != "" {
+		return ip
 	}
 	if overlayCIDR != "" {
 		if d, err := deriveOverlayIP(overlayCIDR, pub); err == nil {
@@ -181,6 +230,13 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 	send(buildAdminSeed())
 	send(buildSealedKeyFrame())
 	send(buildNameAnnounce())
+	// Our live post-quantum state. This belongs in the on-connect sync and
+	// was missing from it: the keepalive loop only re-sends it on the ~minute
+	// "heavy" tick, so a new session showed no PQ shield for up to a minute —
+	// and a session that gets torn down and re-handshaken more often than
+	// that (key desync, a roaming phone) showed one NEVER, even with the PQ
+	// layer demonstrably up in the log.
+	send(buildPQStatus())
 	for _, e := range revocations.list() {
 		if e.Signed && e.Rec != nil {
 			send(buildRevocationFrame(*e.Rec))
@@ -354,6 +410,16 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				}
 			}
 		}
+		// The ROSTER, before guessing. Each node publishes its own configured
+		// address in its roster self-entry, so this resolves nodes whose IP
+		// comes from config (OVERLAY_ADDRESS) rather than an admin provision —
+		// including a peer whose keepalive announce has not arrived yet.
+		// Without this step such a peer was shown at a DERIVED address that
+		// nothing on the network answers on, while the real one (reachable,
+		// pingable) was discarded by de-duplication.
+		if ip == "" {
+			ip = rosterIPByKey(r.key)
+		}
 		derived := false
 		if ip == "" && overlayCIDR != "" && r.key != ([32]byte{}) {
 			if d, err := deriveOverlayIP(overlayCIDR, r.key); err == nil {
@@ -363,9 +429,16 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 		}
 		info.OverlayIP = ip
 		info.IPDerived = derived
+		info.Path = pathLabel(ip, r.addr)
 		info.Name = peerNameByPub(r.key)
 		info.Approved = admitted(r.key)
-		info.PostQuantum = peerPQByPub(r.key)
+		// PQ has REDUNDANT paths to the UI, exactly like the exit badge below.
+	// peerPQByPub is what the peer ADVERTISED, which needs its 'p' frame to
+	// have arrived and survived. pqReady is what we KNOW: the ML-KEM layer
+	// with this peer is up on our side, so the session is post-quantum
+	// protected whatever the gossip says. Either one lights the shield, so a
+	// single lost frame can no longer hide it.
+	info.PostQuantum = peerPQByPub(r.key) || pqReady(r.key)
 		info.Exit, info.ActiveExit = exitStatusFor(r.key)
 		// Merge the gossiped roster view into the direct row. Exit capability
 		// deliberately has REDUNDANT paths to the UI: the peer's own 'E'
@@ -524,6 +597,7 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				V6:           func() bool { rv, ok := rosterLookup(e.IP); return ok && rv.V6 }(),
 				Established:  false,
 				Relayed:      true,
+				Path:         "relay",
 				Via:          via,
 				LastSeenUnix: e.Seen.Unix(),
 			})
@@ -598,6 +672,7 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				V6:           e.V6,
 				Established:  false,
 				Relayed:      true,
+				Path:         "relay",
 				LastSeenUnix: e.Seen.Unix(),
 			})
 		}
@@ -680,6 +755,7 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				PubKey:       pubKey,
 				Established:  false,
 				Relayed:      true,
+				Path:         "relay",
 				Via:          h.Via,
 				LastSeenUnix: h.Seen.Unix(),
 			})
@@ -983,6 +1059,12 @@ func startControlServer(socketPath string) {
 				}
 				return natTraversalAdvice(p)
 			}(),
+			// Data-path counters (datastats.go). A peer showing "connected"
+			// only proves CONTROL frames flow — names and rosters gossip over
+			// a session that may be carrying no useful data at all. These
+			// separate the causes of "the peer is listed but I can't reach
+			// anything on it", which are otherwise indistinguishable.
+			"data_path": dataStats(),
 		})
 	})
 

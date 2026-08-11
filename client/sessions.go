@@ -103,6 +103,11 @@ func IsOverlayPacket(b byte) bool {
 type backoffState struct {
 	failures int
 	until    time.Time
+	// everOK records that a handshake to this endpoint once SUCCEEDED. It is
+	// the difference between "a peer that went away" and "an address that was
+	// never real", and those deserve opposite retry policies (see
+	// RecordFailure).
+	everOK bool
 }
 
 type session struct {
@@ -308,7 +313,15 @@ func (t *SessionTable) evictStale() {
 	// through endpoints indefinitely; without this the map grows for the
 	// life of the process (a slow leak on a node that runs for months).
 	for k, b := range t.peerBackoff {
-		if now.Sub(b.until) > 10*time.Minute {
+		// An endpoint that has genuinely worked is remembered far longer: the
+		// everOK flag is what lets RecordFailure retry a returning peer
+		// quickly instead of mistaking it for a stale tracker record, and a
+		// peer can easily be away longer than the ordinary prune window.
+		horizon := 10 * time.Minute
+		if b.everOK {
+			horizon = time.Hour
+		}
+		if now.Sub(b.until) > horizon {
 			delete(t.peerBackoff, k)
 		}
 	}
@@ -435,6 +448,13 @@ func (t *SessionTable) Evict(addr *net.UDPAddr) {
 // The ceiling is deliberately low (60s, not 10min) because the hole-punch
 // convergence pattern requires regular retries during the first few
 // minutes after a peer is discovered. Long back-offs kill convergence.
+// staleEndpointFailures is how many consecutive failures, with no success
+// EVER, mark an endpoint as almost certainly not real.
+const staleEndpointFailures = 5
+
+// staleEndpointBackoff is the retry interval such an endpoint drops to.
+const staleEndpointBackoff = 15 * time.Minute
+
 func (t *SessionTable) RecordFailure(addr *net.UDPAddr) {
 	key := addr.String()
 	t.mu.Lock()
@@ -454,12 +474,38 @@ func (t *SessionTable) RecordFailure(addr *net.UDPAddr) {
 	if idx >= len(steps) {
 		idx = len(steps) - 1
 	}
-	b.until = time.Now().Add(steps[idx] * time.Second)
+	wait := steps[idx] * time.Second
+	// STALE ENDPOINT. The 60s cap above is right for a peer that has worked
+	// and gone away — tracker swarms churn and we want it back quickly. It is
+	// wrong for an address that has NEVER completed a handshake, which is
+	// overwhelmingly a stale tracker record: those are retried once a minute
+	// for the life of the process, and each retry is a full Noise handshake
+	// (X25519 keygen + DH, with retransmits). A handful of them is a periodic
+	// CPU and radio burst on a phone forever, for an address that will never
+	// answer. Back those off hard; a record that becomes real again is
+	// re-learned by the next tracker announce or by the peer dialling us.
+	if !b.everOK && b.failures >= staleEndpointFailures {
+		wait = staleEndpointBackoff
+	}
+	b.until = time.Now().Add(wait)
 }
 
 func (t *SessionTable) RecordSuccess(addr *net.UDPAddr) {
+	key := addr.String()
 	t.mu.Lock()
-	delete(t.peerBackoff, addr.String())
+	// Keep the entry (cleared) rather than deleting it, so the fact that this
+	// endpoint has genuinely worked survives. RecordFailure uses it to retry a
+	// known-good peer promptly while backing right off an address that has
+	// never once answered. `until` is set to now so the periodic prune in
+	// evictStale still ages the record out when the peer really is gone.
+	b := t.peerBackoff[key]
+	if b == nil {
+		b = &backoffState{}
+		t.peerBackoff[key] = b
+	}
+	b.failures = 0
+	b.until = time.Now()
+	b.everOK = true
 	t.mu.Unlock()
 }
 
@@ -472,7 +518,49 @@ func (t *SessionTable) ShouldSkip(addr *net.UDPAddr) bool {
 	return false
 }
 
+// noteIdentityClash warns — loudly and repeatedly — when a peer presents OUR
+// OWN static key.
+//
+// Overlay identity IS the node key. Two live processes holding one key is not
+// a supported state and does not fail cleanly: each peer keeps exactly one
+// session per key, so the two holders continuously displace each other's
+// session on every peer. From inside either holder that looks like a stream of
+// "cipher: message authentication failed" followed by a key-desync teardown,
+// on a loop — and NOTHING in the logs said the two ends were the same node.
+// This is the one line that names it.
+//
+// How it happens in practice: a second copy started against the same state
+// directory or PVC (a compose stack and a Kubernetes Deployment sharing a
+// volume), or a failover that left the old holder running on a NotReady node
+// while the replacement came up elsewhere. It is a deployment fault, not a
+// protocol one, so this reports rather than tries to arbitrate.
+var (
+	identityClashMu   sync.Mutex
+	identityClashLast time.Time
+)
+
+func noteIdentityClash(addr *net.UDPAddr) {
+	identityClashMu.Lock()
+	if time.Since(identityClashLast) < 30*time.Second {
+		identityClashMu.Unlock()
+		return
+	}
+	identityClashLast = time.Now()
+	identityClashMu.Unlock()
+	log.Printf("[identity] DUPLICATE IDENTITY: %s is presenting THIS node's own key (%s). "+
+		"Two live processes are sharing one node key — they will displace each other's session "+
+		"on every peer, which appears as repeated 'message authentication failed' and key-desync "+
+		"teardowns. Stop one of them, or give it its own node key.",
+		addr, peerKeyFingerprint(gKP.pub[:]))
+}
+
 func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
+	// Every completed handshake funnels through here, so this is the one
+	// place that sees the peer's proven static key for both roles.
+	var zero [32]byte
+	if s.peerStatic != zero && s.peerStatic == gKP.pub {
+		noteIdentityClash(addr)
+	}
 	t.mu.Lock()
 	s.lastSeen = time.Now()
 	key := addr.String()
@@ -552,6 +640,33 @@ func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 // in ip_learning and the roaming-failover rule above never favoured it.
 // Checking our own attached subnets first covers those cases; the RFC1918
 // test stays as a fallback for addresses on a LAN we reach via another hop.
+// routeClass ranks an endpoint by how good a path it is to the same peer.
+// Higher is better:
+//
+//	2  on one of OUR directly-attached subnets — same wire, no router hop
+//	1  private (RFC1918/link-local) but not attached — another VLAN, a
+//	   site-to-site path; still not the public internet
+//	0  public — a NAT hairpin at best, a full internet round trip at worst
+//
+// This is the same preference ip_learning.Learn applies (rule 4: "prefer an
+// upgrade to the LAN path"), factored out so the session table can apply it
+// too. Two paths to one device are normal and deliberate here — a peer on the
+// same LAN is reachable at its LAN address AND, through the router's hairpin,
+// at its public one — and which of the two carries the traffic is the whole
+// difference between wire speed and "it feels relayed".
+func routeClass(a *net.UDPAddr) int {
+	if a == nil || a.IP == nil {
+		return 0
+	}
+	if isAttachedLANAddr(a) {
+		return 2
+	}
+	if a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback() {
+		return 1
+	}
+	return 0
+}
+
 func isPrivateUDPAddr(a *net.UDPAddr) bool {
 	if a == nil || a.IP == nil {
 		return false
@@ -636,8 +751,11 @@ func (t *SessionTable) RouteIsLive(addr *net.UDPAddr) bool {
 	if t == nil || addr == nil {
 		return false
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// RLock, not Lock: this is a pure read and it runs on EVERY outbound
+	// packet. A write lock here serialises the TUN reader against the UDP
+	// receiver for the whole table, on both directions of every transfer.
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	s := t.byAddr[addr.String()]
 	if s == nil || !s.established || s.send == nil || s.recv == nil {
 		return false
@@ -655,6 +773,35 @@ func (t *SessionTable) TouchLastSeen(addr *net.UDPAddr) {
 		s.decryptFails = 0
 	}
 	t.mu.Unlock()
+}
+
+// desyncQuietPeriod is how long a session must go without ANY valid inbound
+// before a run of decrypt failures is treated as key desync rather than as
+// spoofing or line noise.
+//
+// The safety property is what makes this spoof-proof, and it only needs ONE
+// keepalive: a healthy session decrypts its peer's keepalive every
+// gKeepaliveInterval, which resets lastSeen and the failure counter, so a
+// third party flooding garbage can never push `quiet` past this bound on a
+// working tunnel. The previous 2x bound was belt-and-braces from when the
+// keepalive was 10s (a 22s window). Raising the keepalive to 20s for battery
+// silently doubled it to 43s — and this window is a BLACKHOLE: every packet
+// is lost for its whole duration before the teardown that repairs things.
+// That is the "works, then stalls for ages, then comes back" cycle.
+//
+// One interval plus slack for jitter keeps the spoof guarantee and roughly
+// halves the stall. A teardown costs one re-handshake (~1s), so erring toward
+// detecting sooner is strictly the better trade.
+func desyncQuietPeriod() time.Duration {
+	// Slack is PROPORTIONAL, not a fixed 5s: at a short keepalive a constant
+	// slack is itself another whole interval, which puts us straight back at
+	// the 2x bound this exists to avoid. A floor keeps it sane for very short
+	// intervals.
+	slack := gKeepaliveInterval / 2
+	if slack < 3*time.Second {
+		slack = 3 * time.Second
+	}
+	return gKeepaliveInterval + slack
 }
 
 // NoteDecryptFailure records a failed decrypt on the established session for
@@ -677,7 +824,7 @@ func (t *SessionTable) NoteDecryptFailure(addr *net.UDPAddr) {
 	}
 	s.decryptFails++
 	quiet := time.Since(s.lastSeen)
-	if s.decryptFails < 10 || quiet < 2*gKeepaliveInterval+2*time.Second {
+	if s.decryptFails < 10 || quiet < desyncQuietPeriod() {
 		t.mu.Unlock()
 		return
 	}

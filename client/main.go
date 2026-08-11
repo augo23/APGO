@@ -290,6 +290,46 @@ var (
 	unprovenRouteLog = map[string]time.Time{}
 )
 
+// unprovenProbe rate-limits the relay fallback for a route that is
+// established but not proven live.
+//
+// The fallback exists to REDISCOVER a working path, not to duplicate the
+// traffic. Firing it on every packet multiplies a bulk transfer by the peer
+// count — and that is self-reinforcing: the flood saturates the link, the
+// saturation delays the very keepalives that would mark the route live again,
+// so the route stays unproven and the flood continues. On a phone the result
+// is a connection that works for a moment and then collapses, including on a
+// LAN where nothing was wrong with the direct path in the first place.
+//
+// One probe per destination per second is enough: the relayed copy reaches the
+// destination, its reply teaches us the working return route (ip_learning's
+// failover rules let a dead direct route be replaced), and the next packet
+// goes straight down it at full rate.
+var (
+	unprovenProbeMu sync.Mutex
+	unprovenProbeAt = map[string]time.Time{}
+)
+
+const unprovenProbeInterval = time.Second
+
+func shouldProbeUnprovenRoute(dstIP string) bool {
+	unprovenProbeMu.Lock()
+	defer unprovenProbeMu.Unlock()
+	if t, ok := unprovenProbeAt[dstIP]; ok && time.Since(t) < unprovenProbeInterval {
+		return false
+	}
+	if len(unprovenProbeAt) > 1024 {
+		cutoff := time.Now().Add(-5 * time.Minute)
+		for k, t := range unprovenProbeAt {
+			if t.Before(cutoff) {
+				delete(unprovenProbeAt, k)
+			}
+		}
+	}
+	unprovenProbeAt[dstIP] = time.Now()
+	return true
+}
+
 func logUnprovenRoute(dstIP string, addr *net.UDPAddr) {
 	unprovenRouteMu.Lock()
 	if t, ok := unprovenRouteLog[dstIP]; ok && time.Since(t) < 30*time.Second {
@@ -581,7 +621,21 @@ func loadConfig() (*ClientConfig, error) {
 	// a full re-punch. Matches the mobile core's default. Override with
 	// keepalive_seconds if your NAT is unusually tight or unusually generous.
 	if cfg.KeepaliveSeconds == 0 {
-		cfg.KeepaliveSeconds = 20
+		// REVERTED from 20s. Raising this was a battery change, but the
+		// keepalive is not just a battery knob — it is the clock the whole
+		// liveness system is derived from:
+		//
+		//   routeLiveTimeout   = 2x  -> how long a dead route keeps being used
+		//   desyncQuietPeriod  = 1.5x -> how long a desynced session blackholes
+		//   NAT mapping refresh      -> how often the path is actually held open
+		//
+		// Doubling it doubled every one of those, and consumer/carrier NAT
+		// mappings routinely expire between 20s beacons. The measurable
+		// battery wins this session came from the allocation-free packet path,
+		// the gated LAN sweep, and moving directory gossip to a slow tick —
+		// none of which trade away connection quality. This one did, so it
+		// goes back.
+		cfg.KeepaliveSeconds = 10
 	}
 	if cfg.KeepaliveSeconds < 5 {
 		cfg.KeepaliveSeconds = 5
@@ -1372,14 +1426,55 @@ func myConnectCandidates() string {
 // off, so accepting them is safe (the Noise handshake authenticates peers,
 // not the transport address).
 func punchCandidates(candidateList string, kp keypair, psk []byte) {
+	// IS THIS PEER AT OUR SITE? If any candidate it advertises carries our
+	// OWN public IP, we sit behind the same NAT, and its private addresses
+	// may well be routable from here — real sites routinely span several
+	// subnets or VLANs (10.202.2.x and 10.202.3.x behind one address).
+	//
+	// If it is NOT same-site, its private candidates are unreachable BY
+	// DEFINITION: we are not on that LAN and never will be. Dialing them
+	// anyway was not merely wasted effort — addKnownPeer below makes every
+	// candidate PERMANENT, so holePunchRetryLoop re-dialed each dead address
+	// every 10s forever (backoff caps at 60s). One peer advertising four
+	// foreign LAN addresses therefore bought a periodic burst of Noise
+	// handshakes — an X25519 keygen and DH apiece, with retransmits — for
+	// the life of the process. On a phone that is a radio wake and a CPU
+	// spike every few seconds, which is felt as a connection that is fast
+	// and then jittery. handlePeerExchange has always applied this rule; the
+	// punch path simply never did.
+	sameSite := false
+	if selfPub := currentPublicEndpoint(); selfPub != "" {
+		if selfIP, _, err := net.SplitHostPort(selfPub); err == nil && selfIP != "" {
+			for _, c := range strings.Split(candidateList, ",") {
+				if h, _, err := net.SplitHostPort(strings.TrimSpace(c)); err == nil && h == selfIP {
+					sameSite = true
+					break
+				}
+			}
+		}
+	}
 	for _, c := range strings.Split(candidateList, ",") {
 		c = strings.TrimSpace(c)
 		if c == "" || !isPunchableAddr(c) {
 			continue
 		}
+		addr, _ := net.ResolveUDPAddr("udp", c)
+		if addr == nil {
+			continue
+		}
+		if !punchCandidateDialable(c, addr, sameSite) {
+			continue
+		}
 		addKnownPeer(c)
 		go connectToPeer(c, kp, psk)
 	}
+}
+
+// punchCandidateDialable reports whether a punch candidate could possibly be
+// reached from this host: public endpoints always, private ones only when they
+// are on a subnet we are attached to, or when the peer shares our public IP.
+func punchCandidateDialable(c string, addr *net.UDPAddr, sameSite bool) bool {
+	return isValidPeer(c) || isAttachedLANAddr(addr) || sameSite
 }
 
 
@@ -1782,6 +1877,31 @@ func parsePSK(pskStr string) ([]byte, error) {
 	return nil, fmt.Errorf("unsupported PSK format; use base64:<...>")
 }
 
+
+// setSocketBuffers raises the UDP socket buffers from the OS default.
+//
+// Darwin's default receive buffer is ~42 KB — at overlay speed-test rates
+// that is about ONE MILLISECOND of traffic. Any scheduling hiccup (a GC
+// cycle, another goroutine, thread preemption) overflows it, the kernel
+// silently drops the excess, and TCP inside the tunnel interprets the loss as
+// congestion and collapses its window — a fast start decaying into a jittery
+// sawtooth, with nothing in any log because the drop happens in the kernel.
+// Large buffers are the standard fix for Go userspace tunnels (wireguard-go
+// uses 7 MB). Descending attempts because the OS caps SO_RCVBUF/SO_SNDBUF
+// (kern.ipc.maxsockbuf on Darwin) and the cap varies by platform.
+func setSocketBuffers(c *net.UDPConn) {
+	for _, sz := range []int{7 << 20, 4 << 20, 2 << 20, 1 << 20, 512 << 10} {
+		if c.SetReadBuffer(sz) == nil {
+			break
+		}
+	}
+	for _, sz := range []int{7 << 20, 4 << 20, 2 << 20, 1 << 20, 512 << 10} {
+		if c.SetWriteBuffer(sz) == nil {
+			break
+		}
+	}
+}
+
 func udpListener(listenPort int) (*net.UDPConn, int, error) {
 	// Bind the wildcard address (IP == nil) on network "udp": Go opens a
 	// DUAL-STACK socket (IPV6_V6ONLY=0) where the OS supports it, so this one
@@ -1796,6 +1916,7 @@ func udpListener(listenPort int) (*net.UDPConn, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
+		setSocketBuffers(conn)
 		la := conn.LocalAddr().(*net.UDPAddr)
 		return conn, la.Port, nil
 	}
@@ -1808,6 +1929,7 @@ func udpListener(listenPort int) (*net.UDPConn, int, error) {
 			return nil, 0, err
 		}
 	}
+	setSocketBuffers(conn)
 	la := conn.LocalAddr().(*net.UDPAddr)
 	return conn, la.Port, nil
 }
@@ -1823,6 +1945,12 @@ var (
 	// allocates nothing per packet. A buffer returns to the pool as soon as
 	// WriteToUDP has copied it into the kernel (which it does synchronously).
 	framePool = sync.Pool{New: func() any { b := make([]byte, maxFrameSize); return &b }}
+	// compressPool does the same for the compressor's output, which used to be
+	// a fresh bytes.Buffer per packet.
+	compressPool = sync.Pool{New: func() any { b := make([]byte, maxFrameSize); return &b }}
+	// relayFramePool backs the discovery-flood frame built for every packet
+	// that has no learned route.
+	relayFramePool = sync.Pool{New: func() any { b := make([]byte, maxFrameSize); return &b }}
 
 	// lz4WriterPool / lz4ReaderPool recycle the LZ4 codecs (each carries
 	// sizable internal block buffers) so enabling compression doesn't allocate
@@ -1831,36 +1959,95 @@ var (
 	lz4ReaderPool = sync.Pool{New: func() any { return lz4.NewReader(nil) }}
 )
 
+// sliceWriter is an io.Writer that appends into a caller-owned buffer, so the
+// compressor can write into a POOLED slice. The bytes.Buffer it replaces
+// heap-allocated a fresh ~packet-sized buffer for every single datagram.
+type sliceWriter struct{ b []byte }
+
+func (w *sliceWriter) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
+
+var sliceWriterPool = sync.Pool{New: func() any { return new(sliceWriter) }}
+
+// compressSkip counts consecutive packets whose compression was not worth
+// keeping. LZ4 cannot shrink already-compressed bytes, and a VPN mostly
+// carries exactly that: TLS, video, a speed test's random payload. Without
+// this gate every one of those packets paid a full compression pass whose
+// output was then discarded — pure CPU and battery on a phone, right when
+// throughput matters most. After a run of failures we stop trying for a
+// while, then retry periodically so a stream that BECOMES compressible (or a
+// different peer's traffic) is still picked up.
+var compressSkip atomic.Int64
+
+// Sentinel errors, not errors.New at each return: these fire on EVERY packet
+// of an incompressible stream, and building a fresh error object per packet is
+// an allocation on the hot path for a value nobody reads.
+var (
+	errPayloadTooSmall   = errors.New("payload below MinSize, skipping compression")
+	errCompressBackedOff = errors.New("compression backed off: recent payloads were incompressible")
+	errCompressNoGain    = errors.New("compression not beneficial for this payload")
+)
+
+const (
+	compressGiveUpAfter = 32  // consecutive useless attempts before backing off
+	compressRetryEvery  = 512 // packets to skip before sampling again
+)
+
+// compressWorthTrying gates the compressor on its recent hit rate.
+func compressWorthTrying() bool {
+	n := compressSkip.Load()
+	if n < compressGiveUpAfter {
+		return true
+	}
+	// Backing off: sample one packet in compressRetryEvery.
+	return (n-compressGiveUpAfter)%compressRetryEvery == 0
+}
+
 func compressAndFrame(data []byte) ([]byte, error) {
+	out, err := compressAndFrameTo(nil, data)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), out...), nil
+}
+
+// compressAndFrameTo is compressAndFrame writing into a caller-supplied
+// buffer (nil is allowed and allocates). The returned slice aliases dst.
+func compressAndFrameTo(dst, data []byte) ([]byte, error) {
 	if len(data) < compressionCfg.MinSize {
-		return nil, errors.New("payload below MinSize, skipping compression")
+		return nil, errPayloadTooSmall
+	}
+	if !compressWorthTrying() {
+		compressSkip.Add(1)
+		return nil, errCompressBackedOff
 	}
 
-	var buf bytes.Buffer
-	buf.Grow(len(data))
-
-	buf.Write(compressedTag[:])
+	w := sliceWriterPool.Get().(*sliceWriter)
+	defer sliceWriterPool.Put(w)
+	w.b = append(dst[:0], compressedTag[:]...)
 
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
-	buf.Write(lenBuf[:])
+	w.b = append(w.b, lenBuf[:]...)
 
-	// Recycle the encoder; Reset re-points it at buf without allocating.
-	w := lz4WriterPool.Get().(*lz4.Writer)
-	w.Reset(&buf)
-	_, err := w.Write(data)
+	// Recycle the encoder; Reset re-points it at w without allocating.
+	lw := lz4WriterPool.Get().(*lz4.Writer)
+	lw.Reset(w)
+	_, err := lw.Write(data)
 	if err == nil {
-		err = w.Close()
+		err = lw.Close()
 	}
-	lz4WriterPool.Put(w)
+	lz4WriterPool.Put(lw)
 	if err != nil {
+		compressSkip.Add(1)
 		return nil, fmt.Errorf("lz4 compress: %w", err)
 	}
 
-	result := buf.Bytes()
+	result := w.b
 	if len(result) >= len(data) {
-		return nil, errors.New("compression not beneficial for this payload")
+		compressSkip.Add(1)
+		return nil, errCompressNoGain
 	}
+	compressSkip.Store(0)
 	return result, nil
 }
 
@@ -1912,13 +2099,17 @@ func sendPacket(conn *net.UDPConn, addr *net.UDPAddr, s *session, payload []byte
 	// since they bootstrap the layer and must travel classically. pqWrap is a
 	// no-op (returns !ok) until the layer is ready, so pre-PQ traffic is unchanged.
 	if pqEnabled && s != nil && !isPQNegotiation(payload) {
-		if w, ok := pqWrap(s.peerStatic, payload); ok {
+		pqb := pqWrapPool.Get().(*[]byte)
+		defer pqWrapPool.Put(pqb)
+		if w, ok := pqWrapTo((*pqb)[:0], s.peerStatic, payload); ok {
 			payload = w
 		}
 	}
 	toEncrypt := payload
 	if compressionCfg.Enabled {
-		if compressed, err := compressAndFrame(payload); err == nil {
+		cb := compressPool.Get().(*[]byte)
+		defer compressPool.Put(cb)
+		if compressed, err := compressAndFrameTo((*cb)[:0], payload); err == nil {
 			toEncrypt = compressed
 		}
 	}
@@ -1970,6 +2161,9 @@ func recvPacket(s *session, body []byte) ([]byte, error) {
 	}
 
 	if !s.replayCheck(nonce) {
+		// Counted: a rising number here means the anti-replay window is too
+		// narrow for the traffic, so legitimate reordering is being refused.
+		statRxReplayDrop.Add(1)
 		return nil, errors.New("replayed or expired nonce")
 	}
 
@@ -2038,8 +2232,32 @@ func (t *SessionTable) RoamData(raddr *net.UDPAddr, body []byte) bool {
 		if _, err := c.s.recv.Decrypt(nil, nil, ct); err != nil {
 			continue
 		}
-		// Authenticated → this peer moved. Re-key the session onto raddr.
+		// Authenticated. Before assuming the peer MOVED, rule out the much
+		// commoner case: it is still exactly where it was, and this frame
+		// simply took a second path that also happens to reach us.
+		//
+		// A peer on the same LAN is reachable twice over — at its LAN address,
+		// and through the router's hairpin at its public one. Both carry the
+		// same session keys, so a hairpin duplicate authenticates here just as
+		// convincingly as a genuine roam. Adopting it moved a live, same-wire
+		// session onto the router path: everything in flight to the old
+		// address was lost (the transfer stalls mid-stream), throughput
+		// collapsed to hairpin speed, and NOTHING in any UI changed, because
+		// it is the same session and the same peer key. ip_learning.Learn
+		// refuses this exact downgrade (rule 4); this path was going around it.
+		//
+		// So: only decline when the incumbent is STILL LIVE and the candidate
+		// is a strictly worse class of path. Genuine roaming is untouched —
+		// when a peer really moves, the old address stops decrypting, goes
+		// stale within routeLiveTimeout, and the next frame roams it. A
+		// same-or-better path (public -> public NAT rebind, anything -> LAN)
+		// is adopted immediately, as before.
 		old := c.s.addr
+		if old != nil && t.RouteIsLive(old) && routeClass(raddr) < routeClass(old) {
+			logRoamRefused(old, raddr)
+			return false
+		}
+		// This peer moved. Re-key the session onto raddr.
 		t.mu.Lock()
 		if cur, ok := t.byAddr[c.key]; ok && cur == c.s {
 			delete(t.byAddr, c.key)
@@ -2054,6 +2272,41 @@ func (t *SessionTable) RoamData(raddr *net.UDPAddr, body []byte) bool {
 		return true
 	}
 	return false
+}
+
+// logRoamRefused reports a declined downgrade, damped to one line per pair per
+// minute. Undamped this fires at packet rate: the sender floods a relay-wrapped
+// duplicate of every packet to every peer while a route is unproven, so a busy
+// transfer produces thousands of these a second and the log becomes useless
+// exactly when it is being read.
+var (
+	roamRefuseMu   sync.Mutex
+	roamRefuseLast = map[string]time.Time{}
+)
+
+func logRoamRefused(old, cand *net.UDPAddr) {
+	key := old.String() + ">" + cand.String()
+	roamRefuseMu.Lock()
+	last, seen := roamRefuseLast[key]
+	if seen && time.Since(last) < time.Minute {
+		roamRefuseMu.Unlock()
+		return
+	}
+	roamRefuseLast[key] = time.Now()
+	// Bounded: a node with many peers over a long uptime would otherwise grow
+	// this map without limit. Cheap because it only trips on a cold entry.
+	if len(roamRefuseLast) > 256 {
+		cutoff := time.Now().Add(-5 * time.Minute)
+		for k, t := range roamRefuseLast {
+			if t.Before(cutoff) {
+				delete(roamRefuseLast, k)
+			}
+		}
+	}
+	roamRefuseMu.Unlock()
+	log.Printf("[roam] declined %v -> %v: incumbent is live and on a better path "+
+		"(class %d vs %d) — this is a second path to the same peer, not a move",
+		old, cand, routeClass(old), routeClass(cand))
 }
 
 // buildAddrAnnounce returns an "OVLYCTL1A<ip>" control payload advertising
@@ -2216,7 +2469,25 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		}
 		if dst == myOverlayIP() {
 			// We were the destination all along (sender had no direct
-			// mapping yet). Deliver locally.
+			// mapping yet). Deliver locally — and LEARN THE RETURN ROUTE.
+			//
+			// The learn step is load-bearing. A raw data frame teaches it in
+			// the decrypt loop (ipLearning.Learn on the source IP), and the
+			// discovery flood used to send BOTH a raw copy and this relay
+			// frame, so the route was always learned by whichever arrived.
+			// Dropping the raw copy to halve flood bandwidth removed the only
+			// path that taught it: this branch delivered the payload but left
+			// us with no route back, so every reply fell into the flood again.
+			// Symptom: peers visible and "connected", traffic crawling or
+			// dropping, and a direct path that never establishes.
+			if src := extractIPv4Src(pkt); src != "" && src != myOverlayIP() {
+				ipLearning.Learn(src, raddr)
+				if s := GlobalSessions.GetByAddr(raddr); s != nil {
+					setPeerOverlayIP(s.peerStatic, src)
+				}
+			}
+			statRxRelayed.Add(1)
+			statRxDelivered.Add(1)
 			tunIF.Write(pkt)
 			return
 		}
@@ -2392,6 +2663,12 @@ func addKnownPeer(p string) {
 			return
 		}
 	}
+	// Nor an endpoint WE announced recently. Memorising one is what made this
+	// self-inflicted: the retry loop then re-dials our own dead past address
+	// on every pass, forever.
+	if wasSelfEndpoint(strings.TrimSpace(p)) {
+		return
+	}
 	knownPeersMu.Lock()
 	knownPeers[p] = time.Now()
 	knownPeersMu.Unlock()
@@ -2463,6 +2740,15 @@ func isValidPeer(addr string) bool {
 
 func isSelf(addr string, stunEndpoint string, listenPort int) bool {
 	if addr == stunEndpoint {
+		return true
+	}
+	// A FORMER incarnation of ourselves is still ourselves. Our UDP port is
+	// chosen fresh each start, but the endpoint we announced last time lives
+	// on in the tracker swarm for its whole announce interval — so without
+	// this we read our own dead address back and dial it (see
+	// selfendpoints.go). Restart-heavy hosts, i.e. every phone, accumulate
+	// several such ghosts at once.
+	if wasSelfEndpoint(addr) {
 		return true
 	}
 	if stunEndpoint == "" {
@@ -3548,11 +3834,13 @@ func main() {
 				// NoteDecryptFailure tears down only in that case, forcing a
 				// clean re-handshake instead of a minute-long blackhole.
 				logDecryptError(raddr.String(), err)
+				statRxDecryptFail.Add(1)
 				GlobalSessions.NoteDecryptFailure(raddr)
 				continue
 			}
 			// Successful decrypt is also liveness; refresh idle timer.
 			GlobalSessions.TouchLastSeen(raddr)
+			statRxData.Add(1)
 			// Post-quantum: peel the ML-KEM AEAD layer FIRST (once it's up we wrap
 			// EVERYTHING on a direct session — data, relayed/exit packets, and the
 			// control frames that gossip the admin key), so both control and data
@@ -3661,6 +3949,7 @@ func main() {
 					continue
 				}
 			}
+			statRxDelivered.Add(1)
 			tunIF.Write(pt)
 		}
 	}()
@@ -3737,7 +4026,15 @@ func main() {
 					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "egress") {
 						// PQ wrapping (if enabled + ready) happens inside sendPacket.
 						_ = sendPacket(udpConn, a, s, ip)
+						statTxDirect.Add(1)
 						if GlobalSessions.RouteIsLive(a) {
+							continue
+						}
+						// Unproven: fall through to the relay fallback, but
+						// only as an occasional PROBE. Duplicating every
+						// packet here is what turned a quiet route into a
+						// broadcast storm (see shouldProbeUnprovenRoute).
+						if !shouldProbeUnprovenRoute(dst) {
 							continue
 						}
 						logUnprovenRoute(dst, a)
@@ -3759,7 +4056,11 @@ func main() {
 			// coverage.) Whichever copy arrives first teaches the destination
 			// our return path, and its reply teaches us the forward path — so
 			// the mesh converges on the fastest working route automatically.
-			relayFrame := append(append(append([]byte{}, ctlMagic...), 'R'), ip...)
+			// Pooled: this is built for EVERY packet with no learned route —
+			// exactly the state a struggling client is stuck in — and the old
+			// triple append allocated (and grew) a fresh buffer each time.
+			rfp := relayFramePool.Get().(*[]byte)
+			relayFrame := append(append(append((*rfp)[:0], ctlMagic...), 'R'), ip...)
 
 			// Coordinated-connect: while relaying keeps traffic flowing,
 			// also try to UPGRADE to a direct path. Emit a connect-request
@@ -3788,11 +4089,16 @@ func main() {
 				// Admitted peers only.
 				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && admissionOK(s.peerStatic, "egress-flood") {
 					_ = sendPacket(udpConn, addr, s, relayFrame)
+					statTxFlood.Add(1)
 					if connectReq != nil {
 						_ = sendPacket(udpConn, addr, s, connectReq)
 					}
 				}
 			}
+			// Explicit Put, not defer: this is a per-iteration buffer inside
+			// the TUN read loop, and a defer here would hold every buffer
+			// until the goroutine exits — i.e. forever.
+			relayFramePool.Put(rfp)
 		}
 	}()
 
@@ -3803,9 +4109,13 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
+	loadSelfEndpoints()
+	rememberSelfEndpointsAt("", port)
+
 	pub, err := fetchPublicEndpoint(udpConn, cfg.STUNServers, 10*time.Second)
 	if err == nil {
 		lastPublicIP = pub
+		rememberSelfEndpointsAt(pub, port)
 		log.Printf("Public endpoint: %s", pub)
 	} else {
 		log.Printf("STUN failed: %v (will announce with local port %d as fallback)", err, port)
@@ -4012,6 +4322,7 @@ func main() {
 			// Frames identical for every recipient are also built ONCE per
 			// tick (they used to be re-marshalled per peer).
 			var rosterFrame, pqStatus, seed, sealed []byte
+			warnIfSelfUnapproved()
 			if heavy {
 				rosterFrame = buildRosterFrame()
 				pqStatus = buildPQStatus()
@@ -4255,6 +4566,7 @@ func main() {
 				lastAnnounceTime = time.Now()
 			}
 			lastPublicIP = pubNow
+			rememberSelfEndpointsAt(pubNow, myUDPPort)
 			mu.Unlock()
 		}
 	}

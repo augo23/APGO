@@ -112,14 +112,6 @@ type SessionInfo struct {
 	PostQuantum  bool   `json:"post_quantum"` // peer's advertised live PQ state
 	Established  bool   `json:"established"`
 	Exit         bool   `json:"exit"`        // peer advertises as an internet exit node
-	ExitFailed   bool   `json:"exit_failed"` // peer WANTS to be an exit but its NAT setup failed (gossiped)
-	V6           bool   `json:"v6"`          // peer has a globally routable IPv6 transport address (gossiped)
-	// IPDerived: the overlay IP shown is a GUESS derived from the peer's
-	// public key, because it has not announced one and no admin provision
-	// exists. It is the address that peer WOULD get by default, but it is
-	// unconfirmed — showing a guess identically to a known address is exactly
-	// how a peer appears to have "the wrong IP".
-	IPDerived    bool   `json:"ip_derived"`
 	ActiveExit   bool   `json:"active_exit"` // the exit THIS device currently egresses through
 	Relayed      bool   `json:"relayed"`     // reachable only via a relay (no direct session)
 	Via          string `json:"via"`         // relayed rows: the relaying node (overlay IP or endpoint)
@@ -344,31 +336,16 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				}
 			}
 		}
-		derived := false
 		if ip == "" && overlayCIDR != "" && r.key != ([32]byte{}) {
 			if d, err := deriveOverlayIP(overlayCIDR, r.key); err == nil {
 				ip = stripMask(d)
-				derived = true // a guess, not an announced address
 			}
 		}
 		info.OverlayIP = ip
-		info.IPDerived = derived
 		info.Name = peerNameByPub(r.key)
 		info.Approved = admitted(r.key)
 		info.PostQuantum = peerPQByPub(r.key)
 		info.Exit, info.ActiveExit = exitStatusFor(r.key)
-		// Merge the gossiped roster view into the direct row. Exit capability
-		// deliberately has REDUNDANT paths to the UI: the peer's own 'E'
-		// announce over this session, its self-report in its roster, and
-		// every OTHER node's roster view of it. Any one of them lights the
-		// green E — so one flaky link can't hide the only exit on the mesh.
-		// (exitStatusFor stays authoritative for ACTIVE exit selection; the
-		// roster only widens what is DISPLAYED.) A failed exit never
-		// announces at all, so its failure flag can ONLY come from gossip.
-		if rv, ok := rosterLookup(ip); ok {
-			info.Exit = info.Exit || rv.Exit
-			info.ExitFailed = rv.ExitErr
-		}
 		out = append(out, info)
 	}
 
@@ -435,10 +412,8 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 			// each hop is its own PQ-wrapped session; only the DISPLAY was
 			// blind).
 			pq := false
-			exitCap := false
 			if key != ([32]byte{}) {
 				pq = peerPQByPub(key)
-				exitCap, _ = exitStatusFor(key)
 			}
 			// pubKey is what the admin UI needs to ACT on this row — rename,
 			// revoke and approve are all addressed to the full static key, and
@@ -459,11 +434,6 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				}
 				if !pq {
 					pq = r.PQ
-				}
-				// Exit capability travels in the roster for the same reason
-				// PQ does: the 'E' announce only flows over direct sessions.
-				if !exitCap {
-					exitCap = r.Exit
 				}
 			}
 			// The same DEVICE may already be listed directly under a
@@ -507,8 +477,6 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				PubKey:       pubKey,
 				Approved:     admittedB64(pubKey),
 				PostQuantum:  pq,
-				Exit:         exitCap,
-				ExitFailed:   func() bool { rv, ok := rosterLookup(e.IP); return ok && rv.ExitErr }(),
 				Established:  false,
 				Relayed:      true,
 				Via:          via,
@@ -580,8 +548,6 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 				PubKey:       pubKey,
 				Approved:     admittedB64(pubKey),
 				PostQuantum:  e.PQ,
-				Exit:         e.Exit,
-				ExitFailed:   e.ExitErr,
 				Established:  false,
 				Relayed:      true,
 				LastSeenUnix: e.Seen.Unix(),
@@ -968,11 +934,6 @@ func startControlServer(socketPath string) {
 			"psk":                gPSKString,
 			"overlay_cidr":       overlayCIDR,
 			"rendezvous_servers": gRendezvous,
-			"rendezvous_auth":    gRendezvousCred,
-			// Parity with the desktop client's /api/info: a phone must report
-			// its own IPv6 capability too, or every panel that reaches it via
-			// relay draws its own conclusion from a missing field.
-			"ipv6_global": hasGlobalIPv6(),
 			// Top trackers so a scanned phone uses this network's discovery
 			// (incl. any private tracker), capped to keep the QR scannable.
 			"trackers": topN(currentTrackers(), 8),

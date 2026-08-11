@@ -57,21 +57,6 @@ type rosterEntry struct {
 	// sessions, so relayed rows used to show PQ off even when the node had
 	// it on for every hop).
 	PQ bool `json:"pq,omitempty"`
-	// Exit: the node can be an internet exit for the VPN relay. Same rationale
-	// as PQ: 'E' announces only flow over DIRECT sessions, so a device that
-	// reaches the exit through a relay showed no green E for it — on small
-	// meshes (a phone + a NATed exit) that hid the ONLY exit that existed.
-	Exit bool `json:"exit,omitempty"`
-	// ExitErr: the node WANTED to be an exit but its NAT setup failed, so it
-	// refuses to advertise. Carried in the gossip so every OTHER dashboard
-	// can badge it — without this, the answer to "why is there no E for that
-	// node" lived exclusively in the failing node's own log/panel.
-	ExitErr bool `json:"exit_err,omitempty"`
-	// V6: the node has a globally routable IPv6 transport address. Gossiped
-	// so any dashboard can answer "would IPv6 fix this relayed pair?" using
-	// facts about BOTH ends. Must stay in sync with client/roster.go — the
-	// two cores exchange these frames with each other.
-	V6 bool `json:"v6,omitempty"`
 }
 
 // rosterView is one live roster entry plus when we last heard it advertised.
@@ -93,11 +78,8 @@ func buildRosterFrame() []byte {
 	if myOverlayIP != "" {
 		entries = append(entries, rosterEntry{
 			IP: myOverlayIP, Name: getMyFriendlyName(), FP: peerKeyFingerprint(gKP.pub[:]),
-			PK:      base64.StdEncoding.EncodeToString(gKP.pub[:]),
-			PQ:      pqEnabled,
-			Exit:    amExit,
-			ExitErr: exitNATErr != "",
-			V6:      hasGlobalIPv6(),
+			PK: base64.StdEncoding.EncodeToString(gKP.pub[:]),
+			PQ: pqEnabled,
 		})
 		seen[myOverlayIP] = true
 	}
@@ -111,22 +93,10 @@ func buildRosterFrame() []byte {
 			continue
 		}
 		seen[ip] = true
-		peerIsExit, _ := exitStatusFor(s.peerStatic)
-		// Carry the peer's OWN gossiped flags forward, or they only survive
-		// one hop and every node further away sees false (a v6-capable node
-		// shown as "no v6" to anyone reaching it via relay).
-		var peerV6, peerExitErr bool
-		if rv, ok := rosterLookup(ip); ok {
-			peerV6, peerExitErr = rv.V6, rv.ExitErr
-			peerIsExit = peerIsExit || rv.Exit
-		}
 		entries = append(entries, rosterEntry{
 			IP: ip, Name: resolvePeerName(s.peerStatic), FP: peerKeyFingerprint(s.peerStatic[:]),
-			PK:      base64.StdEncoding.EncodeToString(s.peerStatic[:]),
-			PQ:      peerPQByPub(s.peerStatic),
-			Exit:    peerIsExit,
-			ExitErr: peerExitErr,
-			V6:      peerV6,
+			PK: base64.StdEncoding.EncodeToString(s.peerStatic[:]),
+			PQ: peerPQByPub(s.peerStatic),
 		})
 		if len(entries) >= rosterMaxEntries {
 			break
@@ -205,21 +175,6 @@ func handleRoster(payload []byte) {
 			if e.PK == "" {
 				e.PK = cur.PK
 			}
-			// CAPABILITY FLAGS ARE STICKY (true wins).
-			//
-			// These arrive from two kinds of sender: the node ITSELF (which
-			// knows the truth) and third parties relaying what they know
-			// (which may be stale, or an older build that sends nothing at
-			// all). Letting a second-hand `false` overwrite a known `true`
-			// makes the flags flicker with whichever neighbour gossiped last
-			// — a v6-capable node would blink between "v6" and "no v6" as
-			// different rosters arrived. Entries expire on rosterTTL, so a
-			// capability that genuinely goes away still clears within a
-			// couple of minutes.
-			e.PQ = e.PQ || cur.PQ
-			e.Exit = e.Exit || cur.Exit
-			e.ExitErr = e.ExitErr || cur.ExitErr
-			e.V6 = e.V6 || cur.V6
 		} else {
 			sawNew = true
 		}

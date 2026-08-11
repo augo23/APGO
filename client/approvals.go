@@ -37,6 +37,31 @@ func canonicalApproval(action, pubB64 string, seq, ts int64) string {
 
 // admissionRequired reports whether admission control is active — i.e. the
 // network has an admin key (so new devices must be approved).
+// warnIfSelfUnapproved says so, loudly and at most once a minute, because the
+// symptom otherwise looks like anything but what it is.
+var (
+	selfApprovalWarnMu   sync.Mutex
+	selfApprovalWarnLast time.Time
+)
+
+func warnIfSelfUnapproved() {
+	if selfApproved() {
+		return
+	}
+	selfApprovalWarnMu.Lock()
+	if time.Since(selfApprovalWarnLast) < time.Minute {
+		selfApprovalWarnMu.Unlock()
+		return
+	}
+	selfApprovalWarnLast = time.Now()
+	selfApprovalWarnMu.Unlock()
+	log.Printf("[admission] THIS DEVICE IS NOT APPROVED on this network (key %s). "+
+		"Peers that enforce admission accept our control traffic — so we appear "+
+		"normally in their peer list — but SILENTLY DISCARD all data: services on "+
+		"those nodes will be unreachable from here while everything looks connected. "+
+		"Approve this device in the admin panel.", peerKeyFingerprint(gKP.pub[:]))
+}
+
 func admissionRequired() bool {
 	return adminKeySet()
 }

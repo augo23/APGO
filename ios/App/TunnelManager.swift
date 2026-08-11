@@ -150,76 +150,6 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// This device's own transport situation. `natType` is the one that
-    /// explains a permanent relay: two symmetric NATs cannot punch to each
-    /// other at all, so that pair relays forever regardless of settings.
-    struct NetStatus: Decodable {
-        let natType: String
-        let publicEndpoint: String
-        let ipv6: Bool
-        let candidates: String
-        enum CodingKeys: String, CodingKey {
-            case natType = "nat_type", publicEndpoint = "public_endpoint", ipv6, candidates
-        }
-    }
-
-    func fetchNetStatus() async -> NetStatus? {
-        guard status == .connected,
-              let session = manager?.connection as? NETunnelProviderSession else { return nil }
-        return await withCheckedContinuation { (cont: CheckedContinuation<NetStatus?, Never>) in
-            do {
-                try session.sendProviderMessage(Data("netstatus".utf8)) { resp in
-                    guard let resp = resp,
-                          let v = try? JSONDecoder().decode(NetStatus.self, from: resp) else {
-                        cont.resume(returning: nil); return
-                    }
-                    cont.resume(returning: v)
-                }
-            } catch { cont.resume(returning: nil) }
-        }
-    }
-
-    /// Full-VPN outproxy diagnostics from the running extension: which exits
-    /// this device has heard about, their reachability/latency, and which is
-    /// selected. nil on a transient IPC failure.
-    struct ExitsView: Decodable {
-        struct ExitRow: Decodable {
-            let overlayIP: String
-            let name: String
-            let rttMs: Int64
-            let reachable: Bool
-            let selected: Bool
-            enum CodingKeys: String, CodingKey {
-                case overlayIP = "overlay_ip", name, rttMs = "rtt_ms", reachable, selected
-            }
-        }
-        let useExit: Bool
-        let pin: String
-        let exits: [ExitRow]
-        enum CodingKeys: String, CodingKey {
-            case useExit = "use_exit", pin, exits
-        }
-    }
-
-    func fetchExits() async -> ExitsView? {
-        guard status == .connected,
-              let session = manager?.connection as? NETunnelProviderSession else { return nil }
-        return await withCheckedContinuation { (cont: CheckedContinuation<ExitsView?, Never>) in
-            do {
-                try session.sendProviderMessage(Data("exits".utf8)) { resp in
-                    guard let resp = resp,
-                          let v = try? JSONDecoder().decode(ExitsView.self, from: resp) else {
-                        cont.resume(returning: nil)
-                        return
-                    }
-                    cont.resume(returning: v)
-                }
-            } catch {
-                cont.resume(returning: nil)
-            }
-        }
-    }
-
     /// Ask the running tunnel extension whether an admin has assigned this
     /// device a NEW overlay address (returns the pending CIDR, or "" if none).
     /// The extension's Go core receives the signed provision over the mesh but
@@ -272,7 +202,6 @@ struct Peer: Decodable, Identifiable {
     let keyFP: String
     let established: Bool
     let postQuantum: Bool
-    let ipDerived: Bool    // the overlay IP is a key-derived GUESS, not announced
     let isExit: Bool       // peer advertises as an internet exit node
     let activeExit: Bool   // the exit THIS device currently egresses through
     let relayed: Bool      // reachable only via a relay (no direct session)
@@ -286,7 +215,6 @@ struct Peer: Decodable, Identifiable {
         case keyFP = "key_fp"
         case established
         case postQuantum = "post_quantum"
-        case ipDerived = "ip_derived"
         case isExit = "exit"
         case activeExit = "active_exit"
         case relayed
@@ -302,7 +230,6 @@ struct Peer: Decodable, Identifiable {
         keyFP = (try? c.decode(String.self, forKey: .keyFP)) ?? ""
         established = (try? c.decode(Bool.self, forKey: .established)) ?? false
         postQuantum = (try? c.decode(Bool.self, forKey: .postQuantum)) ?? false
-        ipDerived = (try? c.decode(Bool.self, forKey: .ipDerived)) ?? false
         isExit = (try? c.decode(Bool.self, forKey: .isExit)) ?? false
         activeExit = (try? c.decode(Bool.self, forKey: .activeExit)) ?? false
         relayed = (try? c.decode(Bool.self, forKey: .relayed)) ?? false

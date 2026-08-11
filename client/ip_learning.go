@@ -40,10 +40,34 @@ func (t *IPLearning) evictLoop() {
 	}
 }
 
+
+// sameUDPAddr compares two endpoints without building their string forms.
+// UDPAddr.String() allocates, and the comparison it was used for sits on the
+// per-packet receive path.
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
 func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if e, ok := t.m[ip]; ok && e.addr.String() != addr.String() {
+	if e, ok := t.m[ip]; ok {
+		// STEADY STATE, and it is the overwhelming majority of calls: this
+		// runs on EVERY received data packet, and the route almost always
+		// matches the one already recorded. Refresh in place and return.
+		//
+		// The previous shape fell through to the allocation below even when
+		// nothing had changed, and reached it via two UDPAddr.String() calls
+		// — so every packet a phone received cost three allocations and two
+		// string builds inside a global mutex. sameUDPAddr compares the
+		// fields directly and allocates nothing.
+		if sameUDPAddr(e.addr, addr) {
+			e.seen = time.Now()
+			return
+		}
 		// ROUTE-CLASS PREFERENCE. Routes to an overlay IP come in classes:
 		//
 		//   direct — a session whose peer key OWNS ip (it is the device itself)

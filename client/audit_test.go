@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -252,4 +253,90 @@ func TestOverlayEndpointBlockedAtEveryStage(t *testing.T) {
 	found := false
 	for _, p := range list { if p == good { found = true } }
 	if !found { t.Errorf("stage 4: real endpoint should be remembered, got %v", list) }
+}
+
+// Any state that EXPIRES must be refreshed several times within its own
+// lifetime, or normal UDP loss makes it disappear. This is a real regression
+// guard: moving roster gossip from the keepalive tick to the ~60s "heavy"
+// tick (a battery change) left rosterTTL at 2 minutes — a 2x margin — and
+// peers began flickering out of the peer list whenever a frame was lost.
+func TestExpiringStateHasRefreshMargin(t *testing.T) {
+	// How often the heavy tick fires, for the keepalive values we ship.
+	heavyInterval := func(ka time.Duration) time.Duration {
+		every := int(time.Minute / ka)
+		if every < 1 {
+			every = 1
+		}
+		return time.Duration(every) * ka
+	}
+	const minMargin = 3.0 // survive at least two consecutive lost frames
+
+	for _, ka := range []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second} {
+		refresh := heavyInterval(ka)
+		margin := rosterTTL.Seconds() / refresh.Seconds()
+		if margin < minMargin {
+			t.Errorf("keepalive=%v: roster refreshed every %v but expires after %v — only %.1fx margin; "+
+				"one or two lost datagrams would drop peers from the list",
+				ka, refresh, rosterTTL, margin)
+		}
+	}
+	// The gossip cadence is what it is; the TTL is the knob. Guard the
+	// relationship rather than the constant, so changing either is safe.
+	if rosterTTL <= time.Minute {
+		t.Errorf("rosterTTL=%v is at or below the heavy-tick interval — entries would expire between refreshes", rosterTTL)
+	}
+}
+
+// A peer's overlay address must come from what the NETWORK says, not from a
+// guess, whenever the network has said anything at all.
+//
+// The bug: a node whose address comes from config (OVERLAY_ADDRESS) rather
+// than an admin provision publishes it only in its keepalive announce and its
+// roster self-entry. If the announce had not arrived, resolution fell straight
+// through to deriveOverlayIP and displayed an address nothing answers on —
+// while the correct, pingable address sat unused in the roster.
+func TestRosterBeatsKeyDerivationForPeerIP(t *testing.T) {
+	setOverlay(t, "10.22.22.0/24")
+	var pub [32]byte
+	copy(pub[:], []byte("k8s-node-key-0123456789abcdefgh!"))
+
+	// Nothing known yet -> a derived guess is the only option.
+	rosterMu.Lock(); rosterNodes = map[string]rosterView{}; rosterMu.Unlock()
+	guess := resolvePeerIP(pub)
+	if guess == "" {
+		t.Fatal("with nothing known, a derived address should still be produced")
+	}
+
+	// Now the node gossips its REAL configured address.
+	const real = "10.22.22.22"
+	rosterMu.Lock()
+	rosterNodes[real] = rosterView{
+		rosterEntry: rosterEntry{
+			IP: real,
+			FP: peerKeyFingerprint(pub[:]),
+			PK: base64.StdEncoding.EncodeToString(pub[:]),
+		},
+		Seen: time.Now(),
+	}
+	rosterMu.Unlock()
+	defer func() { rosterMu.Lock(); rosterNodes = map[string]rosterView{}; rosterMu.Unlock() }()
+
+	got := resolvePeerIP(pub)
+	if got != real {
+		t.Errorf("roster says %s but resolution returned %q (guess was %q) — the peer would be "+
+			"listed at an address nothing answers on", real, got, guess)
+	}
+	if got == guess {
+		t.Errorf("the gossiped address must win over the derived one; both were %q", got)
+	}
+	// And by key fingerprint alone (older peers omit the full pubkey).
+	rosterMu.Lock()
+	rosterNodes[real] = rosterView{
+		rosterEntry: rosterEntry{IP: real, FP: peerKeyFingerprint(pub[:])},
+		Seen:        time.Now(),
+	}
+	rosterMu.Unlock()
+	if got := rosterIPByKey(pub); got != real {
+		t.Errorf("fingerprint-only roster entry should resolve to %s, got %q", real, got)
+	}
 }

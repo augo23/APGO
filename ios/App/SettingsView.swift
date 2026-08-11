@@ -27,14 +27,6 @@ struct SettingsView: View {
     @State private var trackersText = ""
     @State private var trackersLoadedText = ""
 
-    // Rendezvous editor state. The credential is stored as ONE string
-    // ("user:pass" or a bare token) but edited as two fields, because a single
-    // box that means two different things depending on whether it contains a
-    // colon is a UI nobody can use correctly.
-    @State private var rendezvousText = ""
-    @State private var rendezvousUser = ""
-    @State private var rendezvousPass = ""
-
     var body: some View {
         NavigationStack {
             Form {
@@ -99,27 +91,6 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
-                // Rendezvous: HTTPS discovery for networks that block
-                // BitTorrent. Normally arrives via the join QR (servers AND
-                // credential), but must be enterable by hand too — a phone
-                // added without a QR, or a server whose password rotated.
-                Section("Rendezvous servers") {
-                    TextEditor(text: $rendezvousText)
-                        .font(.footnote.monospaced())
-                        .frame(minHeight: 60)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    Text("One HTTPS URL per line, e.g. https://rv.example.com — used instead of (or alongside) trackers where BitTorrent is blocked.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    TextField("Username or token", text: $rendezvousUser)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    SecureField("Password (leave blank if using a token)", text: $rendezvousPass)
-                    Text("Only if your rendezvous server requires a credential. Enter a username AND password, or just a token in the first box. Sent over HTTPS.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-
                 Section("Trackers") {
                     TextEditor(text: $trackersText)
                         .font(.footnote.monospaced())
@@ -159,7 +130,6 @@ struct SettingsView: View {
                     Button("Done") {
                         config.applyLastOctet(octet)
                         commitTrackers()
-                        commitRendezvous()
                         dismiss()
                     }
                 }
@@ -175,18 +145,8 @@ struct SettingsView: View {
                     : config.trackers
                 trackersText = list.joined(separator: "\n\n")
                 trackersLoadedText = trackersText
-                rendezvousText = config.rendezvousServers.joined(separator: "\n")
-                // Split the stored credential back into the two fields.
-                let cred = config.rendezvousAuth
-                if let colon = cred.firstIndex(of: ":") {
-                    rendezvousUser = String(cred[cred.startIndex..<colon])
-                    rendezvousPass = String(cred[cred.index(after: colon)...])
-                } else {
-                    rendezvousUser = cred
-                    rendezvousPass = ""
-                }
             }
-            .onDisappear { commitTrackers(); commitRendezvous() }   // swipe-down dismiss too
+            .onDisappear { commitTrackers() }   // swipe-down dismiss too
         }
     }
 
@@ -205,21 +165,6 @@ struct SettingsView: View {
         trackersLoadedText = trackersText
     }
 
-    /// Commit the rendezvous editor: one URL per line, and recombine the
-    /// username/password fields into the single credential string the core
-    /// takes ("user:pass" for Basic, bare token for Bearer, "" for none).
-    private func commitRendezvous() {
-        var seen = Set<String>()
-        config.rendezvousServers = rendezvousText
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && seen.insert($0).inserted }
-
-        let u = rendezvousUser.trimmingCharacters(in: .whitespacesAndNewlines)
-        let p = rendezvousPass.trimmingCharacters(in: .whitespacesAndNewlines)
-        config.rendezvousAuth = p.isEmpty ? u : "\(u):\(p)"
-    }
-
     /// Fill the form from a scanned "join QR" (admin panel → Join QR).
     private func applyScannedCode(_ code: String) {
         guard let jc = JoinCode.parse(code) else {
@@ -231,9 +176,6 @@ struct SettingsView: View {
         config.psk = jc.psk
         if let cidr = jc.overlay_cidr, !cidr.isEmpty { config.overlayCIDR = cidr }
         config.rendezvousServers = jc.rendezvous_servers ?? []
-        // Credential for rendezvous servers that require one — carried by the
-        // QR so joining stays "scan and go" even on an authenticated server.
-        config.rendezvousAuth = jc.rendezvous_auth ?? ""
         // Adopt this network's trackers (incl. any private tracker); the core
         // still unions in its curated defaults on top.
         if let t = jc.trackers, !t.isEmpty { config.trackers = t }

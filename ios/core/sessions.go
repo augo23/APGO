@@ -18,7 +18,7 @@ const sessionIdleTimeout = 5 * time.Minute
 const sessionEvictInterval = 15 * time.Second
 
 // gKeepaliveInterval / sessionStaleTimeout are set from keepalive_seconds at
-// startup (defaults: 20s / 75s). Both sides keepalive every interval, so an
+// startup (defaults: 10s / 45s). Both sides keepalive every interval, so an
 // ESTABLISHED session with no inbound for sessionStaleTimeout has a dead or
 // one-way path (blocked inbound, expired NAT mapping, rebooted peer, …).
 // Tearing it down promptly — instead of waiting out sessionIdleTimeout —
@@ -26,8 +26,8 @@ const sessionEvictInterval = 15 * time.Second
 // rebuild a working path within seconds on ANY kind of network, rather than
 // blackholing traffic for up to 5 minutes.
 var (
-	gKeepaliveInterval  = 20 * time.Second
-	sessionStaleTimeout = 75 * time.Second
+	gKeepaliveInterval  = 10 * time.Second
+	sessionStaleTimeout = 45 * time.Second
 )
 
 // Retransmit / deadline knobs for the handshake state machines.

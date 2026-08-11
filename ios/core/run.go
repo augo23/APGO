@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/flynn/noise"
@@ -42,12 +41,6 @@ func applyRuntimeConfig(cfg *ClientConfig) {
 // injected instead of created, and shutdown driven by the stop channel instead
 // of OS signals.
 func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error {
-	// Must run BEFORE anything resolves a hostname. In full-VPN mode the
-	// system resolver hands lookups to mDNSResponder, whose traffic goes
-	// through this very tunnel — so with no exit selected yet, DNS dies and
-	// with it every route out of that state (see resolver.go). Armed only
-	// when full-VPN is on; ordinary runs keep the system resolver.
-	setupBootstrapResolver(cfg.UseExit)
 	applyRuntimeConfig(cfg)
 
 	// An admin-signed network name/PSK rotation (compromise recovery) overrides
@@ -60,8 +53,6 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	ipv6Enabled = cfg.IPv6
 	applyPolicyFile() // admin-signed network policy overrides the PQ default
 	gConfigTrackers = cfg.Trackers
-	gRendezvous = cfg.RendezvousServers
-	gRendezvousCred = strings.TrimSpace(cfg.RendezvousAuth)
 	gTrackerFile = cfg.TrackerListFile
 	if gTrackerFile == "" {
 		gTrackerFile = trackerFilePath()
@@ -315,29 +306,16 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 
 			var connectReq []byte
 			if dst != "" && dst != myOverlayIP {
-				// Order matters for CPU: shouldTryConnect is a cheap
-				// map+clock check and rejects ~all of the time (one attempt
-				// per destination per 15s), while myConnectCandidates walks
-				// every network interface and builds a string. Testing the
-				// cheap gate FIRST turns "enumerate all interfaces for every
-				// packet to an unknown destination" — a burst of them during
-				// any discovery flood — into one enumeration per 15s.
-				if shouldTryConnect(dst) {
-					if myCands := myConnectCandidates(); myCands != "" {
-						connectReq = buildConnectFrame('C', dst, myOverlayIP, myCands)
-					}
+				if myCands := myConnectCandidates(); myCands != "" && shouldTryConnect(dst) {
+					connectReq = buildConnectFrame('C', dst, myOverlayIP, myCands)
 				}
 			}
 
 			for _, addr := range GlobalSessions.EstablishedAddrs() {
-				// Discovery flood — admitted peers only. The 'R' relay frame
-				// covers BOTH roles in one packet: a peer that IS the
-				// destination delivers it locally, and a peer that can reach
-				// the destination forwards it one hop. (A raw copy used to be
-				// flooded alongside, doubling the radio cost of every
-				// discovery flood for zero additional coverage — on a phone
-				// that is pure battery burn.)
+				// Broadcast of real payload to every direct peer — the easiest
+				// place to leak data to a pending device. Admitted peers only.
 				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && admissionOK(s.peerStatic, "egress-flood") {
+					_ = sendPacket(udpConn, addr, s, ip)
 					_ = sendPacket(udpConn, addr, s, relayFrame)
 					if connectReq != nil {
 						_ = sendPacket(udpConn, addr, s, connectReq)
@@ -414,14 +392,7 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			case <-ticker.C:
 			}
 			tickN++
-			// First tick + every ~minute. The `slowGossipEvery == 1` guard is
-			// NOT redundant: with a keepalive of 60s or more slowGossipEvery
-			// is 1, and tickN%1 is always 0, so the plain modulo test meant
-			// heavy gossip NEVER ran on such a node. (The desktop client was
-			// fixed for this; the mobile core still had the original test —
-			// and now that the roster/PEX/PQ-status frames ride on the heavy
-			// tick, that bug would have silenced them completely.)
-			heavy := slowGossipEvery == 1 || tickN%slowGossipEvery == 1
+			heavy := tickN%slowGossipEvery == 1
 			// Rebuild the keepalive payload each tick (matches the desktop
 			// client) so a live overlay-address change is reflected
 			// immediately instead of advertising the stale IP forever.
@@ -430,24 +401,8 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				keepalive = append(keepalive, ip.To4()...)
 			}
 			exitAd := buildExitAnnounce()
-			// BATTERY: only the KEEPALIVE has to run at the keepalive cadence
-			// — that is what holds the NAT mapping open. Everything else here
-			// is DIRECTORY state (peer exchange, roster, PQ status) that
-			// nobody needs fresher than ~a minute, and each one is another
-			// packet per peer per tick with the radio powered up.
-			//
-			// Before: keepalive + PEX + roster + PQ-status = 4 packets per
-			// peer, every 25s, forever. Now: 1 packet per peer per tick, plus
-			// the directory set once a minute. On a 6-peer mesh that is ~24
-			// radio-waking sends a minute down to ~9 — the single biggest
-			// remaining drain in the idle steady state.
-			//
-			// Frames identical for every recipient are also built ONCE per
-			// tick (they used to be re-marshalled per peer).
-			var rosterFrame, pqStatus, seed, sealed []byte
+			var seed, sealed []byte
 			if heavy {
-				rosterFrame = buildRosterFrame()
-				pqStatus = buildPQStatus()
 				seed = buildAdminSeed()
 				sealed = buildSealedKeyFrame()
 			}
@@ -466,47 +421,24 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				if exitAd != nil {
 					_ = sendPacket(GlobalConn, addr, s, exitAd)
 				}
-				// PEX carries ENDPOINTS, so it is connectivity machinery, not
-				// directory decoration: it is how a peer learns the addresses
-				// to punch. Keep it on the fast tick — slowing it down
-				// directly slows how fast a phone finds a working path.
-				// (Per-recipient: same-site peers also get LAN endpoints.)
+				// PEX is per-recipient: same-site peers also get LAN endpoints.
 				if pex := buildPeerExchangeFor(addr); pex != nil {
 					_ = sendPacket(GlobalConn, addr, s, pex)
 				}
-				// Roster + PQ status are DISPLAY state — who exists, what
-				// their PQ/exit flags are. Nobody needs those fresher than a
-				// minute, and new peers get the full set instantly on connect.
-				if heavy {
-					if rosterFrame != nil {
-						_ = sendPacket(GlobalConn, addr, s, rosterFrame)
-					}
-					if pqStatus != nil {
-						_ = sendPacket(GlobalConn, addr, s, pqStatus)
-					}
+				// Roster gossip: us + our direct peers, so every node keeps a
+				// steady directory of the network (relay-only peers included).
+				if roster := buildRosterFrame(); roster != nil {
+					_ = sendPacket(GlobalConn, addr, s, roster)
 				}
-				// PQ negotiation is NOT directory state — it gates encryption
-				// coming up, and it stops by itself once ready, so it keeps
-				// the fast cadence.
 				if pqEnabled && pqInitiator(s.peerStatic) && !pqReady(s.peerStatic) {
 					if offer := buildPQOffer(s.peerStatic); offer != nil {
 						_ = sendPacket(GlobalConn, addr, s, offer)
 					}
 				}
+				_ = sendPacket(GlobalConn, addr, s, buildPQStatus())
 			}
 			// Upgrade roster-known nodes without a direct session to direct
-			// (relayed punch signaling). Runs on EVERY tick, deliberately.
-			//
-			// This is the engine that turns a relayed peer into a direct one,
-			// and it is the difference between "connected but nothing works
-			// well" and a healthy mesh. Moving it to the slow tick to save
-			// battery was a bad trade: it stretched relay→direct convergence
-			// from ~10s to a minute or more, which on a phone (roaming
-			// networks, frequent re-punches) is felt constantly.
-			//
-			// The cost is near zero anyway: shouldTryConnect caps attempts at
-			// one per node per 15s, so most calls do nothing but a map lookup
-			// — no packets, no radio.
+			// (relayed punch signaling; throttled per node inside).
 			connectRosterNodes()
 			if heavy {
 				gossipNameAndProvisions()
@@ -518,62 +450,33 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 		}
 	}()
 
-	// Fast post-quantum negotiation. The keepalive loop only re-offers every
-	// ~25s, so a single dropped (large) ML-KEM handshake packet — common on
-	// constrained Wi-Fi paths — would leave the "quantum-safe" lock missing
-	// for tens of seconds. This loop re-offers quickly until PQ is up (offers
-	// are idempotent, so retransmits don't race an in-flight reply).
-	//
-	// BATTERY: the retry rate now BACKS OFF (1.5s → 3s → 6s … → 60s) instead
-	// of hammering every 1.5s indefinitely. Convergence in the normal case is
-	// unchanged (it succeeds within the first few tries), but a peer that
-	// never completes PQ — an older build, or a path that drops the large
-	// frames outright — used to mean a packet every 1.5s to that peer for as
-	// long as the session lived. That is 40 radio wakeups a minute for a
-	// negotiation that is never going to finish. The interval resets as soon
-	// as a peer needs a fresh offer, so a NEW peer still converges fast.
+	// Fast post-quantum negotiation. The keepalive loop above only re-offers
+	// every ~10s, so a single dropped (large) ML-KEM handshake packet — common
+	// on constrained Wi-Fi paths — meant the "quantum-safe" lock took tens of
+	// seconds to appear. This loop re-offers every ~1.5s until PQ is up (offers
+	// are idempotent, so retransmits don't race with an in-flight reply), then
+	// goes quiet. Negligible bandwidth: it only runs while a peer isn't PQ-ready.
 	go func() {
 		if !pqEnabled {
 			return
 		}
-		const minInterval, maxInterval = 1500 * time.Millisecond, 60 * time.Second
-		interval := minInterval
-		t := time.NewTimer(interval)
+		t := time.NewTicker(1500 * time.Millisecond)
 		defer t.Stop()
-		pendingBefore := 0
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
 			}
-			pending := 0
 			for _, addr := range GlobalSessions.EstablishedAddrs() {
 				s := GlobalSessions.GetByAddr(addr)
 				if s == nil || !s.Established() || !pqInitiator(s.peerStatic) || pqReady(s.peerStatic) {
 					continue
 				}
-				pending++
 				if offer := buildPQOffer(s.peerStatic); offer != nil {
 					_ = sendPacket(GlobalConn, addr, s, offer)
 				}
 			}
-			switch {
-			case pending == 0:
-				// Everyone is ready (or there is nothing to do): idle at the
-				// slow rate, costing nothing, ready to speed up on a new peer.
-				interval = maxInterval
-			case pending > pendingBefore:
-				// A new peer appeared — converge fast again.
-				interval = minInterval
-			default:
-				interval *= 2
-				if interval > maxInterval {
-					interval = maxInterval
-				}
-			}
-			pendingBefore = pending
-			t.Reset(interval)
 		}
 	}()
 
@@ -605,11 +508,7 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	// sitting idle" symptom.
 	wakeCh := make(chan struct{}, 1)
 	go func() {
-		// 30s (was 15s): this timer exists only to NOTICE a suspend that
-		// already happened, so its resolution costs battery for no benefit —
-		// a resume is detected just as reliably one tick later, and the
-		// reconnect it triggers is what actually matters.
-		const probe = 30 * time.Second
+		const probe = 15 * time.Second
 		for {
 			before := time.Now().Round(0) // .Round(0) strips monotonic → wall clock
 			select {
@@ -627,36 +526,10 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 		}
 	}()
 
-	// Battery vs. RECONNECT TIME — and reconnect time wins.
-	//
-	// An isolated tick is a STUN round plus tracker announces with the radio
-	// up, so backing off saves real battery when a phone genuinely has no
-	// mesh to reach (overnight, out of coverage). But an over-eager backoff
-	// is indistinguishable from a broken app: switch to 5G, land in CGNAT
-	// where the first announce rounds routinely fail while the radio and the
-	// carrier NAT settle, and a long backoff means MINUTES of "connected, no
-	// peers". That is exactly what a 4-minute ceiling produced on cellular.
-	//
-	// So the ceiling is 60s, not 4 minutes: at worst one STUN + announce
-	// round per minute while truly alone — negligible next to the radio's
-	// own idle cost — and a phone that lands on a working network converges
-	// in seconds. The streak also resets on ANY signal that the network
-	// picture changed (wake, public-IP change, first session), so the slow
-	// path is only ever reached by a device that really is isolated and
-	// staying that way.
-	isoStreak := 0
 	for {
 		wait := baseTick
 		if len(GlobalSessions.EstablishedAddrs()) == 0 {
-			wait = isolationTick << isoStreak
-			if max := 60 * time.Second; wait > max {
-				wait = max
-			}
-			if wait > baseTick {
-				wait = baseTick
-			}
-		} else {
-			isoStreak = 0
+			wait = isolationTick
 		}
 		select {
 		case <-stop:
@@ -669,8 +542,6 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			// dead endpoints don't linger, then announce + reconnect NOW
 			// (known LAN peers are re-dialed by the retry loop within
 			// seconds; trackers re-learn our fresh NAT mapping).
-			isoStreak = 0 // fresh network conditions — announce fast again
-			resetLANSweep()
 			addrs := GlobalSessions.EstablishedAddrs()
 			log.Printf("[wake] dropping %d stale session(s) and re-announcing", len(addrs))
 			for _, addr := range addrs {
@@ -700,29 +571,11 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				mu.Unlock()
 			}
 			isolated := len(GlobalSessions.EstablishedAddrs()) == 0
-			if isolated {
-				if isoStreak < 1 { // 30s → 60s, then hold
-					isoStreak++
-				}
-			} else {
-				isoStreak = 0
-			}
 			mu.Lock()
 			changed := pubNow != "" && pubNow != lastPublicIP
 			staleRegistration := time.Since(lastAnnounceTime) > 25*time.Minute
 			needHeal := isolated && time.Since(lastAnnounceTime) > 2*time.Minute
 			mu.Unlock()
-
-			// A changed public endpoint means a NEW network (Wi-Fi → 5G, cell
-			// handover, CGNAT re-map). Everything learned about reachability
-			// is stale, so drop back to the fast cadence instead of serving
-			// out a backoff earned on the old network. (Uses `changed`, which
-			// was computed under mu above — reading lastPublicIP unlocked
-			// here would be a data race.)
-			if changed {
-				isoStreak = 0
-				resetLANSweep()
-			}
 
 			if changed {
 				ka := []byte{0x00}

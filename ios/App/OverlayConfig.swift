@@ -27,10 +27,6 @@ struct OverlayConfig: Codable, Equatable {
     var trackersEdited: Bool? = nil
     var stunServers: [String] = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
     var rendezvousServers: [String] = []  // HTTPS discovery servers (from a join QR)
-    /// Credential for rendezvous servers that require one. ONE field, two
-    /// schemes, auto-detected by the core: "user:password" sends HTTP Basic,
-    /// anything without a colon is sent as a Bearer token. Blank = none.
-    var rendezvousAuth: String = ""
     var mtu: Int = 1280
 
     /// The core's curated default trackers (keep in sync with
@@ -167,7 +163,6 @@ struct OverlayConfig: Codable, Equatable {
             "manage_trackers": trackersEdited ?? false,
             "stun_servers": stunServers,
             "rendezvous_servers": rendezvousServers,
-            "rendezvous_auth": rendezvousAuth.trimmingCharacters(in: .whitespacesAndNewlines),
             "tun": ["mtu": mtu]
         ]
         // One-shot state wipe (see requestStateWipe). Nonce-guarded in the

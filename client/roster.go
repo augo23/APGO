@@ -26,7 +26,18 @@ import (
 )
 
 const (
-	rosterTTL        = 2 * time.Minute
+	// rosterTTL must comfortably exceed the interval at which roster frames are
+	// SENT, or a single lost datagram expires a peer and it disappears from
+	// every list until the next gossip lands.
+	//
+	// That regression is why this is 5 minutes rather than 2. Roster gossip
+	// used to ride on every keepalive (~10s), giving ~12 refreshes per TTL, so
+	// 2 minutes was generous. Moving the gossip to the slow ~60s tick (a
+	// battery change) silently cut that to 2 refreshes per TTL — and UDP loses
+	// frames, so peers began flickering in and out of the peer list. Five
+	// minutes restores a 5x margin at the new cadence. A node that genuinely
+	// leaves still drops out within one TTL, which is what this bound is for.
+	rosterTTL        = 5 * time.Minute
 	rosterMaxEntries = 64
 	rosterMaxName    = 64
 	// rosterMaxFrameBytes bounds the marshalled JSON so the control frame fits
@@ -312,6 +323,37 @@ func sendRosterTo(raddr *net.UDPAddr) {
 	if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
 		_ = sendPacket(GlobalConn, raddr, s, frame)
 	}
+}
+
+// rosterIPByKey returns the overlay IP a node publishes for ITSELF in the
+// gossiped roster, matched by static key. "" when unknown.
+//
+// This is authoritative in a way key-derivation never is: every node puts its
+// own configured address in its roster self-entry, so a node whose address
+// comes from config (OVERLAY_ADDRESS) rather than an admin provision is still
+// resolvable by anyone who has heard its gossip — including devices that
+// reach it only via relay.
+//
+// Without it, a DIRECT session whose keepalive announce has not arrived (or
+// was dropped) fell straight through to deriveOverlayIP and displayed a
+// GUESS, while the relay/roster row carrying the real address was suppressed
+// by de-duplication. The visible result: a peer listed at an address you
+// cannot ping, while the address you CAN ping is nowhere on screen.
+func rosterIPByKey(pub [32]byte) string {
+	if pub == ([32]byte{}) {
+		return ""
+	}
+	fp := peerKeyFingerprint(pub[:])
+	pk := base64.StdEncoding.EncodeToString(pub[:])
+	for _, e := range rosterSnapshot() {
+		if e.IP == "" {
+			continue
+		}
+		if (e.PK != "" && e.PK == pk) || (e.FP != "" && e.FP == fp) {
+			return e.IP
+		}
+	}
+	return ""
 }
 
 // rosterLookup returns the fresh roster entry for an overlay IP, if any.

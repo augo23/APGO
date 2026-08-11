@@ -502,6 +502,10 @@ fun MainScreen(
     var peers by remember { mutableStateOf<List<Peer>>(emptyList()) }
     // Full-VPN outproxy diagnostics from the core ({"use_exit","pin","exits":[…]}).
     var exits by remember { mutableStateOf<JSONObject?>(null) }
+    // Network + data-path status from the core (NAT type, LAN discovery,
+    // packet counters). Polled less often than the peer list: it changes
+    // slowly and every poll is a wakeup.
+    var netStatus by remember { mutableStateOf<JSONObject?>(null) }
 
     // Poll the running core (same process) for status + peers every few
     // seconds — but ONLY while the activity is visible. The VPN service keeps
@@ -528,6 +532,9 @@ fun MainScreen(
             exits = if (connected && state.useExit) {
                 try { JSONObject(Overlaymobile.exitsJSON()) } catch (e: Throwable) { null }
             } else null
+            netStatus = if (connected && (tick % 3 == 1 || netStatus == null)) {
+                try { JSONObject(Overlaymobile.networkStatusJSON()) } catch (e: Throwable) { netStatus }
+            } else if (connected) netStatus else null
 
             // Admin-assigned overlay address (signed provision from the network
             // admin panel) pending? The Go core receives it over the mesh but
@@ -682,6 +689,92 @@ fun MainScreen(
                 OutlinedTextField(state.exitPeer, { state.exitPeer = it },
                     label = { Text("Exit node (blank = fastest)") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
+            }
+
+            // NETWORK STATUS. Android never showed any of this, so the two
+            // questions users actually ask — "why is everything relayed?" and
+            // "why can I see peers but not reach them?" — had no answer here
+            // at all. iOS grew these cards; this is the same information, from
+            // the same core call, so the apps agree.
+            if (connected) netStatus?.let { ns ->
+                val nat = ns.optString("nat_type", "")
+                if (nat.isNotEmpty()) {
+                    val symmetric = nat.lowercase().contains("symmetric")
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            (if (symmetric) "⚠ " else "✓ ") + "This device's NAT: $nat",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (symmetric) Color(0xFFE6A400) else Color(0xFF2E7D32)
+                        )
+                        Text(
+                            if (symmetric)
+                                "A symmetric NAT gives this device no predictable port, so peers that are ALSO behind one can never connect directly — those stay relayed (still encrypted, just one extra hop). Wi-Fi is usually better than mobile data here."
+                            else "Peers can connect directly to this device when their own network allows it.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        // LAN discovery: "can't find my laptop on the same
+                        // Wi-Fi" has two causes that look identical in the
+                        // peer list, and only this number separates them.
+                        val lanTargets = ns.optInt("lan_targets", -1)
+                        if (lanTargets == 0) {
+                            Text(
+                                "Local network: cannot see any local addresses, so same-Wi‑Fi devices cannot be found.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFE6A400)
+                            )
+                        } else if (lanTargets > 0 && !ns.optBoolean("lan_peer", false)) {
+                            Text(
+                                "Local network: scanning $lanTargets address(es), no same-Wi‑Fi peer yet. If one is running, the router may be isolating clients (guest Wi‑Fi / AP isolation).",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        } else if (ns.optBoolean("lan_peer", false)) {
+                            Text("Local network: connected to a same-Wi‑Fi peer directly.",
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                // DATA PATH. A peer showing "connected" only proves CONTROL
+                // frames flow; reaching a service needs the DATA path, and
+                // every way it can fail looks the same from the peer list.
+                val txd = ns.optInt("tx_direct", -1)
+                val rxd = ns.optInt("rx_data", -1)
+                if (txd >= 0 && rxd >= 0) {
+                    val txf = ns.optInt("tx_flood", 0)
+                    val del = ns.optInt("rx_delivered", 0)
+                    val rel = ns.optInt("rx_relayed", 0)
+                    val rep = ns.optInt("rx_replay_drop", 0)
+                    val dec = ns.optInt("rx_decrypt_fail", 0)
+                    val problem = when {
+                        txd == 0 && txf == 0 -> null
+                        rxd == 0 -> "Sending, but nothing is coming back — the return path is blocked."
+                        txd == 0 && txf > 0 -> "No direct route learned: every packet is being broadcast to all peers."
+                        dec > 0 && dec * 4 > rxd -> "Many packets fail to decrypt — session keys are out of sync."
+                        rep > 0 && rep * 20 > rxd -> "Packets arrive out of order and are dropped as replays."
+                        del == 0 -> "Packets arrive but none are for this device — check the overlay address."
+                        else -> null
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            (if (problem == null) "✓ " else "⚠ ") + "Data path",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (problem == null) Color(0xFF2E7D32) else Color(0xFFE6A400)
+                        )
+                        Text(
+                            problem
+                                ?: if (txd == 0 && txf == 0) "Idle — no traffic sent to peers yet."
+                                else "Packets are flowing in both directions.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (problem == null) Color.Unspecified else Color(0xFFE6A400)
+                        )
+                        Text(
+                            "sent $txd direct / $txf broadcast · received $rxd, $del delivered" +
+                                (if (rel > 0) " ($rel relayed)" else "") +
+                                (if (rep > 0 || dec > 0) " · dropped $rep out-of-order, $dec undecryptable" else ""),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
             }
 
             // Peers (weighted so the list scrolls and the Support button stays put).

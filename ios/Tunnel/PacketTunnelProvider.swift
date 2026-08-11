@@ -99,17 +99,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(OverlaymobilePeersJSON().data(using: .utf8))
         case "pending":
             completionHandler?(OverlaymobilePendingAddress().data(using: .utf8))
-        case "netstatus":
-            // This device's own NAT type / public endpoint / IPv6. NAT type is
-            // what decides whether a direct session to a given peer is even
-            // possible, so the app can explain a permanent relay instead of
-            // leaving it a mystery.
-            completionHandler?(OverlaymobileNetworkStatusJSON().data(using: .utf8))
-        case "exits":
-            // Full-VPN outproxy view: which exits this device knows about,
-            // their reachability/latency, and which one is selected — so the
-            // app can show WHY "no exit is reachable" instead of a dead end.
-            completionHandler?(OverlaymobileExitsJSON().data(using: .utf8))
         default:
             completionHandler?(nil)
         }
