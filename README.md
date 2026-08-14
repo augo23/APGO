@@ -1,6 +1,7 @@
 # APGO (Another Pretty Good Overlay)
 
 **Website: [https://www.apgoverlay.com](https://www.apgoverlay.com)**
+**i2p Website: [http://apgoverlay.i2p](http://apgoverlay.i2p)**
 
 A self-organizing, encrypted peer-to-peer overlay network written in Go. Nodes discover each other through public BitTorrent trackers (and LAN broadcast), punch through NAT with STUN-assisted UDP hole punching, and establish end-to-end encrypted tunnels using the Noise XX protocol. Each node exposes a Linux TUN interface (`ovl0`), so any IP traffic — SSH, HTTP, ping, anything — flows over the overlay as if the machines shared a private LAN.
 
