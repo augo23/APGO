@@ -13,8 +13,22 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    # VERSIONING -- the single source of truth for both targets.
+    #
+    # App Store Connect rejects an upload whose CFBundleShortVersionString is
+    # not higher than the last APPROVED version (error 90062), and refuses new
+    # builds on a closed pre-release train (90186). So MARKETING_VERSION must
+    # rise for every submission that follows a release, and CURRENT_PROJECT_VERSION
+    # must rise for every upload at all -- even a re-upload of identical code,
+    # since a build number can never be reused.
+    #
+    # App/Info.plist and Tunnel/Info.plist now read these via $(...) rather than
+    # hardcoding them. They used to carry literal "1.0"/"1", which made this
+    # setting decorative: bumping it here changed nothing, and the app and its
+    # network extension could drift to different versions -- which Apple also
+    # rejects, since an extension must match its host app.
+    MARKETING_VERSION: "1.0.2"
+    CURRENT_PROJECT_VERSION: "3"
     SWIFT_VERSION: "5.0"
     # Apple Developer team. Baked in here so the selection
     # survives every `xcodegen generate` (picking it in Xcode's Signing editor

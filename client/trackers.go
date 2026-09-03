@@ -8,6 +8,7 @@ package main
 import (
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 var (
@@ -66,3 +67,24 @@ func saveTrackers(list []string) error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// --- tracker discovery on/off ---------------------------------------------
+
+// trackersOn gates tracker announces without discarding the list. Off means the
+// node keeps its trackers configured but stops announcing to them -- so an
+// operator who has the DHT or a rendezvous server can drop the public-tracker
+// traffic (and the public record of this node's address that comes with it)
+// and switch it back on later without retyping anything.
+var trackersOn atomicBoolDefaultTrue
+
+func setTrackersEnabled(on bool) { trackersOn.Store(on) }
+func trackersEnabled() bool      { return trackersOn.Load() }
+
+// atomicBoolDefaultTrue is an atomic bool whose ZERO VALUE reads as true.
+// Tracker discovery has always been on, so an unset field must keep it on:
+// a plain atomic.Bool would silently disable trackers on every node that has
+// never been configured, which is a regression disguised as a default.
+type atomicBoolDefaultTrue struct{ off atomic.Bool }
+
+func (a *atomicBoolDefaultTrue) Store(v bool) { a.off.Store(!v) }
+func (a *atomicBoolDefaultTrue) Load() bool   { return !a.off.Load() }

@@ -127,6 +127,12 @@ func startAdminServer() {
 	mux.HandleFunc("/api/logs", apiAuth(handleAdminLogs))
 	mux.HandleFunc("/api/revoke", apiAuth(handleAdminRevoke))
 	mux.HandleFunc("/api/provision", apiAuth(handleAdminProvision))
+	// Per-node runtime settings (DHT, trackers, rendezvous, public relay and
+	// exit duty with their budgets). These were registered on the k8s admin
+	// server and on the client's control port but NOT here, so the desktop
+	// dashboard -- which has its own route table -- answered 404 for both.
+	mux.HandleFunc("/api/node-config", apiAuth(handleAdminNodeConfig))
+	mux.HandleFunc("/api/node-config-get", apiAuth(handleAdminNodeConfigGet))
 	registerMultinetPanel(mux)
 
 	srv := &http.Server{Handler: mux}

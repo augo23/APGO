@@ -2486,6 +2486,13 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// Admin-signed network policy (e.g. post-quantum on/off), applied live.
 		handlePolicyGossip(body[1:])
 		return
+	case 'F':
+		// Admin-signed per-node runtime config (nodeconfig.go): DHT, relay
+		// participation, public-relay and exit-node duty plus their bandwidth
+		// budgets. Same trust model as 'D' policy frames -- verified against
+		// the admin key, epoch-superseded, re-flooded on adoption.
+		handleNodeConfigGossip(body[1:])
+		return
 	case 'S':
 		// Admin-signed network share/unshare (join or leave a secondary
 		// network), gossiped. Applied by the target's main instance.
@@ -2601,6 +2608,12 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		sendPeerExchangeTo(raddr)
 		sendRosterTo(raddr)
 		syncAdminStateTo(raddr)
+	case 'U':
+		// Peer withdrew its exit-node offer (exit.go). Admission-exempt like
+		// the other exit control frames: a node telling us to STOP using it is
+		// never something to gate.
+		handleExitWithdraw(raddr)
+		return
 	case 'R':
 		// ADMISSION CONTROL for the relay path. Control frames bypass the
 		// ingress admission gate by design (an unapproved peer needs them to
@@ -3136,6 +3149,14 @@ func announceAndConnect(trackers []string, infoHash []byte, peerID string,
 		seenPeers   = map[string]struct{}{}
 		minInterval int
 	)
+	// Tracker discovery can be switched off from the node's settings while the
+	// list is kept (see trackers.go). Checked here, at the announce, rather
+	// than by emptying the list -- so turning it back on needs no retyping,
+	// and an operator relying on the DHT or a rendezvous server can stop
+	// publishing this node's address to public trackers.
+	if !trackersEnabled() {
+		return 0
+	}
 	sem := make(chan struct{}, 20)
 	var wg sync.WaitGroup
 	for _, tr := range trackers {
@@ -3709,6 +3730,13 @@ func main() {
 	// An admin-signed network policy (set from any admin panel) overrides the
 	// local post_quantum default, so PQ can be toggled network-wide.
 	applyPolicyFile()
+	// Restore admin-signed per-node config (DHT / relay / exit duty and their
+	// bandwidth budgets) before the transport starts, so a rebooted node keeps
+	// what an admin gave it instead of reverting until the mesh re-gossips.
+	loadNodeConfigs()
+	// Keeps an automatically-budgeted public relay at 80% of this node's
+	// estimated capacity (relayshare.go). Harmless when no relay is running.
+	startRelayShareGovernor()
 	if pqEnabled {
 		log.Printf("[pq] hybrid post-quantum layer ENABLED (ML-KEM-768 over classical Noise)")
 	}
@@ -3969,6 +3997,7 @@ func main() {
 			// Successful decrypt is also liveness; refresh idle timer.
 			GlobalSessions.TouchLastSeen(raddr)
 			statRxData.Add(1)
+			noteNodeBytes(len(pt))
 			// Per-peer accounting. Counted only AFTER the frame authenticates, so
 			// forged or replayed packets from a third party cannot inflate a
 			// peer's totals — a counter anyone on the internet can drive up is
@@ -4071,6 +4100,17 @@ func main() {
 					// the kernel routes + NATs them out (return traffic comes back
 					// via the overlay). Otherwise it's not for us — drop it.
 					if amExit && isInternetDst(dst) {
+						// Meter it. This is the outbound half of exit traffic:
+						// a client's packet heading for the internet on our
+						// link and our IP. Over budget, it is dropped here --
+						// deliberately silently, as a dropped packet, because
+						// that is what a congested link looks like and TCP
+						// backs off correctly in response. Sending an ICMP
+						// rejection instead would tell an unmetered client to
+						// keep hammering.
+						if !exitAllowOut(len(pt)) {
+							return
+						}
 						tunIF.Write(pt)
 						return
 					}
@@ -4242,6 +4282,21 @@ func main() {
 				continue
 			}
 
+			// Exit metering, RETURN direction: we are an exit node and this
+			// packet came off the TUN from the internet, addressed to one of
+			// our overlay clients. Identified by its SOURCE being outside the
+			// overlay while its destination is inside it -- our own traffic
+			// has an overlay source, so it is not charged to the exit budget.
+			// Charged in both directions because an exit pays for both, and a
+			// download-heavy client would otherwise be metered at nearly zero.
+			if amExit && dst != "" && !isInternetDst(dst) {
+				if src := extractIPv4Src(ip); src != "" && isInternetDst(src) {
+					if !exitAllowIn(n) {
+						continue
+					}
+				}
+			}
+
 			// Full-VPN mode: internet-bound packets go to the selected exit node.
 			if useExit && isInternetDst(dst) {
 				if ea, es := currentExit(); ea != nil {
@@ -4278,6 +4333,7 @@ func main() {
 							noteSendError("direct", a, err)
 						}
 						statTxDirect.Add(1)
+						noteNodeBytes(len(ip))
 						if GlobalSessions.RouteIsLive(a) {
 							continue
 						}
@@ -4660,6 +4716,7 @@ func main() {
 				gossipApprovals()
 				gossipNetConfig()
 				gossipPolicy()
+				gossipNodeConfigs()
 				gossipNetShares()
 			}
 		}

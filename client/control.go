@@ -1204,6 +1204,59 @@ func startControlServer(socketPath string) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "post_quantum": pqEnabled})
 	})
 
+	// Per-node runtime config (nodeconfig.go). Two shapes:
+	//
+	//   GET  ?pubkey=<b64>   -> the merged effective config for that node
+	//   POST <SignedNodeConfig> -> verify + adopt + re-flood
+	//
+	// The POST body is signed by the ADMIN PANEL, not here: the panel holds
+	// the admin key (sealed, unlocked by the network password), and this node
+	// only verifies. That is the same split as /api/policy-signed and
+	// /api/provision-signed, and it is what allows a node to be configured
+	// from a dashboard running anywhere on the mesh -- including one on a
+	// phone -- without the admin key ever reaching this process.
+	mux.HandleFunc("/api/node-config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			pub := r.URL.Query().Get("pubkey")
+			if pub == "" {
+				pub = selfPubB64() // no target = this node
+			}
+			out := nodeConfigSnapshot(pub)
+			// Live status for THIS node only: a remote node's running state
+			// comes from its own announcements, not from our copy of its
+			// config. Showing our config as if it were its live state would
+			// claim a change had taken effect before the target had seen it.
+			if pub == selfPubB64() {
+				out["live"] = map[string]any{
+					"dht":          dhtStatusSnapshot(gDHTKey),
+					"public_relay": publicRelayStatusSnapshot(),
+					"relay_client": relayClientStatusSnapshot(),
+					"exit":         exitLimitStatus(),
+				}
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var c SignedNodeConfig
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&c); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !verifyNodeConfig(c) {
+			http.Error(w, "invalid signature", http.StatusBadRequest)
+			return
+		}
+		adoptNodeConfig(c)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"config": nodeConfigSnapshot(c.PubKey),
+		})
+	})
+
 	// Generate a fresh random PSK ("base64:<32 bytes>") for the admin UI.
 	mux.HandleFunc("/api/gen-psk", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"psk": generatePSK()})

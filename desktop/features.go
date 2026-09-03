@@ -7,6 +7,8 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"strconv"
+	"net/url"
 	"net/http"
 	"os"
 	"strings"
@@ -324,4 +326,149 @@ func featurePageShell(title, body, script string) string {
 ` + script + `
 </script>
 </body></html>`
+}
+
+// handleAPINodeConfig signs and forwards a per-node runtime config change.
+//
+// The panel sends HUMAN rate strings ("5mbit", "200GB", "" = unlimited) and
+// tri-state booleans (null = leave unchanged). They are parsed to bytes/sec
+// HERE, before signing, so the signature covers the number that will actually
+// be enforced on the target node -- if the target re-parsed a string, two nodes
+// could disagree about what was signed.
+func handleAdminNodeConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Requested-With") == "" {
+		http.Error(w, "missing X-Requested-With header", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		PubKey       string    `json:"pubkey"` // "" = network-wide
+		DHT          *bool     `json:"dht"`
+		UseRelays    *bool     `json:"use_public_relays"`
+		PublicRelay  *bool     `json:"public_relay"`
+		ExitNode     *bool     `json:"exit_node"`
+		Trackers       *[]string `json:"trackers"`
+		TrackersOn     *bool     `json:"trackers_on"`
+		Rendezvous     *string   `json:"rendezvous"`
+		RendezvousAuth *string   `json:"rendezvous_auth"`
+		RelayUp      *string   `json:"relay_up"`
+		RelayDown    *string   `json:"relay_down"`
+		RelayQuota   *string   `json:"relay_quota"`
+		ExitUp       *string   `json:"exit_up"`
+		ExitDown     *string   `json:"exit_down"`
+		ExitQuota    *string   `json:"exit_quota"`
+		Password     string    `json:"password"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 32768))
+	if json.Unmarshal(body, &req) != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !adminKeyAvailable() {
+		http.Error(w, "No network admin key exists yet. Create one in Settings.", http.StatusBadRequest)
+		return
+	}
+	if req.Password == "" {
+		http.Error(w, "admin password required", http.StatusUnauthorized)
+		return
+	}
+
+	rate := func(p *string) *int64 {
+		if p == nil {
+			return nil
+		}
+		v := parseAdminRate(*p)
+		return &v
+	}
+	c := SignedNodeConfig{
+		PubKey:       req.PubKey,
+		DHT:          req.DHT,
+		UseRelays:    req.UseRelays,
+		PublicRelay:  req.PublicRelay,
+		ExitNode:     req.ExitNode,
+		Trackers:       req.Trackers,
+		TrackersOn:     req.TrackersOn,
+		Rendezvous:     req.Rendezvous,
+		RendezvousAuth: req.RendezvousAuth,
+		RelayUp:      rate(req.RelayUp),
+		RelayDown:    rate(req.RelayDown),
+		RelayQuota:   rate(req.RelayQuota),
+		ExitUp:       rate(req.ExitUp),
+		ExitDown:     rate(req.ExitDown),
+		ExitQuota:    rate(req.ExitQuota),
+	}
+
+	// Refuse an unlimited public relay at the point of signing, not only on the
+	// target. Catching it here means the admin gets a sentence explaining the
+	// problem while the form is still open, rather than a record that every
+	// node silently declines to apply.
+	// A blank budget is allowed: the target applies an automatic one (80% of
+	// its own estimated capacity). Only the DHT dependency is still a hard
+	// requirement, because a relay nobody can discover is simply broken.
+	if c.PublicRelay != nil && *c.PublicRelay {
+		if c.DHT != nil && !*c.DHT {
+			http.Error(w, "the public relay advertises itself through the DHT — enable the DHT too, "+
+				"or nobody can find this relay", http.StatusBadRequest)
+			return
+		}
+	}
+
+	rec, err := signNodeConfig(req.Password, c)
+	if err == errWrongPassword {
+		http.Error(w, "incorrect admin password", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, "signing failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	recBytes, _ := json.Marshal(rec)
+	proxyCtl(w, "POST", "/api/node-config", recBytes)
+}
+
+// handleAPINodeConfigGet proxies the read side through to the local client.
+func handleAdminNodeConfigGet(w http.ResponseWriter, r *http.Request) {
+	q := ""
+	if pk := r.URL.Query().Get("pubkey"); pk != "" {
+		q = "?pubkey=" + url.QueryEscape(pk)
+	}
+	proxyCtl(w, "GET", "/api/node-config"+q, nil)
+}
+
+// parseAdminRate mirrors client/bandwidth.go parseRate: "5mbit" / "20MB" /
+// "200GB" / "" -> bytes per second (or bytes, for a quota). Bit units are
+// divided by 8; byte units are taken as-is. "" and "unlimited" mean 0.
+func parseAdminRate(s string) int64 {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || s == "unlimited" || s == "none" || s == "0" {
+		return 0
+	}
+	mult := int64(1)
+	bits := false
+	switch {
+	case strings.HasSuffix(s, "gbit"), strings.HasSuffix(s, "gbps"):
+		mult, bits, s = 1e9, true, s[:len(s)-4]
+	case strings.HasSuffix(s, "mbit"), strings.HasSuffix(s, "mbps"):
+		mult, bits, s = 1e6, true, s[:len(s)-4]
+	case strings.HasSuffix(s, "kbit"), strings.HasSuffix(s, "kbps"):
+		mult, bits, s = 1e3, true, s[:len(s)-4]
+	case strings.HasSuffix(s, "tb"):
+		mult, s = 1e12, s[:len(s)-2]
+	case strings.HasSuffix(s, "gb"):
+		mult, s = 1e9, s[:len(s)-2]
+	case strings.HasSuffix(s, "mb"):
+		mult, s = 1e6, s[:len(s)-2]
+	case strings.HasSuffix(s, "kb"):
+		mult, s = 1e3, s[:len(s)-2]
+	case strings.HasSuffix(s, "b"):
+		s = s[:len(s)-1]
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	v := int64(f * float64(mult))
+	if bits {
+		v /= 8
+	}
+	return v
 }

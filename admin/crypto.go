@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // pbkdfIter is the PBKDF2 iteration count. Deliberately high: the encrypted
@@ -171,4 +172,69 @@ func randomBytes(n int) ([]byte, error) {
 	b := make([]byte, n)
 	_, err := rand.Read(b)
 	return b, err
+}
+
+// SignedNodeConfig mirrors the client's record (client/nodeconfig.go). The two
+// definitions and the two canonical-string builders MUST stay byte-identical:
+// the admin signs the string this file produces and the client verifies the
+// string its own copy produces, so any divergence shows up as "invalid
+// signature" on every node rather than as a compile error here.
+type SignedNodeConfig struct {
+	PubKey string `json:"pubkey"` // "" = network-wide; else base64 target static key
+
+	DHT         *bool `json:"dht,omitempty"`
+	UseRelays   *bool `json:"use_public_relays,omitempty"`
+	PublicRelay *bool `json:"public_relay,omitempty"`
+	ExitNode    *bool `json:"exit_node,omitempty"`
+
+	Trackers   *[]string `json:"trackers,omitempty"`
+	TrackersOn *bool     `json:"trackers_on,omitempty"`
+
+	Rendezvous     *string `json:"rendezvous,omitempty"`
+	RendezvousAuth *string `json:"rendezvous_auth,omitempty"`
+
+	RelayUp    *int64 `json:"relay_up_bps,omitempty"`
+	RelayDown  *int64 `json:"relay_down_bps,omitempty"`
+	RelayQuota *int64 `json:"relay_quota_bytes,omitempty"`
+	ExitUp     *int64 `json:"exit_up_bps,omitempty"`
+	ExitDown   *int64 `json:"exit_down_bps,omitempty"`
+	ExitQuota  *int64 `json:"exit_quota_bytes,omitempty"`
+
+	Epoch int64  `json:"epoch"`
+	Ts    int64  `json:"ts"`
+	Sig   string `json:"sig"`
+}
+
+// canonicalNodeConfig must match client/nodeconfig.go exactly, including the
+// "-" rendering of absent fields (which is what keeps "unset" and "false" from
+// signing to the same string).
+func canonicalNodeConfig(c SignedNodeConfig) string {
+	b := func(p *bool) string {
+		if p == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%t", *p)
+	}
+	i := func(p *int64) string {
+		if p == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%d", *p)
+	}
+	str := func(p *string) string {
+		if p == nil {
+			return "-"
+		}
+		return *p
+	}
+	trackers := "-"
+	if c.Trackers != nil {
+		trackers = strings.Join(*c.Trackers, ",")
+	}
+	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
+		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
+		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
+		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
+		c.Epoch, c.Ts)
 }

@@ -150,6 +150,50 @@ func buildExitAnnounce() []byte {
 	return append(append([]byte(nil), ctlMagic...), 'E')
 }
 
+// buildExitWithdraw announces that this node is NO LONGER an exit, so peers
+// drop it immediately instead of waiting for the candidate to age out. Frame
+// 'U' -- a separate letter rather than an 'E' with a payload, because older
+// builds ignore an unknown control letter but would read a modified 'E' as an
+// ordinary announce, i.e. as the exact opposite of what it means.
+func buildExitWithdraw() []byte {
+	return append(append([]byte(nil), ctlMagic...), 'U')
+}
+
+// handleExitWithdraw drops a peer from the exit candidates on request.
+func handleExitWithdraw(raddr *net.UDPAddr) {
+	s := GlobalSessions.GetByAddr(raddr)
+	if s == nil {
+		return
+	}
+	exitMu.Lock()
+	if e := exitCandidates[s.peerStatic]; e != nil {
+		if selectedExit == e {
+			selectedExit = nil
+		}
+		delete(exitCandidates, s.peerStatic)
+	}
+	exitMu.Unlock()
+	log.Printf("[exit] peer %s withdrew its exit-node offer", raddr)
+	select {
+	case exitRepick <- struct{}{}:
+	default:
+	}
+}
+
+// withdrawExitAnnounce tells every established peer, once, that this node has
+// stopped being an exit.
+func withdrawExitAnnounce() {
+	if GlobalSessions == nil || GlobalConn == nil {
+		return
+	}
+	f := buildExitWithdraw()
+	for _, addr := range GlobalSessions.EstablishedAddrs() {
+		if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
+			_ = sendPacket(GlobalConn, addr, s, f)
+		}
+	}
+}
+
 // handleExitAnnounce records a peer that advertised itself as an exit.
 func handleExitAnnounce(raddr *net.UDPAddr) {
 	s := GlobalSessions.GetByAddr(raddr)
@@ -267,11 +311,23 @@ func exitSelectionLoop() {
 	pick := func() {
 		exitMu.Lock()
 		defer exitMu.Unlock()
-		// Forget exits that stopped advertising long ago (node left the network
-		// or stopped being an exit) so the map stays bounded and a dead exit
-		// can never linger in the candidate list indefinitely.
+		// Forget exits that stopped advertising.
+		//
+		// This was 30 MINUTES, which is far too long for the case that actually
+		// happens: an admin turns exit mode off and every other node keeps
+		// showing that peer as an exit -- green E in the table, still offered
+		// to full-VPN clients -- for up to half an hour, with the node's own
+		// settings correctly reading "off". It looks exactly like the setting
+		// did not apply.
+		//
+		// Exit announces ride the keepalive tick (about once a minute), so
+		// three minutes is several missed announces: long enough to absorb
+		// packet loss or a sleeping laptop, short enough that turning exit off
+		// is visible almost immediately. withdrawExitAnnounce below makes the
+		// common case instant; this is the backstop for a node that vanished
+		// without announcing anything.
 		for k, e := range exitCandidates {
-			if time.Since(e.lastSeen) > 30*time.Minute {
+			if time.Since(e.lastSeen) > 3*time.Minute {
 				if selectedExit == e {
 					selectedExit = nil
 				}

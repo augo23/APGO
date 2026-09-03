@@ -88,6 +88,10 @@ func main() {
 	mux.HandleFunc("/api/rendezvous-config", requireAuthAPI(handleAPIRendezvousConfig))
 	mux.HandleFunc("/api/trackers", requireAuthAPI(handleAPITrackers))
 	mux.HandleFunc("/api/policy", requireAuthAPI(handleAPIPolicy))
+	// Per-node runtime config: DHT, relay participation, public-relay and
+	// exit-node duty, and the bandwidth budget for each.
+	mux.HandleFunc("/api/node-config", requireAuthAPI(handleAPINodeConfig))
+	mux.HandleFunc("/api/node-config-get", requireAuthAPI(handleAPINodeConfigGet))
 	mux.HandleFunc("/api/networks", requireAuthAPI(handleAPINetworks))
 	mux.HandleFunc("/api/network-add", requireAuthAPI(handleAPINetworkAdd))
 	mux.HandleFunc("/api/network-remove", requireAuthAPI(handleAPINetworkRemove))

@@ -369,3 +369,25 @@ func zero(b []byte) {
 		b[i] = 0
 	}
 }
+
+// signNodeConfig signs a per-node (or network-wide) runtime config record.
+// Same shape as signNetworkPolicy: unseal with the network admin password,
+// sign the canonical string, wipe the seed.
+func signNodeConfig(password string, c SignedNodeConfig) (SignedNodeConfig, error) {
+	adminKeyMu.Lock()
+	defer adminKeyMu.Unlock()
+	akf, ok := currentAdminKeyFile()
+	if !ok {
+		return SignedNodeConfig{}, errors.New("no admin key available on this node")
+	}
+	seed, err := decryptSeed(akf, password)
+	if err != nil {
+		return SignedNodeConfig{}, errWrongPassword
+	}
+	c.Epoch = time.Now().UnixNano()
+	c.Ts = time.Now().Unix()
+	sig := adminSignWithSeed(seed, []byte(canonicalNodeConfig(c)))
+	zero(seed)
+	c.Sig = base64.StdEncoding.EncodeToString(sig)
+	return c, nil
+}

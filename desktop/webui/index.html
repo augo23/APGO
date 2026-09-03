@@ -52,6 +52,10 @@
   .exit-fail{font-size:10px;font-weight:700;color:#ff6b6b;border:1px solid #ff6b6b;border-radius:6px;padding:1px 5px;margin-left:6px}
   /* Why is this peer relayed? — IPv6 availability on BOTH ends is the fact
      that decides whether NAT traversal was ever needed. */
+  /* Read-only state, not a control: the toggle lives in the node's Settings.
+     Browsers grey out a disabled checkbox to near-invisibility, so opacity is
+     restored deliberately -- an indicator nobody can read is worse than none. */
+  .pqview{opacity:.85; cursor:default; pointer-events:none; accent-color:#3ddc84}
   .v6-both{font-size:10px;color:#e6b400;border:1px solid #e6b400;border-radius:6px;padding:1px 5px;margin-left:6px}
   .v6-one{font-size:10px;color:#8a93a3;border:1px solid #8a93a3;border-radius:6px;padding:1px 5px;margin-left:6px}
   .v6-none{font-size:10px;color:#8a93a3;border:1px solid #8a93a3;border-radius:6px;padding:1px 5px;margin-left:6px}
@@ -91,7 +95,14 @@
     align-items:center; justify-content:center; z-index:30; padding:20px}
   .modal-backdrop.show{display:flex}
   .modal{background:var(--panel); border:1px solid var(--line); border-radius:14px;
-    padding:22px 22px 20px; width:100%; max-width:420px; box-shadow:0 18px 60px rgba(0,0,0,.5)}
+    padding:22px 22px 20px; width:100%; max-width:420px; box-shadow:0 18px 60px rgba(0,0,0,.5);
+    /* A tall sheet must scroll INSIDE itself rather than growing past the
+       viewport. Without this the modal simply overflowed: on a laptop screen
+       the password field and the Apply button sat below the bottom edge with
+       no way to reach them, because the backdrop is position:fixed and does
+       not scroll. Applied to .modal generally so no future sheet inherits the
+       same trap. */
+    max-height:calc(100vh - 40px); overflow-y:auto; overscroll-behavior:contain}
   .modal h3{margin:0 0 4px; font-size:16px}
   .modal .who{color:var(--muted); font-size:12px; margin:0 0 6px}
   .modal label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:.6px;
@@ -134,6 +145,29 @@
   .sharelist .shrow:last-child{border-bottom:0}
   .sharelist .shname{flex:1; word-break:break-all}
   .sharelist .exwrap{display:flex; align-items:center; gap:4px; color:var(--muted); font-size:11px}
+  /* Per-node discovery & relay sheet. */
+  .cfgrow{display:flex; gap:10px; align-items:flex-start; padding:8px 0;
+          border-top:1px solid var(--line); cursor:pointer}
+  .cfgrow input{margin:2px 0 0; width:17px; height:17px; flex:none; cursor:pointer}
+  .cfgrow strong{display:block; font-size:13px; font-weight:600}
+  .cfgrow em{display:block; margin-top:2px; color:var(--muted); font-size:11px;
+             font-style:normal; line-height:1.4}
+  .cfglimits{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+             gap:10px; margin:2px 0 8px; padding:10px; border:1px solid var(--line);
+             border-radius:9px; background:var(--panel-2)}
+  .cfglimits label{display:block; font-size:10px; text-transform:uppercase;
+                   letter-spacing:.6px; color:var(--muted); margin-bottom:4px}
+  .cfglimits input{width:100%; padding:8px 10px; background:var(--panel); color:var(--fg);
+                   border:1px solid var(--line); border-radius:7px; font-size:12.5px}
+  /* Hidden, not removed: values persist while the toggle is off, so switching
+     a relay back on does not quietly restore "unlimited". */
+  .cfglimits[hidden]{display:none}
+  #cfgRelayList{width:100%; padding:9px 11px; background:var(--panel-2); color:var(--fg);
+                border:1px solid var(--line); border-radius:8px; font-size:12.5px;
+                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #cfgScope{width:100%; padding:9px 11px; background:var(--panel-2); color:var(--fg);
+            border:1px solid var(--line); border-radius:8px; font-size:13px}
+  .cfgseed{display:flex; align-items:center; gap:10px; margin:6px 0 4px; flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -239,13 +273,123 @@
       <div class="msg" id="nodeMsg"></div>
       <div class="modal-actions wrapact">
         <button class="ghost" id="nodeCancel" type="button">Close</button>
-        <button class="edit-btn" id="nodeApprove" type="button" style="display:none">Approve&hellip;</button>
-        <button class="edit-btn" id="nodeEdit" type="button">Edit&hellip;</button>
-        <button class="revoke" id="nodeRevoke" type="button">Revoke</button>
+        <button class="edit-btn" id="nodeSettings" type="button">Settings&hellip;</button>
       </div>
     </div>
   </div>
 
+
+
+  <!-- PER-NODE DISCOVERY & RELAY SETTINGS
+       Opened from the node sheet ("Settings…"), so the per-node controls live
+       with that node instead of on the home screen. Applies to the SELECTED
+       node, not this one: the change is an admin-signed record gossiped over
+       the mesh (client/nodeconfig.go), which is what makes it possible to
+       configure a container or a phone -- neither of which has YAML to edit or
+       a reachable control port. -->
+  <div class="modal-backdrop" id="cfgModal">
+    <div class="modal" style="max-width:430px">
+      <h3 id="cfgTitle">Node settings</h3>
+      <p class="who" id="cfgWho">&mdash;</p>
+
+      <!-- Identity, folded in from the old separate Edit dialog. Editing a
+           node's name and having two dialogs to do it in was the confusing
+           part, not the fields themselves. -->
+      <label for="cfgName">Friendly name</label>
+      <input id="cfgName" type="text" spellcheck="false" autocapitalize="off" placeholder="e.g. web-server-1">
+      <label for="cfgIp">Overlay IP <span class="lc">&mdash; full address or just the last number; blank = unchanged</span></label>
+      <input id="cfgIp" type="text" spellcheck="false" autocapitalize="off">
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgPq">
+        <span><strong>Post-quantum encryption</strong>
+        <em>Adds an ML-KEM layer under the existing handshake, so traffic captured
+        today cannot be decrypted later by a quantum computer. Costs a little
+        handshake time. Both ends must have it on.</em></span>
+      </label>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgDht">
+        <span><strong>Join the public DHT</strong>
+        <em>Finds peers without a rendezvous server. The lookup key is derived from
+        your PSK, so nobody without it can identify or enumerate this network.</em></span>
+      </label>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgUseRelays">
+        <span><strong>Use public relays</strong>
+        <em>Route through a volunteer relay when a direct path fails (symmetric NAT,
+        CGNAT). Traffic stays end-to-end encrypted.</em></span>
+      </label>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgPublicRelay">
+        <span><strong>Be a public relay for others</strong>
+        <em>Carry strangers' encrypted traffic. Needs the DHT &mdash; that is how relays
+        are advertised. Leave the limits blank and this node budgets itself at 80% of
+        its measured capacity, keeping a fifth of the link for its own use.</em></span>
+      </label>
+      <div id="cfgRelayLimits" class="cfglimits">
+        <div><label for="cfgRelayUp">Relay upload (Mbps)</label>
+          <input id="cfgRelayUp" type="number" min="0" step="0.1" placeholder="blank = automatic (80%)"></div>
+        <div><label for="cfgRelayDown">Relay download (Mbps)</label>
+          <input id="cfgRelayDown" type="number" min="0" step="0.1" placeholder="blank = automatic (80%)"></div>
+        <div><label for="cfgRelayQuota">Relay quota (GB)</label>
+          <input id="cfgRelayQuota" type="number" min="0" step="1" placeholder="blank = no quota"></div>
+      </div>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgExit">
+        <span><strong>Be a VPN exit node</strong>
+        <em>Forward full-VPN clients' internet traffic out of this node's own
+        connection and IP address. More expensive than relaying &mdash; set a budget.</em></span>
+      </label>
+      <div id="cfgExitLimits" class="cfglimits">
+        <div><label for="cfgExitUp">Exit upload (Mbps)</label>
+          <input id="cfgExitUp" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
+        <div><label for="cfgExitDown">Exit download (Mbps)</label>
+          <input id="cfgExitDown" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
+        <div><label for="cfgExitQuota">Exit quota (GB)</label>
+          <input id="cfgExitQuota" type="number" min="0" step="1" placeholder="e.g. 500"></div>
+      </div>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgTrackersOn">
+        <span><strong>Announce to public trackers</strong>
+        <em id="cfgTrackersNote">Finds peers through public BitTorrent trackers. Can be turned
+        off once the DHT or a rendezvous server is available &mdash; the list below is kept
+        either way.</em></span>
+      </label>
+      <label for="cfgRelayList">Public trackers <span class="lc">&mdash; one per line</span></label>
+      <textarea id="cfgRelayList" rows="4" spellcheck="false" placeholder="udp://tracker.example.org:1337/announce"></textarea>
+      <div class="cfgseed">
+        <button class="ghost" id="cfgSeed" type="button">Copy from this node</button>
+        <span class="lc" id="cfgSeedNote">&mdash;</span>
+      </div>
+
+      <label for="cfgRv">Rendezvous server <span class="lc">&mdash; one only; blank = none</span></label>
+      <input id="cfgRv" type="text" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">
+      <label for="cfgRvAuth">Rendezvous credentials <span class="lc">&mdash; user:pass, a bare token, or blank</span></label>
+      <input id="cfgRvAuth" type="text" spellcheck="false" autocapitalize="off" autocomplete="off">
+
+      <label for="cfgScope">Apply to</label>
+      <select id="cfgScope">
+        <option value="node">This node only</option>
+        <option value="network">Every node on the network (default for all)</option>
+      </select>
+
+      <label for="cfgPass">Network admin password</label>
+      <input id="cfgPass" type="password">
+
+      <div class="msg" id="cfgMsg"></div>
+      <div class="modal-actions wrapact">
+        <button class="ghost" id="cfgCancel" type="button">Cancel</button>
+        <button class="edit-btn" id="cfgApprove" type="button" style="display:none">Approve&hellip;</button>
+        <button class="revoke" id="cfgRevoke" type="button">Revoke</button>
+        <button class="primary" id="cfgApply" type="button">Apply</button>
+      </div>
+    </div>
+  </div>
 
   <div class="modal-backdrop" id="pqModal">
     <div class="modal">
@@ -718,16 +862,17 @@ async function loadSessions(){
       <td>${esc(s.name||"—")}</td>
       <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge" title="Reachable through this node&#39;s relay - no direct session yet">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
-      <td style="text-align:center"><input type="checkbox" class="pqbox" ${s.post_quantum?'checked':''} data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}" ${s.pubkey&&!relayed?'':'disabled'} title="Post-quantum encryption for this node"></td>
+      <td style="text-align:center" title="Post-quantum encryption — change it in this node's Settings"><input type="checkbox" class="pqview" ${s.post_quantum?'checked':''} disabled tabindex="-1" aria-label="Post-quantum encryption"></td>
       <td class="num">${fmtRate(tr_.rx_bytes_per_sec, tr_.sampled)}</td>
       <td class="num">${fmtRate(tr_.tx_bytes_per_sec, tr_.sampled)}</td>
       <td class="num">${tr_.sampled?fmtBytes(tr_.total_bytes):'<span class="tdim">—</span>'}</td>
       <td>${relayed?'—':rel(s.since_unix)}</td>
       <td>${rel(s.last_seen_unix)}</td>
       <td style="text-align:right">
-        ${pending?`<button class="edit-btn approve" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Approve…</button>`:''}
-        ${canAct?`<button class="edit-btn edit" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||'')}" data-name="${esc(s.name||'')}"${relayed?' title="Applies as an admin-signed provision — it reaches this node through the mesh"':''}>Edit</button>`:''}
-        ${canRevoke?`<button class="revoke" data-remote="${esc(s.remote)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Revoke</button>`:''}
+        <!-- No per-row buttons. Every action for a node lives in its Settings
+             sheet, reached by clicking the row: one place to look, and no
+             chance of hitting Revoke while scanning a table. -->
+        ${pending?'<span class="pending">pending</span>':''}
       </td>
     </tr>`;}).join("");
 }
@@ -846,10 +991,7 @@ document.getElementById("pqApply").addEventListener("click", async () => {
     setTimeout(loadSessions, 800);
   }catch(err){ msg.textContent = "Error: "+err; }
 });
-document.getElementById("rows").addEventListener("change", (e) => {
-  const box = e.target.closest(".pqbox"); if(!box) return;
-  openPQModal(box.dataset.pubkey, box.checked, box.dataset.ip || "node");
-});
+
 
 // --- in-page approve modal (admission control) -----------------------------
 let approveTarget = {pubkey:""};
@@ -1073,33 +1215,14 @@ function renderNodeModal(){
   const pending = (s.approved === false && canAct);
   const canRevoke = relayed ? (canAct && adminConfigured) : true;
   const btn = (id, show) => { const el = document.getElementById(id); if(el) el.style.display = show ? "" : "none"; };
-  btn("nodeApprove", pending);
-  btn("nodeEdit", canAct);
-  btn("nodeRevoke", canRevoke);
+  btn("nodeSettings", canAct);
   return true;
 }
 
 document.getElementById("nodeCancel").addEventListener("click", closeNodeModal);
 document.getElementById("nodeModal").addEventListener("click", (e)=>{ if(e.target.id==="nodeModal") closeNodeModal(); });
 
-document.getElementById("nodeApprove").addEventListener("click", ()=>{
-  const s = sessionByRemote(nodeSel); if(!s) return;
-  closeNodeModal();
-  openApproveModal(s.pubkey, s.overlay_ip || s.remote || "device");
-});
-document.getElementById("nodeEdit").addEventListener("click", ()=>{
-  const s = sessionByRemote(nodeSel); if(!s) return;
-  closeNodeModal();
-  openEditModal(s.pubkey, s.overlay_ip, s.name, s.overlay_ip || "node");
-});
-document.getElementById("nodeRevoke").addEventListener("click", async ()=>{
-  const s = sessionByRemote(nodeSel); if(!s) return;
-  const b = document.getElementById("nodeRevoke");
-  b.disabled = true; const label = b.textContent; b.textContent = "…";
-  const ok = await doAction("revoke", s.pubkey, s.remote, s.overlay_ip || s.remote);
-  b.disabled = false; b.textContent = label;
-  if(ok){ closeNodeModal(); await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
-});
+
 
 // --- Enter applies, Escape cancels -----------------------------------------
 // Every modal here is a short form ending in one obvious action, so requiring a
@@ -1416,6 +1539,278 @@ async function tick(){
 }
 loadConfig().then(tick);
 setInterval(tick, 3000);
+
+/* ---- Per-node discovery & relay ---------------------------------------
+   Reads  /api/node-config-get?pubkey=<b64>
+   Writes /api/node-config   (admin server signs, then forwards to the node)
+
+   Rates go OUT as the human strings typed here and come BACK as bytes/sec,
+   because the signature must cover the parsed number rather than a string the
+   target would have to re-parse. So the round-trip is asymmetric on purpose. */
+let cfgTarget = null;   // {pubkey, label}
+let cfgPqWas = false;   // PQ state when the sheet opened, so Apply only signs a real change
+
+/* The API speaks BYTES PER SECOND; these fields speak Mbps, and quotas speak
+   GB. Converting at the edge keeps one unit in the UI -- mixing "5mbit" and
+   "200GB" in free text meant every value needed a suffix to be unambiguous,
+   and a missing or wrong suffix silently changed the number by 8x. */
+function cfgToMbps(bps){
+  if(!bps || bps <= 0) return "";
+  return +((bps * 8) / 1e6).toFixed(2);
+}
+function cfgToGB(bytes){
+  if(!bytes || bytes <= 0) return "";
+  return +(bytes / 1e9).toFixed(2);
+}
+/* Back the other way, as the suffixed strings the signer parses. Blank stays
+   blank: it means "automatic" for a relay rate and "no quota" for a quota, and
+   sending 0 would be indistinguishable from an explicit unlimited. */
+function cfgMbpsField(id){
+  const v = (document.getElementById(id).value || "").trim();
+  if(v === "") return "";
+  const n = parseFloat(v);
+  return (isFinite(n) && n > 0) ? n + "mbit" : "";
+}
+function cfgGBField(id){
+  const v = (document.getElementById(id).value || "").trim();
+  if(v === "") return "";
+  const n = parseFloat(v);
+  return (isFinite(n) && n > 0) ? n + "GB" : "";
+}
+function cfgSyncLimits(){
+  document.getElementById("cfgRelayLimits").hidden = !document.getElementById("cfgPublicRelay").checked;
+  document.getElementById("cfgExitLimits").hidden  = !document.getElementById("cfgExit").checked;
+}
+
+async function openCfgModal(pubkey, label){
+  cfgTarget = {pubkey: pubkey || "", label: label || "node"};
+  document.getElementById("cfgWho").textContent = cfgTarget.label;
+  document.getElementById("cfgMsg").textContent = "";
+  document.getElementById("cfgPass").value = "";
+  document.getElementById("cfgScope").value = "node";
+  document.getElementById("cfgSeedNote").textContent = "—";
+
+  /* RESET EVERY FIELD BEFORE FETCHING.
+     The sheet is a single reused DOM node, so anything not overwritten still
+     shows the PREVIOUS node's value. The config fetch below can fail -- a 404,
+     an offline node, a slow control socket -- and the old code assigned these
+     fields only on the success path, so a failed open silently displayed the
+     last node's name and IP under the correct heading. Wrong data that looks
+     right is worse than a blank form, and this one was one Apply away from
+     writing another node's address onto this one. */
+  for(const id of ["cfgName","cfgIp","cfgRv","cfgRvAuth","cfgRelayList",
+                   "cfgRelayUp","cfgRelayDown","cfgRelayQuota",
+                   "cfgExitUp","cfgExitDown","cfgExitQuota"]){
+    document.getElementById(id).value = "";
+  }
+  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit"]){
+    document.getElementById(id).checked = false;
+  }
+  document.getElementById("cfgTrackersOn").checked = true;
+  document.getElementById("cfgApprove").style.display = "none";
+
+  /* Identity and PQ come from the session list, which is already in memory and
+     does not depend on the request below. Set them FIRST so they are right even
+     if that request fails. */
+  const sess = sessionByPubkey(cfgTarget.pubkey) || {};
+  document.getElementById("cfgName").value = sess.name || "";
+  document.getElementById("cfgIp").value   = sess.overlay_ip || "";
+  document.getElementById("cfgPq").checked = !!sess.post_quantum;
+  cfgPqWas = !!sess.post_quantum;
+  document.getElementById("cfgApprove").style.display = (sess.approved === false) ? "" : "none";
+  document.getElementById("cfgExit").checked = !!sess.exit;
+
+  try{
+    const r = await fetch("/api/node-config-get?pubkey=" + encodeURIComponent(cfgTarget.pubkey), {headers:XRW});
+    const d = r.ok ? await r.json() : {};
+    /* Live state wins over an absent record for THIS node too (the API returns
+       d.live only for the node serving the dashboard). */
+    const lv = d.live || {};
+    document.getElementById("cfgDht").checked         = d.has_node_record ? !!d.dht
+                                                        : !!(lv.dht && lv.dht.enabled) || !!d.dht;
+    document.getElementById("cfgUseRelays").checked   = d.has_node_record ? !!d.use_public_relays
+                                                        : !!(lv.relay_client && lv.relay_client.enabled) || !!d.use_public_relays;
+    document.getElementById("cfgPublicRelay").checked = d.has_node_record ? !!d.public_relay
+                                                        : !!(lv.public_relay && lv.public_relay.enabled) || !!d.public_relay;
+    /* Fall back to what the node is ACTUALLY doing. exit_node in the config
+       record only exists once someone has set it here; a node that was made an
+       exit through its YAML or env has no record, so the box read unticked on
+       a node that is visibly an exit (green E in the table). Showing "off" for
+       something that is on is worse than showing nothing -- pressing Apply
+       would then have signed a record turning it off. The session's own
+       advertised state is the truth for this. */
+    if(d.has_node_record) document.getElementById("cfgExit").checked = !!d.exit_node;
+    document.getElementById("cfgRelayUp").value    = cfgToMbps(d.relay_up_bps);
+    document.getElementById("cfgRelayDown").value  = cfgToMbps(d.relay_down_bps);
+    document.getElementById("cfgRelayQuota").value = cfgToGB(d.relay_quota_bytes);
+    document.getElementById("cfgExitUp").value     = cfgToMbps(d.exit_up_bps);
+    document.getElementById("cfgExitDown").value   = cfgToMbps(d.exit_down_bps);
+    document.getElementById("cfgExitQuota").value  = cfgToGB(d.exit_quota_bytes);
+    document.getElementById("cfgRelayList").value  = (d.trackers||[]).join("\n");
+    document.getElementById("cfgTrackersOn").checked = d.trackers_on !== false;
+    document.getElementById("cfgRv").value      = d.rendezvous || "";
+    document.getElementById("cfgRvAuth").value  = d.rendezvous_auth || "";
+
+    /* Say where the values came from. Without this, a node inheriting the
+       network-wide default looks identical to one configured individually,
+       and an admin editing it cannot tell whether they are about to create an
+       override or edit an existing one. */
+    const note = document.getElementById("cfgSeedNote");
+    if(d.has_node_record)      note.textContent = "showing this node's own settings";
+    else if(d.has_network_wide) note.textContent = "inherited from the network-wide default";
+    else                        note.textContent = "no settings recorded yet — showing defaults";
+  }catch(e){
+    document.getElementById("cfgMsg").textContent =
+      "Could not read this node's current settings — the toggles below are defaults, " +
+      "not what the node is running. Applying now would overwrite its settings. (" + e + ")";
+  }
+  cfgSyncLimits();
+  cfgSyncTrackerGate();
+  document.getElementById("cfgModal").classList.add("show");
+}
+function closeCfgModal(){ document.getElementById("cfgModal").classList.remove("show"); cfgTarget = null; }
+
+async function applyCfg(){
+  if(!cfgTarget) return;
+  const msg = document.getElementById("cfgMsg"), btn = document.getElementById("cfgApply");
+  const pass = document.getElementById("cfgPass").value;
+  if(!pass){ msg.textContent = "Enter the network admin password."; return; }
+  msg.textContent = ""; btn.disabled = true;
+  try{
+    /* Identity first, as a separate admin-signed PROVISION. Name and overlay
+       address are provisioned facts about a node, not runtime settings, and
+       they travel on their own record -- folding them into one dialog is a UI
+       decision, not a reason to merge two different signed types. Sent only
+       when something actually changed, so opening the sheet and pressing
+       Apply does not re-provision every node it touches. */
+    const nm = document.getElementById("cfgName").value.trim();
+    const ipv = document.getElementById("cfgIp").value.trim();
+    const sess0 = sessionByPubkey(cfgTarget.pubkey) || {};
+    if((nm && nm !== (sess0.name||"")) || (ipv && ipv !== (sess0.overlay_ip||""))){
+      const pr = await fetch("/api/provision", {method:"POST",
+        headers:{...XRW,"Content-Type":"application/json"},
+        body: JSON.stringify({pubkey: cfgTarget.pubkey, address: ipv, name: nm, password: pass})});
+      if(!pr.ok){ msg.textContent = (await pr.text()) || "Name/IP update failed."; return; }
+    }
+    /* Post-quantum, as its own signed policy record. Sent only on a change:
+       re-signing an unchanged policy would bump its epoch across the mesh for
+       nothing. */
+    const pqNow = document.getElementById("cfgPq").checked;
+    if(pqNow !== cfgPqWas){
+      const pq = await fetch("/api/policy", {method:"POST",
+        headers:{...XRW,"Content-Type":"application/json"},
+        body: JSON.stringify({pubkey: cfgTarget.pubkey, post_quantum: pqNow, password: pass})});
+      if(!pq.ok){ msg.textContent = (await pq.text()) || "Post-quantum update failed."; return; }
+      cfgPqWas = pqNow;
+    }
+    const relays = document.getElementById("cfgRelayList").value
+      .split(/[\r\n,]+/).map(x=>x.trim()).filter(Boolean);
+    const wide = document.getElementById("cfgScope").value === "network";
+    const body = {
+      pubkey: wide ? "" : cfgTarget.pubkey,
+      dht:               document.getElementById("cfgDht").checked,
+      use_public_relays: document.getElementById("cfgUseRelays").checked,
+      public_relay:      document.getElementById("cfgPublicRelay").checked,
+      exit_node:         document.getElementById("cfgExit").checked,
+      trackers:          relays,
+      trackers_on:       document.getElementById("cfgTrackersOn").checked,
+      rendezvous:        document.getElementById("cfgRv").value.trim(),
+      rendezvous_auth:   document.getElementById("cfgRvAuth").value.trim(),
+      relay_up:    cfgMbpsField("cfgRelayUp"),
+      relay_down:  cfgMbpsField("cfgRelayDown"),
+      relay_quota: cfgGBField("cfgRelayQuota"),
+      exit_up:     cfgMbpsField("cfgExitUp"),
+      exit_down:   cfgMbpsField("cfgExitDown"),
+      exit_quota:  cfgGBField("cfgExitQuota"),
+      password: pass,
+    };
+    const r = await fetch("/api/node-config", {method:"POST",
+      headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    /* Surface the server's refusal verbatim: an unlimited public relay, a
+       relay with the DHT off, a wrong password. Each needs a different fix. */
+    if(!r.ok){ msg.textContent = await r.text(); return; }
+    msg.textContent = "Saved. It reaches that node over the mesh within a few seconds.";
+    setTimeout(closeCfgModal, 1200);
+  }catch(e){ msg.textContent = "request failed: " + e;
+  } finally { btn.disabled = false; }
+}
+
+/* "Copy this node's relay list" — the reseed. Pulls the relay list from the
+   node the dashboard runs on and drops it into the form for the target, so a
+   working list can be propagated without retyping it per node. */
+async function cfgSeedFromSelf(){
+  const note = document.getElementById("cfgSeedNote");
+  try{
+    const r = await fetch("/api/node-config-get", {headers:XRW});   // no pubkey = this node
+    const d = r.ok ? await r.json() : {};
+    const list = d.trackers || [];
+    if(!list.length){ note.textContent = "this node has no trackers to copy"; return; }
+    document.getElementById("cfgRelayList").value = list.join("\n");
+    note.textContent = "copied " + list.length + " tracker(s) from this node";
+  }catch(e){ note.textContent = "could not read this node's relay list"; }
+}
+
+/* Look a session up by key. The sheet is keyed by pubkey, while the table is
+   keyed by remote endpoint, and a roaming node changes endpoint but not key. */
+function sessionByPubkey(pk){
+  if(!pk) return null;
+  return (lastSessions||[]).find(x => x.pubkey === pk) || null;
+}
+
+/* The tracker switch may only be turned OFF when something else can still find
+   peers -- the DHT, or a rendezvous server. Disabling every discovery method at
+   once leaves a node that cannot rejoin its own network and cannot be told to,
+   because the instruction would have to reach it over the network it just left.
+   Enforced in the UI as a disabled control with the reason shown, rather than
+   as a refusal after the fact. */
+function cfgSyncTrackerGate(){
+  const dht = document.getElementById("cfgDht").checked;
+  const rv  = document.getElementById("cfgRv").value.trim() !== "";
+  const box = document.getElementById("cfgTrackersOn");
+  const note = document.getElementById("cfgTrackersNote");
+  const alt = dht || rv;
+  if(!alt){
+    box.checked = true;
+    box.disabled = true;
+    note.textContent = "Trackers are the only way this node can currently find peers. " +
+      "Turn on the DHT or set a rendezvous server before switching them off.";
+  } else {
+    box.disabled = false;
+    note.textContent = "Finds peers through public BitTorrent trackers. " +
+      (dht ? "The DHT" : "The rendezvous server") + " can do this instead — " +
+      "the list below is kept either way.";
+  }
+}
+
+document.getElementById("cfgCancel").addEventListener("click", closeCfgModal);
+document.getElementById("cfgModal").addEventListener("click", (e)=>{ if(e.target.id==="cfgModal") closeCfgModal(); });
+document.getElementById("cfgApply").addEventListener("click", applyCfg);
+document.getElementById("cfgSeed").addEventListener("click", cfgSeedFromSelf);
+document.getElementById("cfgPublicRelay").addEventListener("change", cfgSyncLimits);
+document.getElementById("cfgExit").addEventListener("change", cfgSyncLimits);
+document.getElementById("cfgDht").addEventListener("change", cfgSyncTrackerGate);
+document.getElementById("cfgRv").addEventListener("input", cfgSyncTrackerGate);
+document.getElementById("cfgApprove").addEventListener("click", ()=>{
+  if(!cfgTarget) return;
+  const pk = cfgTarget.pubkey, label = cfgTarget.label;
+  closeCfgModal();
+  openApproveModal(pk, label);
+});
+document.getElementById("cfgRevoke").addEventListener("click", async ()=>{
+  if(!cfgTarget) return;
+  const sess = sessionByPubkey(cfgTarget.pubkey);
+  const b = document.getElementById("cfgRevoke");
+  b.disabled = true; const label = b.textContent; b.textContent = "…";
+  const ok = await doAction("revoke", cfgTarget.pubkey, sess && sess.remote,
+                            (sess && sess.overlay_ip) || cfgTarget.label);
+  b.disabled = false; b.textContent = label;
+  if(ok){ closeCfgModal(); await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
+});
+document.getElementById("nodeSettings").addEventListener("click", ()=>{
+  const s = sessionByRemote(nodeSel); if(!s) return;
+  closeNodeModal();
+  openCfgModal(s.pubkey, (s.overlay_ip || s.remote || "node") + (s.name ? " · " + s.name : ""));
+});
 </script>
 </body>
 </html>
