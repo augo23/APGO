@@ -4,8 +4,8 @@
 # Then set your Team on both targets and Run on a device.
 name: APGO
 options:
-  bundleIdPrefix: org.apgo
-  # iOS 16.0: the SwiftUI UI uses NavigationStack (ContentView, SupportView),
+  bundleIdPrefix: com.APGOveraly
+  # iOS 16.0: the SwiftUI UI uses NavigationStack (ContentView, SettingsView),
   # which is 16.0+. iOS 16 covers iPhone 8 and newer, so this isn't a real
   # reach limitation.
   deploymentTarget:
@@ -16,10 +16,10 @@ settings:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
-    # Apple Developer team: AUSTIN PAUL GOULD. Baked in here so the selection
+    # Apple Developer team. Baked in here so the selection
     # survives every `xcodegen generate` (picking it in Xcode's Signing editor
     # only writes to the generated .xcodeproj, which regeneration overwrites).
-    DEVELOPMENT_TEAM: "58ZSP5V9AC"
+    DEVELOPMENT_TEAM: "KG664QFM64"
     CODE_SIGN_STYLE: Automatic
 
 packages: {}
@@ -37,7 +37,7 @@ targets:
         embed: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.apgo.APGO
+        PRODUCT_BUNDLE_IDENTIFIER: "com.APGOveraly.-"
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/APGO.entitlements
         GENERATE_INFOPLIST_FILE: NO
@@ -67,7 +67,7 @@ targets:
         embed: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.apgo.APGO.Tunnel
+        PRODUCT_BUNDLE_IDENTIFIER: "com.APGOveraly.-.Tunnel"
         INFOPLIST_FILE: Tunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: Tunnel/APGOTunnel.entitlements
         GENERATE_INFOPLIST_FILE: NO

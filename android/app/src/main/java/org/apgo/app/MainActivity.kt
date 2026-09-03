@@ -10,6 +10,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -30,8 +31,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.apgo.overlaymobile.Overlaymobile
 import org.json.JSONArray
 import org.json.JSONObject
@@ -443,6 +446,11 @@ data class Peer(
     val isExit: Boolean,       // peer advertises as an internet exit node
     val activeExit: Boolean,   // the exit THIS device currently egresses through
     val lastSeenUnix: Long,
+    // Admission control. The app could not previously see these at all, so a
+    // device stuck in "pending" looked like a healthy peer that inexplicably
+    // passed no traffic.
+    val pubkey: String = "",   // base64 static key — the identity an approval names
+    val approved: Boolean = true,
 ) {
     fun lastSeenText(): String {
         if (lastSeenUnix <= 0) return "—"
@@ -477,6 +485,11 @@ data class Peer(
                     o.optBoolean("exit"),
                     o.optBoolean("active_exit"),
                     o.optLong("last_seen_unix"),
+                    o.optString("pubkey"),
+                    // Defaults to TRUE: a core build that predates this field
+                    // is reporting nothing, not "unapproved", and marking every
+                    // peer pending would be a false alarm on every row at once.
+                    o.optBoolean("approved", true),
                 )
             }
         } catch (e: Exception) { emptyList() }
@@ -500,6 +513,26 @@ fun MainScreen(
 ) {
     var connected by remember { mutableStateOf(false) }
     var peers by remember { mutableStateOf<List<Peer>>(emptyList()) }
+    // Admission control, polled with the peer list.
+    //   admissionRequired — this network gates devices (it has an admin key)
+    //   selfApproved      — THIS device is allowed to pass data
+    //   canSignApprovals  — we hold the sealed admin key, so we can approve
+    //                       others given the password. It arrives by mesh
+    //                       gossip, so it flips to true on its own shortly
+    //                       after connecting.
+    var admissionRequired by remember { mutableStateOf(false) }
+    var selfApproved by remember { mutableStateOf(true) }
+    var canSignApprovals by remember { mutableStateOf(false) }
+    // Non-null while the approval dialog is open. The Peer is the target;
+    // null-with-dialog-open means "approve this device".
+    var approveTarget by remember { mutableStateOf<Peer?>(null) }
+    var showApprove by remember { mutableStateOf(false) }
+    var approvePassword by remember { mutableStateOf("") }
+    var approveError by remember { mutableStateOf<String?>(null) }
+    var approveBusy by remember { mutableStateOf(false) }
+    val onApproveRequest: (Peer) -> Unit = { p ->
+        approveTarget = p; approvePassword = ""; approveError = null; showApprove = true
+    }
     // Full-VPN outproxy diagnostics from the core ({"use_exit","pin","exits":[…]}).
     var exits by remember { mutableStateOf<JSONObject?>(null) }
     // Network + data-path status from the core (NAT type, LAN discovery,
@@ -529,6 +562,13 @@ fun MainScreen(
                 try { Peer.parseList(Overlaymobile.peersJSON()).sortedBy { it.ipKey() } }
                 catch (e: Throwable) { emptyList() }
             } else emptyList()
+            if (connected) {
+                admissionRequired = try { Overlaymobile.admissionRequired() } catch (e: Throwable) { false }
+                selfApproved = try { Overlaymobile.selfApproved() } catch (e: Throwable) { true }
+                canSignApprovals = try { Overlaymobile.adminKeyAvailable() } catch (e: Throwable) { false }
+            } else {
+                admissionRequired = false; selfApproved = true; canSignApprovals = false
+            }
             exits = if (connected && state.useExit) {
                 try { JSONObject(Overlaymobile.exitsJSON()) } catch (e: Throwable) { null }
             } else null
@@ -777,6 +817,26 @@ fun MainScreen(
                 }
             }
 
+            // NOT APPROVED. Peers accept this device's control traffic, so it
+            // appears in their lists looking perfectly healthy while every
+            // packet of real data is dropped. From here that presents as
+            // "connected, but nothing works".
+            if (connected && admissionRequired && !selfApproved) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("\u26a0 This device is not approved",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFE6A400))
+                    Text("Peers show it as connected but discard all of its data, so nothing is " +
+                         "reachable. Approve it from the admin panel of another node that holds " +
+                         "the network admin key — a device cannot approve itself.",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+
             // Peers (weighted so the list scrolls and the Support button stays put).
             Text("Peers (${peers.size})", style = MaterialTheme.typography.titleSmall)
             LazyColumn(
@@ -794,12 +854,88 @@ fun MainScreen(
                     // cores that don't emit `remote`, since Compose crashes on
                     // duplicate keys). Keeps scroll/animation state attached to the
                     // right device across refreshes.
-                    itemsIndexed(peers, key = { i, p -> "$i:${p.remote}" }) { _, p -> PeerRow(p) }
+                    itemsIndexed(peers, key = { i, p -> "$i:${p.remote}" }) { _, p ->
+                        PeerRow(p, canApprove = canSignApprovals, onApprove = onApproveRequest)
+                    }
                 }
             }
 
             // Support at the bottom.
             Button(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text("♥ Support APGO") }
+
+            // Approval dialog. Signs with the network admin key (unsealed from
+            // the password, in memory, for the duration of one signature) and
+            // gossips the record to the mesh — the same thing the desktop and
+            // container dashboards do, so peers accept it identically.
+            if (showApprove) {
+                val label = approveTarget?.let {
+                    if (it.overlayIp.isBlank()) it.keyFp else it.overlayIp
+                } ?: "\u2014"
+                AlertDialog(
+                    onDismissRequest = { if (!approveBusy) showApprove = false },
+                    title = { Text("Approve $label") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            approveTarget?.name?.takeIf { it.isNotBlank() }?.let {
+                                Text(it, style = MaterialTheme.typography.bodySmall)
+                            }
+                            OutlinedTextField(
+                                value = approvePassword,
+                                onValueChange = { approvePassword = it; approveError = null },
+                                label = { Text("Network admin password") },
+                                singleLine = true,
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            approveError?.let {
+                                Text(it, style = MaterialTheme.typography.bodySmall,
+                                     color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            enabled = approvePassword.isNotBlank() && !approveBusy,
+                            onClick = {
+                                approveBusy = true
+                                approveError = null
+                                scope.launch {
+                                    val err = withContext(Dispatchers.IO) {
+                                        // Only ever a SELECTED PEER. A device
+                                        // cannot approve itself; an approval
+                                        // must come from an admin elsewhere.
+                                        val target = approveTarget?.pubkey ?: ""
+                                        if (target.isBlank()) "No device selected."
+                                        else try {
+                                            Overlaymobile.approveDevice(approvePassword, target, "approve")
+                                            null
+                                        } catch (e: Throwable) {
+                                            e.message ?: "Approval failed."
+                                        }
+                                    }
+                                    approveBusy = false
+                                    if (err != null) {
+                                        approveError = err
+                                    } else {
+                                        approvePassword = ""
+                                        showApprove = false
+                                        approveTarget = null
+                                        // Reflect the result immediately; waiting
+                                        // for the next poll reads as "did that
+                                        // work?".
+                                        selfApproved = try { Overlaymobile.selfApproved() } catch (e: Throwable) { selfApproved }
+                                        peers = try {
+                                            Peer.parseList(Overlaymobile.peersJSON()).sortedBy { it.ipKey() }
+                                        } catch (e: Throwable) { peers }
+                                    }
+                                }
+                            }) { Text(if (approveBusy) "Approving\u2026" else "Approve") }
+                    },
+                    dismissButton = {
+                        TextButton(enabled = !approveBusy,
+                            onClick = { showApprove = false; approveTarget = null }) { Text("Cancel") }
+                    })
+            }
             Text(
                 "© 2026 The APGO Team · Another Pretty Good Overlay\nFree & open source, GPL-3.0-or-later",
                 style = MaterialTheme.typography.labelSmall,
@@ -811,11 +947,14 @@ fun MainScreen(
 }
 
 @Composable
-fun PeerRow(p: Peer) {
+fun PeerRow(p: Peer, canApprove: Boolean = false, onApprove: (Peer) -> Unit = {}) {
+    val pending = !p.approved && p.pubkey.isNotBlank()
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (pending && canApprove) Modifier.clickable { onApprove(p) } else Modifier)
     ) {
         Text(if (p.established) "●" else "○")
         Column(Modifier.weight(1f)) {
@@ -838,6 +977,14 @@ fun PeerRow(p: Peer) {
                 color = Color(0xFF3FB950))
         }
         if (p.postQuantum) Text("PQ", style = MaterialTheme.typography.labelSmall)
+        if (pending) {
+            Text(
+                if (canApprove) "PENDING \u2013 TAP" else "PENDING",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFE3B341),
+            )
+        }
         Text(p.lastSeenText(), style = MaterialTheme.typography.labelSmall)
     }
 }

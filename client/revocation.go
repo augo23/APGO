@@ -406,6 +406,11 @@ func (t *SessionTable) RevokeByKey(pub [32]byte) int {
 	t.mu.Unlock()
 	// Block this peer's overlay IP at the data plane too (covers relayed paths).
 	setKeyRevoked(pub, true)
+	// Drop its traffic counters. A revoked device is gone; leaving its totals
+	// in the table means the dashboard keeps a row of stale numbers for a peer
+	// that can no longer transfer a byte, and the table grows for the life of
+	// the process across repeated revocations.
+	peerStats.Forget(pub)
 	for _, a := range lost {
 		ipLearning.ForgetAddr(a)
 		if cb != nil {

@@ -54,3 +54,56 @@ min_announce_interval_seconds: 30
 # extremely aggressive NATs; sessions self-heal after ~3 missed intervals.
 # Clamped 5..120.
 # keepalive_seconds: 25
+
+# --- Distributed discovery (DHT / Kademlia) ---------------------------------
+# The DHT is a THIRD discovery source alongside trackers and rendezvous, and
+# the only one that needs no server: two nodes with the same PSK find each
+# other with no infrastructure between them. It runs on this client's own UDP
+# port, so the NAT mapping it keeps warm is the same one peers punch to.
+#
+# The lookup key is BLINDED with your PSK — HMAC-SHA1(psk, network_name), not
+# SHA-1(network_name) — so nobody who guesses your network name can enumerate
+# your members on the public swarm. Rotating the PSK rotates the key.
+# dht: false                     # env: DHT=1/0. Default OFF — it shares the
+#                                # overlay UDP socket and dials endpoints from
+#                                # the public swarm, some of which are junk.
+# dht_public_key: false          # announce the PLAIN infohash instead.
+#                                # Leave false: true makes your membership
+#                                # publicly enumerable by name.
+
+# --- Public relay -----------------------------------------------------------
+# Two independent switches:
+#
+#   use_public_relays  — USE other people's relays when a direct path is
+#                        impossible (symmetric NAT, CGNAT). Costs you nothing
+#                        and costs them only what THEY agreed to donate.
+#   public_relay       — BE a relay for others. Off by default.
+#
+# A public relay carries full overlay traffic for nodes outside your network.
+# It cannot read any of it (the traffic is Noise-encrypted end to end and the
+# relay holds no keys) and it cannot join your overlay (it holds no PSK). It
+# only pairs nodes that present the same blinded key, so it can never bridge
+# two unrelated overlays.
+#
+# use_public_relays: false       # env: USE_PUBLIC_RELAYS=1/0. Default OFF —
+#                                # an open circuit becomes a synthetic 240/4
+#                                # route and silently swallows the data plane
+#                                # if that circuit is bad. Enable deliberately.
+# public_relay: false            # env: PUBLIC_RELAY=1. Default OFF.
+#
+# What you are willing to give. Rates accept bytes ("5MB", "500kb") or bits as
+# ISPs quote them ("20mbit" = 2.5 MB/s), "unlimited" for no cap. Defaults are
+# 1MB/s each way — a modest, visible donation rather than a blank cheque.
+# relay_up_limit: "1MB"          # env: RELAY_UP_LIMIT
+# relay_down_limit: "1MB"        # env: RELAY_DOWN_LIMIT
+# relay_per_circuit_limit: "256kb"   # one peer's share, so the first caller
+#                                    # cannot claim the whole allowance
+# relay_quota: "200GB"           # TOTAL per period; relaying stops when spent
+# relay_quota_days: 30           # and resumes when the period rolls over.
+#                                # Usage is PERSISTED, so restarting does not
+#                                # reset the budget. Blank = no cap.
+# relay_max_circuits: 64         # env: RELAY_MAX_CIRCUITS
+# relay_max_per_ip: 4            # env: RELAY_MAX_PER_IP
+#
+# static_relays:                 # skip DHT discovery, use a relay you run
+#   - "relay.example.com:6969"   # env: STATIC_RELAYS (comma-separated)

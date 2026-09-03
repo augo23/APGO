@@ -7,12 +7,34 @@
 # It: quits & uninstalls any previous version, installs prerequisites (Xcode
 # CLT check, Go), builds the native client + menu-bar app in a temporary dir,
 # installs a fresh APGO.app to /Applications, then deletes all build artifacts.
+#
+#     --fresh    ALSO delete this Mac's node identity and settings (~/.apgo).
+#
+# Settings and identity are KEPT by default. They did not used to be, and the
+# consequence was severe enough to be worth spelling out: ~/.apgo holds
+# node.key, this machine's cryptographic identity on the overlay. Deleting it
+# means the Mac rejoins as a brand-new, unknown device — new key fingerprint,
+# and on a network with admission control it lands in "pending" and passes no
+# data until an admin approves it again. Reinstalling to fix a problem should
+# not, by itself, evict the machine from its own network.
 
 set -euo pipefail
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- flags ------------------------------------------------------------------
+FRESH=0
+for arg in "$@"; do
+  case "$arg" in
+    --fresh) FRESH=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) die "unknown option: $arg (did you mean --fresh?)" ;;
+  esac
+done
 
 [[ "$(uname)" == "Darwin" ]] || die "This installer is for macOS."
 
@@ -229,16 +251,42 @@ fi
 
 log "UDP port(s) $(apgo_ports | tr '\n' ' ')are free."
 
-# Fresh session: wipe the per-user state so old keys/config/sockets don't linger
-# (avoids stale admin keys, node identity, and control sockets). Uses the real
-# user's home even under sudo.
+# Per-user state (~/.apgo): node identity, settings, admin key, control sockets.
 #
-# NOTE: this also deletes node.key, so the Mac REJOINS THE MESH AS A NEW
-# DEVICE — new identity, new key fingerprint, and re-approval if the network
-# uses admission control. That is intentional here, but it is why a reinstall
-# makes the machine "disappear" from other nodes' peer lists.
-log "Clearing previous session state ($USER_HOME/.apgo)…"
-rm -rf "$USER_HOME/.apgo" 2>/dev/null || sudo rm -rf "$USER_HOME/.apgo" 2>/dev/null || true
+# KEPT unless --fresh. This used to be wiped unconditionally, and the note that
+# stood here described the damage accurately while calling it intentional:
+# deleting node.key makes the Mac rejoin the mesh AS A NEW DEVICE — new
+# identity, new fingerprint, and re-approval required if the network uses
+# admission control. Combined with enforcement being on, the ordinary act of
+# reinstalling silently locked this machine out of its own network. A stale
+# socket is worth clearing; a cryptographic identity is not the installer's to
+# throw away.
+#
+# Stale control sockets ARE cleared either way: they are the thing that
+# genuinely goes bad across a reinstall, and they carry no identity.
+if [[ "$FRESH" == "1" ]]; then
+  # A full wipe: config, approvals, provisions, policy, cached endpoints, logs,
+  # sockets AND node.key. Nothing is preserved.
+  #
+  # The one consequence worth stating plainly, because it is invisible from
+  # this Mac: node.key is the machine's identity on the overlay, and peers
+  # route to KEYS, not machines -- an admin provision binds an overlay address
+  # to a public key. A new key therefore needs a new provision. Until an admin
+  # provisions this Mac's address onto its NEW fingerprint, the Mac will
+  # establish sessions in both directions, report every counter healthy, and
+  # receive nothing, because peers still resolve that address to the previous
+  # key. The installer prints the new fingerprint at the end for that reason.
+  log "--fresh: erasing $USER_HOME/.apgo (settings, state and node identity)…"
+  warn "This Mac rejoins as a NEW device: new key, re-approval if admission"
+  warn "control is on, and an admin must provision its overlay address onto"
+  warn "the new key or it will look connected and receive nothing."
+  rm -rf "$USER_HOME/.apgo" 2>/dev/null || sudo rm -rf "$USER_HOME/.apgo" 2>/dev/null || true
+
+elif [[ -d "$USER_HOME/.apgo" ]]; then
+  log "Keeping existing settings and node identity ($USER_HOME/.apgo). Use --fresh to reset."
+  rm -f "$USER_HOME/.apgo"/*.sock "$USER_HOME/.apgo/client.pid" 2>/dev/null \
+    || sudo rm -f "$USER_HOME/.apgo"/*.sock "$USER_HOME/.apgo/client.pid" 2>/dev/null || true
+fi
 
 # Recreate it NOW, owned by the real user.
 #

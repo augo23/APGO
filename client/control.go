@@ -104,27 +104,27 @@ var revoked = newRevocationList(revocationTTLFromEnv())
 
 // SessionInfo is the JSON view of one live session, served to the admin UI.
 type SessionInfo struct {
-	Remote       string `json:"remote"`     // peer UDP endpoint (ip:port) — stable table key
-	OverlayIP    string `json:"overlay_ip"` // announced or key-derived overlay address
-	Name         string `json:"name"`       // friendly name the peer advertises, if any
-	KeyFP        string `json:"key_fp"`     // short fingerprint of the peer static key
-	PubKey       string `json:"pubkey"`     // base64 peer static key
-	Role         string `json:"role"`       // "initiator" or "responder"
-	Approved     bool   `json:"approved"`   // admission control: peer is admin-approved
-	PostQuantum  bool   `json:"post_quantum"` // peer's advertised live PQ state
-	Established  bool   `json:"established"`
-	Exit         bool   `json:"exit"`        // peer advertises as an internet exit node
-	ExitFailed   bool   `json:"exit_failed"` // peer WANTS to be an exit but its NAT setup failed (gossiped)
-	V6           bool   `json:"v6"`          // peer has a globally routable IPv6 transport address (gossiped)
+	Remote      string `json:"remote"`       // peer UDP endpoint (ip:port) — stable table key
+	OverlayIP   string `json:"overlay_ip"`   // announced or key-derived overlay address
+	Name        string `json:"name"`         // friendly name the peer advertises, if any
+	KeyFP       string `json:"key_fp"`       // short fingerprint of the peer static key
+	PubKey      string `json:"pubkey"`       // base64 peer static key
+	Role        string `json:"role"`         // "initiator" or "responder"
+	Approved    bool   `json:"approved"`     // admission control: peer is admin-approved
+	PostQuantum bool   `json:"post_quantum"` // peer's advertised live PQ state
+	Established bool   `json:"established"`
+	Exit        bool   `json:"exit"`        // peer advertises as an internet exit node
+	ExitFailed  bool   `json:"exit_failed"` // peer WANTS to be an exit but its NAT setup failed (gossiped)
+	V6          bool   `json:"v6"`          // peer has a globally routable IPv6 transport address (gossiped)
 	// IPDerived: the overlay IP shown is a GUESS derived from the peer's
 	// public key, because the peer has not announced one and no admin
 	// provision exists. It is what that peer WOULD get by default, but it is
 	// not confirmed — and presenting a guess identically to a known address
 	// is how a peer ends up "showing the wrong IP" in the UI.
-	IPDerived    bool   `json:"ip_derived"`
-	ActiveExit   bool   `json:"active_exit"` // the exit THIS device currently egresses through
-	Relayed      bool   `json:"relayed"`     // reachable only via a relay (no direct session)
-	Via          string `json:"via"`         // relayed rows: the relaying node (overlay IP or endpoint)
+	IPDerived  bool   `json:"ip_derived"`
+	ActiveExit bool   `json:"active_exit"` // the exit THIS device currently egresses through
+	Relayed    bool   `json:"relayed"`     // reachable only via a relay (no direct session)
+	Via        string `json:"via"`         // relayed rows: the relaying node (overlay IP or endpoint)
 	// Path is what packets to this peer ACTUALLY do, as opposed to Established,
 	// which only says a handshake completed once. The two diverge constantly:
 	// a peer can hold a perfectly good established session while the routing
@@ -136,6 +136,13 @@ type SessionInfo struct {
 	Path         string `json:"path"`
 	SinceUnix    int64  `json:"since_unix"`     // when the session was created
 	LastSeenUnix int64  `json:"last_seen_unix"` // last inbound activity
+
+	// Traffic is the per-peer byte accounting (peerstats.go): lifetime totals
+	// and the current smoothed rate in each direction. Present on every row
+	// that has a static key, including relayed ones — a relayed peer's bytes
+	// are real bytes and belong in the total, even though they crossed
+	// somebody else's link to get here.
+	Traffic peerTraffic `json:"traffic"`
 }
 
 // pathLabel classifies how traffic to overlayIP currently leaves this device.
@@ -433,12 +440,12 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 		info.Name = peerNameByPub(r.key)
 		info.Approved = admitted(r.key)
 		// PQ has REDUNDANT paths to the UI, exactly like the exit badge below.
-	// peerPQByPub is what the peer ADVERTISED, which needs its 'p' frame to
-	// have arrived and survived. pqReady is what we KNOW: the ML-KEM layer
-	// with this peer is up on our side, so the session is post-quantum
-	// protected whatever the gossip says. Either one lights the shield, so a
-	// single lost frame can no longer hide it.
-	info.PostQuantum = peerPQByPub(r.key) || pqReady(r.key)
+		// peerPQByPub is what the peer ADVERTISED, which needs its 'p' frame to
+		// have arrived and survived. pqReady is what we KNOW: the ML-KEM layer
+		// with this peer is up on our side, so the session is post-quantum
+		// protected whatever the gossip says. Either one lights the shield, so a
+		// single lost frame can no longer hide it.
+		info.PostQuantum = peerPQByPub(r.key) || pqReady(r.key)
 		info.Exit, info.ActiveExit = exitStatusFor(r.key)
 		// Merge the gossiped roster view into the direct row. Exit capability
 		// deliberately has REDUNDANT paths to the UI: the peer's own 'E'
@@ -761,7 +768,32 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 			})
 		}
 	}
+	// Attach per-peer traffic in ONE pass over the finished list rather than at
+	// each of the four places a row is built (direct sessions, learned relay
+	// routes, roster-only peers, heard-through-the-mesh peers). Those sites
+	// already disagree about which fields they set; adding a fifth thing each
+	// must remember is how a column ends up silently empty for one row type.
+	for i := range out {
+		out[i].Traffic = trafficForB64(out[i].PubKey)
+	}
 	return out
+}
+
+// trafficForB64 looks up a peer's byte counters by its base64 static key,
+// which is the only peer identifier every row type carries. Returns a zero
+// value for a row with no key (nothing has been exchanged with it yet), which
+// the UI renders as "—" rather than as a genuine zero.
+func trafficForB64(pubB64 string) peerTraffic {
+	if pubB64 == "" {
+		return peerTraffic{}
+	}
+	raw, err := base64.StdEncoding.DecodeString(pubB64)
+	if err != nil || len(raw) != 32 {
+		return peerTraffic{}
+	}
+	var pub [32]byte
+	copy(pub[:], raw)
+	return peerStats.Traffic(pub)
 }
 
 // relayPeerIdentity returns a best-effort friendly name, key fingerprint, and
@@ -786,7 +818,6 @@ func admittedB64(b64 string) bool {
 	copy(pub[:], raw)
 	return admitted(pub)
 }
-
 
 // peerPubByOverlayIP resolves an overlay address back to the device's full
 // static public key, using the announce table every node maintains.
@@ -972,7 +1003,7 @@ func startControlServer(socketPath string) {
 			// admin_trusted: this node trusts a network admin public key (so the
 			// network HAS an admin key), even if the encrypted blob for signing
 			// hasn't synced here yet.
-			"admin_trusted":  adminKeySet(),
+			"admin_trusted": adminKeySet(),
 			// Admission control: whether the network gates new devices, and whether
 			// THIS node has been approved (used by the mobile "pending" banner).
 			"admission_required": admissionRequired(),
@@ -980,21 +1011,21 @@ func startControlServer(socketPath string) {
 			// Current network-wide post-quantum state (admin-signed policy).
 			"post_quantum": pqEnabled,
 			// Local transport toggles (per-node).
-			"ipv6":               ipv6Enabled,
-			"pq_auth":            pqAuth,
-			"port_prediction":    portPredictionOn.Load(),
+			"ipv6":            ipv6Enabled,
+			"pq_auth":         pqAuth,
+			"port_prediction": portPredictionOn.Load(),
 			// How this node's NAT allocates external ports. "symmetric" means
 			// peers behind their own NAT cannot punch to us and will relay —
 			// the one diagnosis the UI previously had no way to show.
-			"nat":                natSummary(),
-			"nat_type":           natTypeLabel(),
-			"uptime_seconds":     int64(time.Since(nodeStartTime).Seconds()),
+			"nat":            natSummary(),
+			"nat_type":       natTypeLabel(),
+			"uptime_seconds": int64(time.Since(nodeStartTime).Seconds()),
 			// Distinct DEVICES, not sessions: a peer reached over both its LAN
 			// and WAN address holds two established sessions, and the peer table
 			// collapses those into one row. Counting addresses here made the
 			// card disagree with the table underneath it.
-			"sessions":           GlobalSessions.EstablishedPeerCount(),
-			"session_routes":     len(GlobalSessions.EstablishedAddrs()),
+			"sessions":       GlobalSessions.EstablishedPeerCount(),
+			"session_routes": len(GlobalSessions.EstablishedAddrs()),
 			// Full-VPN state: whether this node routes internet traffic via an
 			// exit, which exit is pinned ("" = automatic/fastest), and which exit
 			// is currently carrying traffic.
@@ -1030,7 +1061,7 @@ func startControlServer(socketPath string) {
 			// handshake TOWARD this node? "false" while peers exist is the
 			// signature of a firewall dropping inbound UDP on our port, which
 			// is the most common reason a node is permanently relayed.
-			"inbound_ok": func() bool { ok, _, _ := inboundStatus(); return ok }(),
+			"inbound_ok":        func() bool { ok, _, _ := inboundStatus(); return ok }(),
 			"inbound_last_unix": func() int64 { _, l, _ := inboundStatus(); return l }(),
 			"inbound_from":      func() string { _, _, f := inboundStatus(); return f }(),
 			"listen_port":       myUDPPort,
@@ -1065,6 +1096,9 @@ func startControlServer(socketPath string) {
 			// separate the causes of "the peer is listed but I can't reach
 			// anything on it", which are otherwise indistinguishable.
 			"data_path": dataStats(),
+			// One sentence naming WHY the data path is failing, derived from the
+			// drop counters. See dataPathVerdict.
+			"data_path_verdict": dataPathVerdict(),
 		})
 	})
 
@@ -1579,6 +1613,66 @@ func startControlServer(socketPath string) {
 		log.Printf("[admin] rendezvous config updated — %d server(s), credential set=%v (restart to apply servers)",
 			len(clean), auth != "")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "servers": clean, "auth_set": auth != ""})
+	})
+
+	// /api/discovery reports the DHT and both relay halves in one call, and
+	// accepts the panel's changes. One endpoint rather than three because the
+	// settings are interdependent — a public relay with the DHT off can never
+	// be found, and showing those two switches in separate round-trips is how
+	// a panel ends up letting an operator save that combination.
+	mux.HandleFunc("/api/discovery", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"dht":          dhtStatusSnapshot(gDHTKey),
+				"public_relay": publicRelayStatusSnapshot(),
+				"relay_client": relayClientStatusSnapshot(),
+			})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			DHT         bool `json:"dht"`
+			UseRelays   bool `json:"use_public_relays"`
+			PublicRelay bool `json:"public_relay"`
+			// Human strings, as typed into the panel: "5MB", "20mbit",
+			// "200GB", "unlimited".
+			UpLimit   string `json:"up_limit"`
+			DownLimit string `json:"down_limit"`
+			Quota     string `json:"quota"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		up, down, quota := parseRate(req.UpLimit), parseRate(req.DownLimit), parseRate(req.Quota)
+		// A public relay with no rate limit at all is almost never what an
+		// operator means, and it is not recoverable from once strangers find
+		// it. Refuse rather than silently accepting an open commitment.
+		if req.PublicRelay && up <= 0 && down <= 0 && quota <= 0 {
+			http.Error(w, "set at least one limit (upload, download, or a period quota) before enabling the public relay",
+				http.StatusBadRequest)
+			return
+		}
+		if req.PublicRelay && !req.DHT {
+			http.Error(w, "the public relay advertises itself through the DHT — enable the DHT too, or nobody can find this relay",
+				http.StatusBadRequest)
+			return
+		}
+		if err := saveNodeRelaySettings(req.DHT, req.UseRelays, req.PublicRelay, up, down, quota); err != nil {
+			http.Error(w, "no persistent settings path configured on this node (set NODE_SETTINGS_FILE)", http.StatusBadRequest)
+			return
+		}
+		log.Printf("[admin] discovery updated — dht=%v use_relays=%v public_relay=%v up=%s down=%s quota=%s",
+			req.DHT, req.UseRelays, req.PublicRelay, formatRate(up), formatRate(down), formatRate(quota))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"dht":          dhtStatusSnapshot(gDHTKey),
+			"public_relay": publicRelayStatusSnapshot(),
+			"relay_client": relayClientStatusSnapshot(),
+		})
 	})
 
 	mux.HandleFunc("/api/set-ipv6", func(w http.ResponseWriter, r *http.Request) {

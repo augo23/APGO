@@ -11,11 +11,11 @@
 		221F7209B42A3D675B0A3CDE /* OverlayConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6234183D5B85E276CF72CADE /* OverlayConfig.swift */; };
 		476E61D8302BD6AC2D1F4356 /* Overlaymobile.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */; };
 		478E6B458D42F25FD7A16A26 /* QRScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC3FCF5095690A3F563812BC /* QRScanner.swift */; };
-		4DB18FC266F58394BC8EE267 /* SupportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53C47826E4AF62087395CC63 /* SupportView.swift */; };
 		66196F87C25F5F7E4561ECC8 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A99E2A38E8BA5E6E708CE6 /* ContentView.swift */; };
 		705C666255196AB57CCE0BC4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8141F769148D848FBC6B9F6C /* Assets.xcassets */; };
 		71A8AE3D34056C91FAC9A060 /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3A0D60FC4C87046D79A6EAF /* TunnelManager.swift */; };
 		8C57ED03DB7A058FC162F525 /* Overlaymobile.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A946190D69ED737483C8D919 /* PhoneWidthLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68D15225A51C2C76CBC98E91 /* PhoneWidthLayout.swift */; };
 		D0B45766314C93DB2019D68D /* APGOApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D8225F3DC5369E28EB5B97C /* APGOApp.swift */; };
 		D53DF51313BAEE07F9958500 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D2412986976AAF4337DBA54 /* SettingsView.swift */; };
 		E79B8D4EA183DBB132C86BA5 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72B63BC4222287A09CB3BEF5 /* PacketTunnelProvider.swift */; };
@@ -64,9 +64,9 @@
 		118EDD17A12C2016EF2A6031 /* APGO.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = APGO.entitlements; sourceTree = "<group>"; };
 		36F404986E6B4CD423189A83 /* Overlaymobile.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Overlaymobile.xcframework; sourceTree = "<group>"; };
 		3D2412986976AAF4337DBA54 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
-		53C47826E4AF62087395CC63 /* SupportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportView.swift; sourceTree = "<group>"; };
 		5FD7D4943C11669509D440F1 /* LocalNetworkPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalNetworkPrompt.swift; sourceTree = "<group>"; };
 		6234183D5B85E276CF72CADE /* OverlayConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayConfig.swift; sourceTree = "<group>"; };
+		68D15225A51C2C76CBC98E91 /* PhoneWidthLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneWidthLayout.swift; sourceTree = "<group>"; };
 		72B63BC4222287A09CB3BEF5 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		8141F769148D848FBC6B9F6C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		905E4237EAA437F90E4133E0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -120,9 +120,9 @@
 				905E4237EAA437F90E4133E0 /* Info.plist */,
 				5FD7D4943C11669509D440F1 /* LocalNetworkPrompt.swift */,
 				6234183D5B85E276CF72CADE /* OverlayConfig.swift */,
+				68D15225A51C2C76CBC98E91 /* PhoneWidthLayout.swift */,
 				AC3FCF5095690A3F563812BC /* QRScanner.swift */,
 				3D2412986976AAF4337DBA54 /* SettingsView.swift */,
-				53C47826E4AF62087395CC63 /* SupportView.swift */,
 				F3A0D60FC4C87046D79A6EAF /* TunnelManager.swift */,
 			);
 			path = App;
@@ -210,11 +210,11 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					B04F3F8936C0857479F32040 = {
-						DevelopmentTeam = 58ZSP5V9AC;
+						DevelopmentTeam = KG664QFM64;
 						ProvisioningStyle = Automatic;
 					};
 					C28A270A7AB2CD34B221F72A = {
-						DevelopmentTeam = 58ZSP5V9AC;
+						DevelopmentTeam = KG664QFM64;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -290,9 +290,9 @@
 				66196F87C25F5F7E4561ECC8 /* ContentView.swift in Sources */,
 				0218577A9AB8B0DC3C55E1D1 /* LocalNetworkPrompt.swift in Sources */,
 				221F7209B42A3D675B0A3CDE /* OverlayConfig.swift in Sources */,
+				A946190D69ED737483C8D919 /* PhoneWidthLayout.swift in Sources */,
 				478E6B458D42F25FD7A16A26 /* QRScanner.swift in Sources */,
 				D53DF51313BAEE07F9958500 /* SettingsView.swift in Sources */,
-				4DB18FC266F58394BC8EE267 /* SupportView.swift in Sources */,
 				71A8AE3D34056C91FAC9A060 /* TunnelManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -323,7 +323,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO.Tunnel;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.APGOveraly.-.Tunnel";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -345,7 +345,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.APGOveraly.-";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -388,7 +388,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 58ZSP5V9AC;
+				DEVELOPMENT_TEAM = KG664QFM64;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -427,7 +427,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.APGOveraly.-";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -448,7 +448,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.apgo.APGO.Tunnel;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.APGOveraly.-.Tunnel";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -491,7 +491,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 58ZSP5V9AC;
+				DEVELOPMENT_TEAM = KG664QFM64;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;

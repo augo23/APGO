@@ -3,7 +3,7 @@ import UIKit
 import NetworkExtension
 
 /// ContentView is the main screen: connection control and the full-VPN toggle
-/// at the top, then the live peers list, with a Support button at the bottom.
+/// at the top, then the live peers list, with an APGO website link at the bottom.
 /// Everything configuration-related (network name, PSK, this device's overlay
 /// address, post-quantum, IPv6) lives behind the gear icon in SettingsView, so
 /// once you're joined the main screen never shows your name/PSK again.
@@ -23,8 +23,14 @@ struct ContentView: View {
     @State private var config = OverlayConfig.load()   // persisted across launches
     @State private var octet: String = "30"
     @State private var showSettings = false
-    @State private var showSupport = false
     @State private var peers: [Peer] = []
+    // Admission control state, refreshed on the same poll as the peer list.
+    @State private var admission = TunnelManager.AdmissionStatus()
+    @State private var approveTarget: Peer? = nil     // nil + showApprove = self
+    @State private var showApprove = false
+    @State private var approvePassword = ""
+    @State private var approveError: String? = nil
+    @State private var approveBusy = false
 
     private var isBusy: Bool {
         tunnel.status == .connecting || tunnel.status == .disconnecting || tunnel.status == .reasserting
@@ -152,6 +158,24 @@ struct ContentView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
+                // --- Not approved on this network ------------------------------
+                // The most misleading state the system has: peers accept our
+                // control traffic, so this device shows up in their lists
+                // looking healthy, while every packet of real data is dropped.
+                // From here it presents as "connected but nothing works".
+                if isConnected && admission.required && !admission.selfApproved {
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("This device is not approved", systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.orange)
+                            Text("Peers show it as connected but discard all of its data, so nothing is reachable. Approve it from the admin panel of another node that holds the network admin key — a device cannot approve itself.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
                 // --- Peers ----------------------------------------------------
                 Section("Peers (\(peers.count))") {
                     if !isConnected {
@@ -208,27 +232,62 @@ struct ContentView: View {
                                     Image(systemName: "lock.shield")
                                         .font(.caption).foregroundStyle(.green)
                                 }
+                                // Pending badge. Until now the phone could not
+                                // even SEE that a peer was unapproved, let alone
+                                // do anything about it.
+                                if !p.approved && !p.pubkey.isEmpty {
+                                    Text("pending")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.orange)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(.orange.opacity(0.14), in: Capsule())
+                                }
                                 Text(p.lastSeenText)
                                     .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                guard !p.approved, !p.pubkey.isEmpty, admission.canSign else { return }
+                                approveTarget = p
+                                approvePassword = ""
+                                approveError = nil
+                                showApprove = true
+                            }
+                            // Swipe works too, and is the gesture people expect
+                            // in a SwiftUI list.
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if !p.approved && !p.pubkey.isEmpty && admission.canSign {
+                                    Button {
+                                        approveTarget = p
+                                        approvePassword = ""
+                                        approveError = nil
+                                        showApprove = true
+                                    } label: {
+                                        Label("Approve", systemImage: "checkmark.seal")
+                                    }
+                                    .tint(.green)
+                                }
                             }
                         }
                     }
                 }
 
-                // --- Support (bottom) ------------------------------------------
+                // --- Website (bottom) ------------------------------------------
                 Section(footer:
                     Text("© 2026 The APGO Team · Another Pretty Good Overlay\nFree & open source, GPL-3.0-or-later")
                         .font(.caption2)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
                 ) {
-                    Button { showSupport = true } label: {
-                        Label("Support APGO", systemImage: "heart")
+                    Link(destination: URL(string: "https://apgoverlay.com")!) {
+                        Label("APGO website", systemImage: "globe")
                             .frame(maxWidth: .infinity)
                     }
                 }
             }
+            .phoneWidthLayout()
             .navigationTitle("APGO")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showSettings = true } label: {
@@ -239,7 +298,47 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView(config: $config, octet: $octet, onDelete: deleteCurrentNetwork)
             }
-            .sheet(isPresented: $showSupport) { SupportView() }
+            .sheet(isPresented: $showApprove) {
+                NavigationStack {
+                    Form {
+                        Section {
+                            Text(approveTarget.map { p in
+                                p.overlayIP.isEmpty ? p.keyFP : p.overlayIP
+                            } ?? "\u{2014}")
+                                .font(.body.monospaced())
+                            if let n = approveTarget?.name, !n.isEmpty {
+                                Text(n).font(.caption).foregroundStyle(.secondary)
+                            }
+                        } header: {
+                            Text("Approve")
+                        } footer: {
+                            Text("Signs an approval with the network admin key and sends it to the mesh. Every node accepts it exactly as it would an approval made from the desktop or web dashboard.")
+                        }
+
+                        Section {
+                            SecureField("Network admin password", text: $approvePassword)
+                                .textContentType(.password)
+                                .submitLabel(.go)
+                                .onSubmit { Task { await submitApproval() } }
+                            if let e = approveError {
+                                Text(e).font(.caption).foregroundStyle(.red)
+                            }
+                        }
+                    }
+                    .navigationTitle("Approve device")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") { showApprove = false; approveTarget = nil }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Approve") { Task { await submitApproval() } }
+                                .disabled(approvePassword.isEmpty || approveBusy)
+                        }
+                    }
+                }
+                .presentationDetents([.medium])
+            }
         }
         .onAppear {
             // Clamp the persisted selection, load its config, and recover the
@@ -262,7 +361,6 @@ struct ContentView: View {
         .onChange(of: appLock.isLocked) { locked in
             if locked {
                 showSettings = false
-                showSupport = false
             }
         }
         // React to connection-state changes IMMEDIATELY instead of waiting for
@@ -369,6 +467,35 @@ struct ContentView: View {
         if let fetched = await tunnel.fetchPeers() {
             peers = fetched.sorted { ipSortKey($0.overlayIP) < ipSortKey($1.overlayIP) }
         }
+        // Same cadence as the peer list: canSign flips to true on its own once
+        // the sealed admin key gossips in, and the Approve button has to become
+        // usable when it does without the user reopening anything.
+        admission = await tunnel.fetchAdmission()
+    }
+
+    /// Sign the approval and report the outcome. Kept off the view body so the
+    /// sheet stays declarative.
+    private func submitApproval() async {
+        // Only ever approves a SELECTED PEER. A node cannot approve itself —
+        // an approval has to be issued by an admin on another device.
+        guard let target = approveTarget?.pubkey, !target.isEmpty else {
+            approveError = "No device selected."
+            return
+        }
+        approveBusy = true
+        defer { approveBusy = false }
+        if let err = await tunnel.approve(pubkey: target, action: "approve",
+                                          password: approvePassword) {
+            approveError = err
+            return
+        }
+        approvePassword = ""
+        showApprove = false
+        approveTarget = nil
+        // Re-read immediately: the banner clearing is the confirmation that
+        // actually matters, and waiting up to 1.5s for the next poll reads as
+        // "did that work?".
+        await refreshPeers()
     }
 
     /// Adopt an admin-assigned overlay address if one is pending. The extension's

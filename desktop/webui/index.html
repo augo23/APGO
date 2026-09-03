@@ -58,6 +58,21 @@
   .dot{display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:7px; vertical-align:middle}
   .dot.relay{background:transparent;border:2px solid #e6b400;width:6px;height:6px}
   .relay-badge{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#e6b400;border:1px solid #e6b400;border-radius:6px;padding:1px 5px;margin-left:6px;opacity:.85}
+
+  /* Traffic columns + the node detail sheet. */
+  th.num, td.num{text-align:right; white-space:nowrap}
+  .tdim{color:var(--muted); opacity:.65}
+  tbody tr.rowsel{cursor:pointer}
+  tbody tr.rowsel:hover{background:rgba(127,127,127,.08)}
+  tbody tr.rowsel.active{background:rgba(127,127,127,.14)}
+  .nodegrid{display:grid; grid-template-columns:auto 1fr; gap:6px 14px; margin:10px 0 4px}
+  .nodegrid .k{color:var(--muted); font-size:12px}
+  .nodegrid .v{font-size:13px}
+  .tstat{display:flex; gap:18px; margin:12px 0 6px; flex-wrap:wrap}
+  .tstat .box{flex:1 1 110px; border:1px solid var(--line); border-radius:8px; padding:8px 10px}
+  .tstat .box .lbl{color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em}
+  .tstat .box .big{font-size:17px; margin-top:3px}
+  .modal-actions.wrapact{flex-wrap:wrap; gap:8px}
   .revoke{background:transparent; color:var(--danger); border:1px solid var(--danger);
     border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer}
   .revoke:hover{background:var(--danger); color:var(--bg)}
@@ -165,9 +180,9 @@
       <div class="panel scroll">
         <table>
           <thead><tr>
-            <th>Overlay IP</th><th>Name</th><th>Endpoint</th><th>Key</th><th>PQ</th><th>Connected</th><th>Last seen</th><th></th>
+            <th>Overlay IP</th><th>Name</th><th>Endpoint</th><th>Key</th><th>PQ</th><th class="num" title="Current inbound rate from this peer">&#8595; Down</th><th class="num" title="Current outbound rate to this peer">&#8593; Up</th><th class="num" title="Total transferred with this peer since the client started (both directions, on-the-wire bytes)">Total</th><th>Connected</th><th>Last seen</th><th></th>
           </tr></thead>
-          <tbody id="rows"><tr><td class="empty" colspan="8">Loading…</td></tr></tbody>
+          <tbody id="rows"><tr><td class="empty" colspan="11">Loading…</td></tr></tbody>
         </table>
       </div>
     </details>
@@ -188,6 +203,49 @@
 
     <div class="foot"><span id="status">·</span></div>
   </main>
+
+
+  <!-- Node detail sheet: the per-link telemetry, plus every action that
+       applies to this node. The row buttons stay where they are for people who
+       already know them; this is the place where the numbers and the actions
+       sit together, so deciding to revoke something and revoking it are not
+       two different screens. -->
+  <div class="modal-backdrop" id="nodeModal">
+    <div class="modal" style="max-width:520px">
+      <h3 id="nodeTitle">Node</h3>
+      <p class="who" id="nodeWho">&mdash;</p>
+
+      <div class="nodegrid">
+        <div class="k">Overlay IP</div><div class="v mono" id="nodeIp">&mdash;</div>
+        <div class="k">Endpoint</div><div class="v mono" id="nodeEp">&mdash;</div>
+        <div class="k">Key</div><div class="v mono" id="nodeKey">&mdash;</div>
+        <div class="k">Path</div><div class="v" id="nodePath">&mdash;</div>
+        <div class="k">Status</div><div class="v" id="nodeState">&mdash;</div>
+        <div class="k">Connected</div><div class="v" id="nodeSince">&mdash;</div>
+        <div class="k">Last seen</div><div class="v" id="nodeSeen">&mdash;</div>
+      </div>
+
+      <div class="tstat">
+        <div class="box"><div class="lbl">&#8595; Down now</div><div class="big mono" id="nodeRxRate">&mdash;</div></div>
+        <div class="box"><div class="lbl">&#8593; Up now</div><div class="big mono" id="nodeTxRate">&mdash;</div></div>
+        <div class="box"><div class="lbl">Total</div><div class="big mono" id="nodeTotal">&mdash;</div></div>
+      </div>
+      <div class="nodegrid">
+        <div class="k">Received</div><div class="v mono" id="nodeRx">&mdash;</div>
+        <div class="k">Sent</div><div class="v mono" id="nodeTx">&mdash;</div>
+        <div class="k">Packets</div><div class="v mono" id="nodePkts">&mdash;</div>
+      </div>
+
+      <div class="msg" id="nodeMsg"></div>
+      <div class="modal-actions wrapact">
+        <button class="ghost" id="nodeCancel" type="button">Close</button>
+        <button class="edit-btn" id="nodeApprove" type="button" style="display:none">Approve&hellip;</button>
+        <button class="edit-btn" id="nodeEdit" type="button">Edit&hellip;</button>
+        <button class="revoke" id="nodeRevoke" type="button">Revoke</button>
+      </div>
+    </div>
+  </div>
+
 
   <div class="modal-backdrop" id="pqModal">
     <div class="modal">
@@ -343,6 +401,34 @@ function dur(sec){
   if(m) return m+"m";
   return sec+"s";
 }
+
+// --- traffic formatting ----------------------------------------------------
+// Byte counts and rates are shown in decimal units (kB = 1000 B), the same
+// convention an ISP bills in, so the "total" column can be compared with a data
+// cap without a conversion step.
+function fmtBytes(n){
+  n = Number(n)||0;
+  if(n <= 0) return "0 B";
+  const u = ["B","kB","MB","GB","TB","PB"];
+  let i = 0;
+  while(n >= 1000 && i < u.length-1){ n /= 1000; i++; }
+  // Three significant figures: "2.50 GB", "64.0 kB", "500 kB". A fixed decimal
+  // count would print either "500.0 kB" (noise) or "2 GB" (uselessly coarse).
+  const dp = i === 0 ? 0 : (n < 10 ? 2 : n < 100 ? 1 : 0);
+  return n.toFixed(dp) + " " + u[i];
+}
+// A rate below ~50 B/s is rendered as idle rather than as a number. Keepalives
+// alone produce a small nonzero trickle on every healthy link, and showing
+// "31 B/s" on twenty idle rows makes the handful of rows that are actually
+// moving data impossible to pick out at a glance.
+function fmtRate(n, sampled){
+  if(!sampled) return '<span class="tdim">&mdash;</span>';
+  n = Number(n)||0;
+  if(n < 50) return '<span class="tdim">idle</span>';
+  return fmtBytes(n) + "/s";
+}
+function trafficOf(s){ return (s && s.traffic) || {}; }
+
 function esc(s){ return (s??"").toString().replace(/[&<>"']/g, c => (
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
@@ -597,9 +683,14 @@ async function loadSessions(){
   if(r.status===401){ location.href="/login"; return; }
   const list = await r.json();
   const tb = document.getElementById("rows");
+  // Keep the payload: the node detail sheet re-renders from it on every poll,
+  // so its live rates keep moving while it is open.
+  lastSessions = Array.isArray(list) ? list : [];
+  // Repaint the detail sheet if one is open, so its rates keep moving.
+  if(nodeSel !== null) renderNodeModal();
   document.getElementById("nodesCnt").textContent = Array.isArray(list) ? "("+list.length+")" : "";
   if(!Array.isArray(list) || list.length===0){
-    tb.innerHTML = '<tr><td class="empty" colspan="8">No peers connected.</td></tr>';
+    tb.innerHTML = '<tr><td class="empty" colspan="11">No peers connected.</td></tr>';
     return;
   }
   list.sort((a,b)=> (a.overlay_ip||"").localeCompare(b.overlay_ip||""));
@@ -620,13 +711,17 @@ async function loadSessions(){
     const canAct    = !!s.pubkey;
     const canRevoke = relayed ? (canAct && adminConfigured) : true;
     const pending   = (s.approved === false && canAct);
+    const tr_ = trafficOf(s);
     return `
-    <tr>
+    <tr class="rowsel${nodeSel===s.remote?' active':''}" data-remote="${esc(s.remote)}">
       <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Can be an exit node for the VPN relay">E</span>':''}${v6Badge(s, relayed)}${s.exit_failed?' <span class="exit-fail" title="This device has exit-node mode enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active" title="This device\'s internet traffic currently egresses through this exit node">&#127760; exit</span>':''}</td>
       <td>${esc(s.name||"—")}</td>
       <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge" title="Reachable through this node&#39;s relay - no direct session yet">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
       <td style="text-align:center"><input type="checkbox" class="pqbox" ${s.post_quantum?'checked':''} data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}" ${s.pubkey&&!relayed?'':'disabled'} title="Post-quantum encryption for this node"></td>
+      <td class="num">${fmtRate(tr_.rx_bytes_per_sec, tr_.sampled)}</td>
+      <td class="num">${fmtRate(tr_.tx_bytes_per_sec, tr_.sampled)}</td>
+      <td class="num">${tr_.sampled?fmtBytes(tr_.total_bytes):'<span class="tdim">—</span>'}</td>
       <td>${relayed?'—':rel(s.since_unix)}</td>
       <td>${rel(s.last_seen_unix)}</td>
       <td style="text-align:right">
@@ -885,6 +980,18 @@ document.getElementById("editApply").addEventListener("click", submitEdit);
 
 document.getElementById("rows").addEventListener("click", async (e) => {
   modalNet = "main";
+  // A click on the row itself (not on one of its controls) opens the detail
+  // sheet. Checked first so the existing per-row buttons keep working exactly
+  // as before for anyone already used to them.
+  if(!e.target.closest("button") && !e.target.closest("input")){
+    const tr = e.target.closest("tr.rowsel");
+    if(tr && tr.dataset.remote){
+      document.querySelectorAll("#rows tr.active").forEach(x => x.classList.remove("active"));
+      tr.classList.add("active");
+      openNodeModal(tr.dataset.remote);
+      return;
+    }
+  }
   const appr = e.target.closest(".approve");
   if(appr){
     openApproveModal(appr.dataset.pubkey, appr.dataset.ip || "device");
@@ -901,6 +1008,152 @@ document.getElementById("rows").addEventListener("click", async (e) => {
   if(ok){ await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
   else { btn.disabled = false; btn.textContent = t; }
 });
+
+
+// --- node detail sheet -----------------------------------------------------
+// lastSessions is the most recent /api/sessions payload. The detail sheet reads
+// from it on every poll rather than freezing the numbers it opened with — a
+// panel showing a live rate that stopped updating the moment you opened it is
+// worse than showing no rate at all.
+let lastSessions = [];
+let nodeSel = null;   // remote key of the row whose sheet is open
+
+function sessionByRemote(remote){
+  return (lastSessions || []).find(s => s.remote === remote) || null;
+}
+
+function openNodeModal(remote){
+  nodeSel = remote;
+  modalNet = "main";
+  if(!renderNodeModal()) return;
+  document.getElementById("nodeMsg").textContent = "";
+  document.getElementById("nodeModal").classList.add("show");
+}
+function closeNodeModal(){
+  document.getElementById("nodeModal").classList.remove("show");
+  nodeSel = null;
+  document.querySelectorAll("#rows tr.active").forEach(tr => tr.classList.remove("active"));
+}
+
+// renderNodeModal repaints the sheet from the latest data. Returns false when
+// the peer has disappeared from the list entirely, which is a real event worth
+// saying out loud instead of leaving stale numbers on screen.
+function renderNodeModal(){
+  if(nodeSel === null) return false;
+  const s = sessionByRemote(nodeSel);
+  const set = (id, html) => { const el = document.getElementById(id); if(el) el.innerHTML = html; };
+  if(!s){
+    set("nodeMsg", '<span class="tdim">This peer is no longer in the node list.</span>');
+    ["nodeRxRate","nodeTxRate","nodeTotal"].forEach(id => set(id, "&mdash;"));
+    return true;
+  }
+  const t = trafficOf(s);
+  const relayed = !!s.relayed;
+  set("nodeTitle", esc(s.name || s.overlay_ip || "Node"));
+  set("nodeWho", esc(s.overlay_ip || s.remote || "") + (s.name ? " &middot; " + esc(s.name) : ""));
+  set("nodeIp", esc(s.overlay_ip || "unknown") + (s.ip_derived ? ' <span class="tdim">(derived, not confirmed)</span>' : ''));
+  set("nodeEp", relayed ? 'via ' + esc(s.via || "mesh") + ' <span class="relay-badge">relayed</span>' : esc(s.remote || "—"));
+  set("nodeKey", '<span class="pill">' + esc(s.key_fp || "—") + '</span>');
+  set("nodePath", esc(s.path || "unknown"));
+  set("nodeState", s.approved === false
+        ? '<span class="pending">pending approval</span>'
+        : (s.established ? "established" : (relayed ? "relayed" : "connecting")));
+  set("nodeSince", relayed ? "&mdash;" : rel(s.since_unix));
+  set("nodeSeen", rel(s.last_seen_unix));
+
+  set("nodeRxRate", fmtRate(t.rx_bytes_per_sec, t.sampled));
+  set("nodeTxRate", fmtRate(t.tx_bytes_per_sec, t.sampled));
+  set("nodeTotal",  t.sampled ? fmtBytes(t.total_bytes) : '<span class="tdim">&mdash;</span>');
+  set("nodeRx", fmtBytes(t.rx_bytes));
+  set("nodeTx", fmtBytes(t.tx_bytes));
+  set("nodePkts", (Number(t.rx_packets)||0).toLocaleString() + " in / " +
+                  (Number(t.tx_packets)||0).toLocaleString() + " out");
+
+  const canAct = !!s.pubkey;
+  const pending = (s.approved === false && canAct);
+  const canRevoke = relayed ? (canAct && adminConfigured) : true;
+  const btn = (id, show) => { const el = document.getElementById(id); if(el) el.style.display = show ? "" : "none"; };
+  btn("nodeApprove", pending);
+  btn("nodeEdit", canAct);
+  btn("nodeRevoke", canRevoke);
+  return true;
+}
+
+document.getElementById("nodeCancel").addEventListener("click", closeNodeModal);
+document.getElementById("nodeModal").addEventListener("click", (e)=>{ if(e.target.id==="nodeModal") closeNodeModal(); });
+
+document.getElementById("nodeApprove").addEventListener("click", ()=>{
+  const s = sessionByRemote(nodeSel); if(!s) return;
+  closeNodeModal();
+  openApproveModal(s.pubkey, s.overlay_ip || s.remote || "device");
+});
+document.getElementById("nodeEdit").addEventListener("click", ()=>{
+  const s = sessionByRemote(nodeSel); if(!s) return;
+  closeNodeModal();
+  openEditModal(s.pubkey, s.overlay_ip, s.name, s.overlay_ip || "node");
+});
+document.getElementById("nodeRevoke").addEventListener("click", async ()=>{
+  const s = sessionByRemote(nodeSel); if(!s) return;
+  const b = document.getElementById("nodeRevoke");
+  b.disabled = true; const label = b.textContent; b.textContent = "…";
+  const ok = await doAction("revoke", s.pubkey, s.remote, s.overlay_ip || s.remote);
+  b.disabled = false; b.textContent = label;
+  if(ok){ closeNodeModal(); await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
+});
+
+// --- Enter applies, Escape cancels -----------------------------------------
+// Every modal here is a short form ending in one obvious action, so requiring a
+// mouse trip to the button after typing a password is pure friction. One
+// delegated handler covers all of them, including modals added later, rather
+// than a keydown listener wired per input — the version that always misses one.
+const MODAL_PRIMARY = {
+  pqModal:      "pqApply",
+  revokeModal:  "revokeApply",
+  approveModal: "approveApply",
+  editModal:    "editApply",
+  netModal:     "netApply",
+  nodeModal:    null,          // a detail sheet, not a form: Enter does nothing
+};
+const MODAL_CANCEL = {
+  pqModal:      "pqCancel",
+  revokeModal:  "revokeCancel",
+  approveModal: "approveCancel",
+  editModal:    "editCancel",
+  netModal:     "netCancel",
+  nodeModal:    "nodeCancel",
+};
+function topModal(){
+  const open = Array.from(document.querySelectorAll(".modal-backdrop.show"));
+  return open.length ? open[open.length-1] : null;
+}
+document.addEventListener("keydown", (e) => {
+  const m = topModal();
+  if(!m) return;
+  if(e.key === "Escape"){
+    const c = MODAL_CANCEL[m.id];
+    if(c){ e.preventDefault(); document.getElementById(c).click(); }
+    return;
+  }
+  if(e.key !== "Enter" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+  const tag = (e.target && e.target.tagName || "").toLowerCase();
+  // A textarea needs Enter for newlines, and a focused button already responds
+  // to Enter on its own — intercepting either would break normal behaviour.
+  if(tag === "textarea" || tag === "button" || tag === "a") return;
+  const id = MODAL_PRIMARY[m.id];
+  if(!id) return;
+  const btn = document.getElementById(id);
+  if(!btn || btn.disabled) return;
+  // Skip a primary button the page has hidden — netModal hides "Add" once it
+  // switches to showing invite details, and Enter must not fire an action the
+  // user cannot see. Tested with computed style rather than offsetParent:
+  // offsetParent is null for any positioned-fixed subtree, which would have
+  // silently disabled Enter inside exactly these modals.
+  const cs = window.getComputedStyle ? window.getComputedStyle(btn) : null;
+  if(cs && (cs.display === "none" || cs.visibility === "hidden")) return;
+  e.preventDefault();
+  btn.click();
+});
+
 
 document.getElementById("connectBtn").addEventListener("click", async (e) => {
   const b = e.currentTarget;

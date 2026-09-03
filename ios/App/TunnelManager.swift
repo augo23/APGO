@@ -15,7 +15,7 @@ final class TunnelManager: ObservableObject {
     private var statusObserver: NSObjectProtocol?
 
     // Set this to your extension's bundle identifier (matches project.yml).
-    private let tunnelBundleID = "org.apgo.APGO.Tunnel"
+    private let tunnelBundleID = "com.APGOveraly.-.Tunnel"
 
     init() {
         Task { await load() }
@@ -173,6 +173,78 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    // MARK: - Admission control
+
+    /// What this device can do about approvals right now.
+    struct AdmissionStatus: Decodable {
+        /// The network gates new devices (it has an admin key).
+        var required: Bool = false
+        /// THIS device is approved.
+        var selfApproved: Bool = true
+        /// This device holds the sealed admin key, so it can sign approvals
+        /// given the password. Arrives by mesh gossip, so it can be false for
+        /// the first few seconds after connecting and then become true.
+        var canSign: Bool = false
+
+        enum CodingKeys: String, CodingKey {
+            case required, selfApproved = "self_approved", canSign = "can_sign"
+        }
+    }
+
+    func fetchAdmission() async -> AdmissionStatus {
+        guard status == .connected,
+              let session = manager?.connection as? NETunnelProviderSession else { return AdmissionStatus() }
+        return await withCheckedContinuation { (cont: CheckedContinuation<AdmissionStatus, Never>) in
+            do {
+                try session.sendProviderMessage(Data("admission".utf8)) { resp in
+                    guard let resp = resp,
+                          let st = try? JSONDecoder().decode(AdmissionStatus.self, from: resp) else {
+                        cont.resume(returning: AdmissionStatus())
+                        return
+                    }
+                    cont.resume(returning: st)
+                }
+            } catch {
+                cont.resume(returning: AdmissionStatus())
+            }
+        }
+    }
+
+    /// Approve or deny a device by its base64 static key.
+    ///
+    /// There is deliberately no way to approve THIS device from here: an
+    /// approval must be issued by an admin on another node.
+    ///
+    /// Returns nil on success, or a message to show the user. The password is
+    /// sent to the extension and used there to unseal the admin key; it is
+    /// never persisted on either side.
+    func approve(pubkey: String, action: String, password: String) async -> String? {
+        guard status == .connected,
+              let session = manager?.connection as? NETunnelProviderSession else {
+            return "Not connected."
+        }
+        let req: [String: String] = ["cmd": "approve", "pubkey": pubkey,
+                                     "action": action, "password": password]
+        guard let body = try? JSONSerialization.data(withJSONObject: req) else {
+            return "Could not encode the request."
+        }
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            do {
+                try session.sendProviderMessage(body) { resp in
+                    guard let resp = resp, let s = String(data: resp, encoding: .utf8) else {
+                        cont.resume(returning: "No response from the tunnel.")
+                        return
+                    }
+                    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // The extension answers "ok" or an error message.
+                    cont.resume(returning: t == "ok" ? nil : t)
+                }
+            } catch {
+                cont.resume(returning: error.localizedDescription)
+            }
+        }
+    }
+
     private func observe(_ mgr: NETunnelProviderManager) {
         if let obs = statusObserver {
             NotificationCenter.default.removeObserver(obs)
@@ -207,6 +279,11 @@ struct Peer: Decodable, Identifiable {
     let relayed: Bool      // reachable only via a relay (no direct session)
     let via: String        // relayed rows: the relaying node (overlay IP or endpoint)
     let lastSeenUnix: Int64
+    // Admission control. The app could not previously SEE these, so a device
+    // stuck in "pending" looked like a healthy peer that mysteriously passed no
+    // traffic — the same misleading state the desktop dashboard calls out.
+    let pubkey: String     // base64 static key; the identity an approval names
+    let approved: Bool     // false = waiting for an admin to approve it
 
     enum CodingKeys: String, CodingKey {
         case remote
@@ -220,6 +297,8 @@ struct Peer: Decodable, Identifiable {
         case relayed
         case via
         case lastSeenUnix = "last_seen_unix"
+        case pubkey
+        case approved
     }
 
     init(from decoder: Decoder) throws {
@@ -231,6 +310,11 @@ struct Peer: Decodable, Identifiable {
         established = (try? c.decode(Bool.self, forKey: .established)) ?? false
         postQuantum = (try? c.decode(Bool.self, forKey: .postQuantum)) ?? false
         isExit = (try? c.decode(Bool.self, forKey: .isExit)) ?? false
+        pubkey = (try? c.decode(String.self, forKey: .pubkey)) ?? ""
+        // Defaults to TRUE on purpose. A client build that predates this field
+        // is not reporting "unapproved", it is reporting nothing — and marking
+        // every peer pending would be a false alarm on every row at once.
+        approved = (try? c.decode(Bool.self, forKey: .approved)) ?? true
         activeExit = (try? c.decode(Bool.self, forKey: .activeExit)) ?? false
         relayed = (try? c.decode(Bool.self, forKey: .relayed)) ?? false
         via = (try? c.decode(String.self, forKey: .via)) ?? ""

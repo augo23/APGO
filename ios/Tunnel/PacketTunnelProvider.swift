@@ -1,3 +1,4 @@
+import Foundation
 import NetworkExtension
 import Overlaymobile   // gomobile-generated framework (from ios/core)
 
@@ -99,8 +100,39 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(OverlaymobilePeersJSON().data(using: .utf8))
         case "pending":
             completionHandler?(OverlaymobilePendingAddress().data(using: .utf8))
+        case "admission":
+            // Three booleans the app needs before it can offer an Approve
+            // button: does this network gate devices at all, is THIS device
+            // approved, and can we sign (do we hold the sealed admin key yet).
+            let st: [String: Bool] = [
+                "required": OverlaymobileAdmissionRequired(),
+                "self_approved": OverlaymobileSelfApproved(),
+                "can_sign": OverlaymobileAdminKeyAvailable(),
+            ]
+            completionHandler?(try? JSONSerialization.data(withJSONObject: st))
         default:
-            completionHandler?(nil)
+            // Structured commands arrive as JSON. Only "approve" so far; the
+            // plain-string cases above stay for compatibility with an older app
+            // build talking to a newer extension.
+            guard let obj = try? JSONSerialization.jsonObject(with: messageData) as? [String: String],
+                  obj["cmd"] == "approve" else {
+                completionHandler?(nil)
+                return
+            }
+            let password = obj["password"] ?? ""
+            let action = obj["action"] ?? "approve"
+            let pubkey = obj["pubkey"] ?? ""
+            guard !pubkey.isEmpty else {
+                // A device cannot approve itself: an approval must be issued by
+                // an admin on some OTHER node. Refuse rather than quietly
+                // treating a missing key as "me".
+                completionHandler?("no device key given".data(using: .utf8))
+                return
+            }
+            var err: NSError?
+            _ = OverlaymobileApproveDevice(password, pubkey, action, &err)
+            let reply = err?.localizedDescription ?? "ok"
+            completionHandler?(reply.data(using: .utf8))
         }
     }
 

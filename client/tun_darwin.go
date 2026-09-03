@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,10 +64,8 @@ func createAndConfigureTUN(cfg *ClientConfig) error {
 	}
 
 	netCIDR := ipnet.String() // e.g. 10.22.55.0/24
-	if out, err := runCmd("route", "-n", "add", "-inet", "-net", netCIDR, "-interface", name); err != nil {
-		if !strings.Contains(out, "File exists") {
-			return fmt.Errorf("route add %s: %v (%s)", netCIDR, err, out)
-		}
+	if err := ensureOverlayRoute(netCIDR); err != nil {
+		return err
 	}
 	log.Printf("Assigned %s to %s and routed %s via it", cfg.Tun.AddressCIDR, name, netCIDR)
 	return nil
@@ -169,7 +168,43 @@ func reAddressTUN(oldIP, newCIDR string) error {
 		fmt.Sprintf("%s/%d", ip4.String(), ones), ip4.String(), "up"); err != nil {
 		return fmt.Errorf("ifconfig %s: %v (%s)", tunName, err, out)
 	}
+
+	// Re-add the prefix route. This is NOT optional and it is NOT a duplicate
+	// of the one setupTUN installs.
+	//
+	// utun is a POINTOPOINT interface, so macOS routes by the explicit route
+	// entry, never by the address's netmask. `ifconfig <if> inet <old> delete`
+	// above tears down every route bound to that address -- including the
+	// `-interface` net route for the overlay prefix. Without this call the
+	// interface comes back up correctly addressed and completely unreachable:
+	// the only remaining overlay route is the host route to ourselves, so
+	// every packet to a peer falls through to the default route and leaves via
+	// the physical NIC, where it dies. Nothing logs an error, the sessions
+	// stay established, and the symptom is 100% packet loss in both
+	// directions on this machine alone.
+	if err := ensureOverlayRoute(ipnet.String()); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ensureOverlayRoute points the overlay prefix at the utun interface, treating
+// an already-present route as success. Retried rather than trusted once: the
+// address assignment immediately before it is asynchronous in the kernel, and
+// a route added microseconds too early is rejected with "network is
+// unreachable".
+func ensureOverlayRoute(netCIDR string) error {
+	var last string
+	for i := 0; i < 10; i++ {
+		out, err := runCmd("route", "-n", "add", "-inet", "-net", netCIDR, "-interface", tunName)
+		if err == nil || strings.Contains(out, "File exists") {
+			log.Printf("routed %s via %s", netCIDR, tunName)
+			return nil
+		}
+		last = out
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("route add %s via %s: %s", netCIDR, tunName, last)
 }
 
 func runCmd(name string, args ...string) (string, error) {

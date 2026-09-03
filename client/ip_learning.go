@@ -40,7 +40,6 @@ func (t *IPLearning) evictLoop() {
 	}
 }
 
-
 // sameUDPAddr compares two endpoints without building their string forms.
 // UDPAddr.String() allocates, and the comparison it was used for sits on the
 // per-packet receive path.
@@ -52,6 +51,30 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 }
 
 func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
+	// A relay circuit is NOT a routable next hop, and letting one in here is
+	// how a node ends up connected to everything and able to reach nothing.
+	//
+	// relayclient.go delivers a circuit's payload by calling the normal
+	// transport handler with the circuit's SYNTHETIC 240.0.0.0/4 address as the
+	// source. That address then flows into this table as the route for whatever
+	// overlay IP sent the frame. From then on the egress path resolves that
+	// peer to the circuit, hands the packet to overlayWriteTo, and
+	// overlayWriteTo diverts it off the UDP socket and into the circuit —
+	// which, if the circuit was opened against a "relay" discovered in the
+	// public DHT, is a stranger's node that simply drops it.
+	//
+	// The failure is silent and total on the data plane while looking perfectly
+	// healthy everywhere else, because the keepalive and gossip loops send by
+	// walking established sessions directly and never consult this table. Peer
+	// list green, handshakes fine, post-quantum up, zero traffic delivered.
+	//
+	// Circuits stay usable for the handshake that runs over them; they are just
+	// never installed as a learned route. If relay-routed data is wanted later,
+	// it needs an explicit, verified path — not an address that arrived here by
+	// accident.
+	if isSyntheticRelayAddr(addr) {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e, ok := t.m[ip]; ok {

@@ -22,6 +22,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -79,9 +80,41 @@ func createAndConfigureTUN(cfg *ClientConfig) error {
 	// Wintun is a raw L3 adapter, so assign the address, mask and MTU with netsh.
 	mask := net.IP(ipnet.Mask).To4()
 	maskStr := fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
-	if out, err := runCmd("netsh", "interface", "ip", "set", "address",
-		fmt.Sprintf("name=%s", name), "static", ip4.String(), maskStr); err != nil {
-		log.Printf("warning: netsh set address on %s: %v (%s)", name, err, out)
+
+	// RETRY, and treat final failure as FATAL.
+	//
+	// Two bugs in one place. First, a freshly created Wintun adapter is not
+	// immediately visible to netsh: the NDIS registration completes
+	// asynchronously, so an immediate `set address` loses the race and fails
+	// with "Element not found" or "The filename, directory name, or volume
+	// label syntax is incorrect". It is intermittent, which is why it looks
+	// like a flaky network rather than a race.
+	//
+	// Second — and this is what made it a silent failure — the result was only
+	// LOGGED. The adapter then existed with no IPv4 address, so every overlay
+	// packet was dropped by the Windows stack before it reached Wintun. The
+	// client reported itself as running, the tray showed connected, peers
+	// showed as sessions, and nothing could be reached. An interface we could
+	// not address is not a degraded state we can carry on in.
+	var addrErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		out, err := runCmd("netsh", "interface", "ip", "set", "address",
+			fmt.Sprintf("name=%s", name), "static", ip4.String(), maskStr)
+		if err == nil {
+			addrErr = nil
+			break
+		}
+		addrErr = fmt.Errorf("%v (%s)", err, out)
+		log.Printf("[tun] netsh set address on %s failed (attempt %d/10): %v", name, attempt+1, addrErr)
+	}
+	if addrErr != nil {
+		dev.Close()
+		return fmt.Errorf("could not assign %s to the Wintun adapter %s after 10 attempts: %w — "+
+			"the adapter exists but has no address, so no overlay traffic can flow. "+
+			"Is the client running as Administrator?", cfg.Tun.AddressCIDR, name, addrErr)
 	}
 	if out, err := runCmd("netsh", "interface", "ipv4", "set", "subinterface",
 		name, fmt.Sprintf("mtu=%d", cfg.Tun.MTU), "store=persistent"); err != nil {

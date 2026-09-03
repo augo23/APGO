@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // --- friendly names ------------------------------------------------------
@@ -170,7 +171,31 @@ type provStore struct {
 
 var provisions = &provStore{recs: map[[32]byte]SignedProvision{}}
 
-// put stores rec if it supersedes the current entry for that target (higher seq).
+// put stores rec if it supersedes the current entry for that target (higher
+// seq), and retires any OTHER key's older claim on the same overlay address.
+//
+// Why the second half exists.
+//
+// A provision binds an overlay address to a PUBLIC KEY, and this store is
+// keyed by key -- so before this, two keys could hold a provision for one
+// address indefinitely and nothing ever retired the loser. That is not an
+// exotic race: it is what an ordinary reinstall does. A wiped machine comes
+// back with a fresh node.key, an admin assigns it its usual address, and the
+// previous key's claim stays in every peer's store forever. Do it three times
+// and three keys claim one address, of which two are machines that no longer
+// exist.
+//
+// Retiring here rather than at the admin is deliberate. The stale records are
+// already replicated across the mesh, so fixing only the issuing side would
+// leave every existing copy in place; this rule runs on every node as the
+// gossip arrives and heals stores that are already wrong. It is deterministic
+// -- same records in, same records out, regardless of arrival order -- so
+// nodes converge without extra traffic.
+//
+// The rule is strictly seq-ordered, never liveness-based. A quiet node has not
+// stopped owning its address, and "silent for N minutes" would let any node
+// squat a sleeping laptop's IP and inherit whatever that IP is trusted for.
+// Only a NEWER admin signature displaces an older one.
 func (s *provStore) put(pub [32]byte, rec SignedProvision) bool {
 	s.mu.Lock()
 	if cur, ok := s.recs[pub]; ok && rec.Seq <= cur.Seq {
@@ -178,7 +203,32 @@ func (s *provStore) put(pub [32]byte, rec SignedProvision) bool {
 		return false
 	}
 	s.recs[pub] = rec
+
+	var retired []string
+	if addr := normalizeOverlayAddr(rec.Address); addr != "" {
+		ip := stripMask(addr)
+		for k, other := range s.recs {
+			if k == pub || other.Address == "" {
+				continue
+			}
+			if stripMask(normalizeOverlayAddr(other.Address)) != ip {
+				continue
+			}
+			// Only an older signature is displaced. If the other record is
+			// newer, THIS one is the stale claim and the address belongs to
+			// the other key -- leave it alone.
+			if other.Seq < rec.Seq {
+				delete(s.recs, k)
+				retired = append(retired, peerKeyFingerprint(k[:]))
+			}
+		}
+	}
 	s.mu.Unlock()
+	if len(retired) > 0 {
+		log.Printf("[provision] %s reassigned to %s — retired %d superseded claim(s): %s",
+			stripMask(normalizeOverlayAddr(rec.Address)), peerKeyFingerprint(pub[:]),
+			len(retired), strings.Join(retired, ", "))
+	}
 	s.save()
 	return true
 }
@@ -312,6 +362,79 @@ func handleProvision(payload []byte) {
 	if pub == gKP.pub {
 		applyProvisionSelf(rec)
 	}
+}
+
+// overlayIPClaimants returns every OTHER node key that holds an admin
+// provision for ip. Normally empty.
+//
+// A non-empty result is a DUPLICATE CLAIM on one overlay address, and it is the
+// most quietly destructive state this system has. It happens when a machine is
+// reinstalled: it comes back with a new node key, but the old key keeps its
+// signed provision for the same address. Peers then resolve that address to a
+// key that no longer exists anywhere, route to a dead endpoint, and the machine
+// receives nothing — while its peer list, handshakes, post-quantum layers and
+// gossip all look perfect, because control traffic is addressed to the SESSION
+// and never to the overlay IP.
+//
+// From the affected node it presents as 100% packet loss with a completely
+// healthy dashboard. Nothing in the peer list, the logs or the admission state
+// hints at it. Hence this check, and the loud warning below.
+func overlayIPClaimants(ip string) []string {
+	if ip == "" {
+		return nil
+	}
+	ip = strings.TrimSpace(strings.SplitN(ip, "/", 2)[0])
+	self := base64.StdEncoding.EncodeToString(gKP.pub[:])
+	var out []string
+	for _, rec := range provisions.list() {
+		if rec.PubKey == self || rec.Address == "" {
+			continue
+		}
+		if strings.TrimSpace(strings.SplitN(rec.Address, "/", 2)[0]) == ip {
+			out = append(out, rec.PubKey)
+		}
+	}
+	return out
+}
+
+// warnOnDuplicateOverlayClaim logs, loudly and at most once a minute, when some
+// other key also claims this node's overlay address. Rate-limited rather than
+// once-only because the conflicting record can arrive by gossip long after
+// startup.
+var (
+	dupClaimWarnMu   sync.Mutex
+	dupClaimWarnLast time.Time
+)
+
+func warnOnDuplicateOverlayClaim() {
+	mine := myOverlayIP()
+	others := overlayIPClaimants(mine)
+	if len(others) == 0 {
+		return
+	}
+	dupClaimWarnMu.Lock()
+	if time.Since(dupClaimWarnLast) < time.Minute {
+		dupClaimWarnMu.Unlock()
+		return
+	}
+	dupClaimWarnLast = time.Now()
+	dupClaimWarnMu.Unlock()
+
+	fps := make([]string, 0, len(others))
+	for _, b64 := range others {
+		if raw, err := base64.StdEncoding.DecodeString(b64); err == nil && len(raw) == 32 {
+			fps = append(fps, peerKeyFingerprint(raw))
+		}
+	}
+	log.Printf("[overlay] DUPLICATE CLAIM on %s: %d OTHER node key(s) hold an admin provision "+
+		"for this address (%s). Peers resolve %s to one of THOSE keys, so traffic addressed to "+
+		"this node is routed to a device that no longer exists — this node will appear fully "+
+		"connected and receive NOTHING. This is the normal result of reinstalling a machine "+
+		"(new node key, old provision left behind).",
+		mine, len(others), strings.Join(fps, ", "), mine)
+	log.Printf("[overlay] FIX: give this node a different overlay address, or have an admin "+
+		"re-provision %s onto this node's current key (%s) — which supersedes the stale claims.",
+		mine, peerKeyFingerprint(gKP.pub[:]))
 }
 
 // onPendingAddress, if set by the host (the standalone client, or a mobile

@@ -12,6 +12,7 @@
 package overlaymobile
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,20 +28,20 @@ import (
 
 // mobileConfig is the JSON the app passes in providerConfiguration.
 type mobileConfig struct {
-	NetworkName  string   `json:"network_name"`
-	PSK          string   `json:"psk"`
-	FriendlyName string   `json:"friendly_name"` // human label shown to peers
-	OverlayIP    string   `json:"overlay_ip"`    // bare host, e.g. 10.22.55.30
-	OverlayCIDR  string   `json:"overlay_cidr"`  // e.g. 10.22.55.0/24
+	NetworkName       string   `json:"network_name"`
+	PSK               string   `json:"psk"`
+	FriendlyName      string   `json:"friendly_name"` // human label shown to peers
+	OverlayIP         string   `json:"overlay_ip"`    // bare host, e.g. 10.22.55.30
+	OverlayCIDR       string   `json:"overlay_cidr"`  // e.g. 10.22.55.0/24
 	Trackers          []string `json:"trackers"`
 	RendezvousServers []string `json:"rendezvous_servers"`
 	STUNServers       []string `json:"stun_servers"`
-	AdminPubKey string   `json:"admin_public_key"`
-	KeyPath     string   `json:"key_path"` // writable path for the node key
-	UseExit     bool     `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
-	ExitPeer    string   `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest
-	UDPPort     int      `json:"udp_listen_port"`
-	Cipher      string   `json:"cipher"`
+	AdminPubKey       string   `json:"admin_public_key"`
+	KeyPath           string   `json:"key_path"`  // writable path for the node key
+	UseExit           bool     `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
+	ExitPeer          string   `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest
+	UDPPort           int      `json:"udp_listen_port"`
+	Cipher            string   `json:"cipher"`
 	// KeepaliveSeconds tunes the NAT keepalive (0 = default 10s).
 	KeepaliveSeconds int `json:"keepalive_seconds"`
 	// Quantum-safe settings are pointers so an ABSENT field defaults to ON —
@@ -245,6 +246,67 @@ func PeersJSON() string {
 	return string(b)
 }
 
+// --- admission control from the phone ---------------------------------------
+//
+// gomobile only exports a narrow set of types across the language boundary
+// (strings, ints, bools, errors), so these are deliberately string-in /
+// error-out rather than passing structs around.
+
+// AdminKeyAvailable reports whether this device holds the network admin key
+// and can therefore sign approvals given the password.
+//
+// The app should call this before showing an Approve button: the key arrives
+// by mesh gossip, so on a freshly installed phone it is briefly false and then
+// becomes true on its own. A button that appears and then fails is worse than
+// one that appears a few seconds late.
+func AdminKeyAvailable() bool { return adminKeyAvailable() }
+
+// AdmissionRequired reports whether this network gates new devices at all
+// (i.e. it has an admin key). When false there is nothing to approve and the
+// app should not show any of this.
+func AdmissionRequired() bool { return admissionRequired() }
+
+// SelfApproved reports whether THIS device is approved on the network.
+func SelfApproved() bool { return selfApproved() }
+
+// SelfPubKey returns this device's own static key (base64), or "" when the
+// overlay is not running.
+func SelfPubKey() string {
+	bridgeMu.Lock()
+	up := running
+	bridgeMu.Unlock()
+	if !up {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(gKP.pub[:])
+}
+
+// ApproveDevice approves (or denies) a peer by its base64 static key, using the
+// network admin password. The signed record is applied locally and flooded to
+// the mesh, exactly as the desktop and container panels do it.
+//
+// action is "approve" or "deny"; anything else is treated as "approve" so a
+// caller passing "" gets the safe, obvious meaning rather than a silent no-op.
+func ApproveDevice(password, pubKeyB64, action string) error {
+	if pubKeyB64 == "" {
+		return errors.New("no device key given")
+	}
+	if password == "" {
+		return errors.New("network admin password required")
+	}
+	if action != "approve" && action != "deny" {
+		action = "approve"
+	}
+	if !admissionRequired() {
+		return errors.New("this network has no admin key, so devices do not need approval")
+	}
+	rec, err := signApproval(password, pubKeyB64, action)
+	if err != nil {
+		return err
+	}
+	return applyAndGossipApproval(rec)
+}
+
 // PendingAddress returns a new overlay address an admin has assigned this device
 // that will take effect on the next (re)connect, or "" if none. The app polls
 // this to warn the user and re-establish the tunnel.
@@ -254,16 +316,16 @@ func PendingAddress() string {
 
 func toClientConfig(mc mobileConfig) *ClientConfig {
 	cfg := &ClientConfig{
-		NetworkName:   mc.NetworkName,
-		PSK:           mc.PSK,
-		FriendlyName:  mc.FriendlyName,
-		OverlayCIDR:   mc.OverlayCIDR,
-		UDPListenPort: mc.UDPPort,
+		NetworkName:       mc.NetworkName,
+		PSK:               mc.PSK,
+		FriendlyName:      mc.FriendlyName,
+		OverlayCIDR:       mc.OverlayCIDR,
+		UDPListenPort:     mc.UDPPort,
 		STUNServers:       mc.STUNServers,
 		Trackers:          mc.Trackers,
 		RendezvousServers: mc.RendezvousServers,
-		Cipher:           mc.Cipher,
-		KeepaliveSeconds: mc.KeepaliveSeconds,
+		Cipher:            mc.Cipher,
+		KeepaliveSeconds:  mc.KeepaliveSeconds,
 		// Quantum-safe by default: absent flags mean ON.
 		PostQuantum: mc.PostQuantum == nil || *mc.PostQuantum,
 		PQAuth:      mc.PQAuth == nil || *mc.PQAuth,

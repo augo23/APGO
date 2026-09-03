@@ -3,6 +3,16 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// The release version, passed in by android/build-apk.sh as -PapgoVersion=X.Y.Z,
+// which in turn gets it from build-release.sh (i.e. from the newest git tag).
+// A bare `./gradlew assembleDebug` has no release to name, so it falls back to
+// the same 1.0.0 the rest of the toolchain uses before any tag exists.
+val apgoVersion: String =
+    (findProperty("apgoVersion") as String?)?.takeIf { it.isNotBlank() } ?: "1.0.0"
+// Tolerant of junk on purpose: a malformed version should still produce an APK
+// rather than failing the last step of a long release build.
+val apgoParts: List<Int> = apgoVersion.split(".").map { it.toIntOrNull() ?: 0 }
+
 android {
     namespace = "org.apgo.app"
     compileSdk = 34
@@ -11,8 +21,16 @@ android {
         applicationId = "org.apgo.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Android will not install an update over an existing install unless
+        // versionCode INCREASES, so it has to track the release — putting the
+        // version only in the filename leaves every build looking identical to
+        // the device. major*10000 + minor*100 + patch stays monotonic across
+        // the same ordering git uses, with room for 99 minors and 99 patches.
+        // (v1.0.0 -> 10000, comfortably above the hardcoded 1 shipped before.)
+        versionCode = apgoParts.getOrElse(0) { 0 } * 10000 +
+            apgoParts.getOrElse(1) { 0 } * 100 +
+            apgoParts.getOrElse(2) { 0 }
+        versionName = apgoVersion
     }
 
     buildTypes {

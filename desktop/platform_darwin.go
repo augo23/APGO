@@ -141,13 +141,49 @@ func doDisconnect() {
 	opMu.Lock()
 	defer opMu.Unlock()
 
-	sh := fmt.Sprintf("kill $(cat %s) 2>/dev/null; rm -f %s", q(pidPath()), q(pidPath()))
-	if err := runAdmin(sh); err != nil {
+	// THREE different things can be running the client, and stopping only one
+	// of them is why Disconnect appeared to do nothing at all:
+	//
+	//  1. the boot LaunchDaemon (com.apgo.client), installed with
+	//     KeepAlive=true — killing its process just makes launchd start a new
+	//     one within a second, so the client never actually goes away;
+	//  2. a client this tray app started, which writes a pid file;
+	//  3. a client started some other way, which writes nothing.
+	//
+	// The old implementation was `kill $(cat client.pid)` and nothing else.
+	// When the boot daemon is what's running there IS no pid file: `cat`
+	// failed, `kill` got no argument, stderr went to /dev/null, and the shell
+	// still exited 0. So the admin prompt appeared, the password was accepted,
+	// runAdmin returned success — and the client kept running, with no error
+	// to show for it. That is exactly the "asks for my password then does
+	// nothing" report, and it also silently blocked every settings change that
+	// needs a restart to take effect (a new overlay address, most visibly).
+	//
+	// Order matters: bootout FIRST so KeepAlive cannot undo the kills below.
+	var sh strings.Builder
+	sh.WriteString("/bin/launchctl bootout system/" + bootDaemonLabel + " 2>/dev/null || true; ")
+	// Older macOS (and older installs) only understand `unload`.
+	sh.WriteString("/bin/launchctl unload " + q(bootDaemonPath()) + " 2>/dev/null || true; ")
+	sh.WriteString("if [ -f " + q(pidPath()) + " ]; then kill $(cat " + q(pidPath()) + ") 2>/dev/null || true; fi; ")
+	sh.WriteString("rm -f " + q(pidPath()) + "; ")
+	sh.WriteString("/usr/bin/pkill -x overlay-client 2>/dev/null || true")
+	if err := runAdmin(sh.String()); err != nil {
 		notify("Disconnect failed: " + err.Error())
 		return
 	}
-	time.Sleep(300 * time.Millisecond)
+
+	// VERIFY, rather than assuming. Reporting success without checking is what
+	// let this stay broken: the UI said "disconnected" while the tunnel was up.
+	for i := 0; i < 20; i++ {
+		time.Sleep(250 * time.Millisecond)
+		if _, ok := fetchInfo(); !ok {
+			refreshStatus()
+			return
+		}
+	}
 	refreshStatus()
+	notify("The overlay client is STILL RUNNING after Disconnect. Something is restarting it — " +
+		"check for a boot daemon with: sudo launchctl print system/" + bootDaemonLabel)
 }
 
 // runAdmin runs a shell command as root via the macOS authentication prompt.

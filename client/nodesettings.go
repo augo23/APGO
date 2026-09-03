@@ -26,6 +26,71 @@ type nodeSettings struct {
 	// credential: "user:pass" = HTTP Basic, bare = Bearer, "" = none.
 	RendezvousServers *[]string `json:"rendezvous_servers,omitempty"`
 	RendezvousAuth    *string   `json:"rendezvous_auth,omitempty"`
+
+	// DHT / public-relay toggles, settable from the admin panel so a
+	// CONTAINER node — which has no desktop Settings window — can be turned
+	// into a public relay, or have its bandwidth donation adjusted, without
+	// editing YAML and redeploying. Pointers so "unset" falls back to
+	// config/env. All apply live except DHT, which takes effect immediately
+	// too (the routing table is kept, so re-enabling is instant).
+	DHT         *bool `json:"dht,omitempty"`
+	UseRelays   *bool `json:"use_public_relays,omitempty"`
+	PublicRelay *bool `json:"public_relay,omitempty"`
+	// Limits are stored as BYTES PER SECOND (and bytes, for the quota) —
+	// already parsed, so the panel round-trips exact numbers rather than
+	// re-parsing a human string on every read.
+	RelayUpLimit   *int64 `json:"relay_up_limit,omitempty"`
+	RelayDownLimit *int64 `json:"relay_down_limit,omitempty"`
+	RelayQuota     *int64 `json:"relay_quota,omitempty"`
+}
+
+// saveNodeRelaySettings persists the DHT + public-relay choices made in the
+// admin panel and applies them to the running node.
+func saveNodeRelaySettings(dht, useRelays, publicRelay bool, upBps, downBps, quotaBytes int64) error {
+	p := nodeSettingsPath()
+	if p == "" {
+		return os.ErrInvalid
+	}
+	nodeSettingsMu.Lock()
+	s := nodeSettings{}
+	if data, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(data, &s)
+	}
+	s.DHT = &dht
+	s.UseRelays = &useRelays
+	s.PublicRelay = &publicRelay
+	s.RelayUpLimit = &upBps
+	s.RelayDownLimit = &downBps
+	s.RelayQuota = &quotaBytes
+	out, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		nodeSettingsMu.Unlock()
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		nodeSettingsMu.Unlock()
+		return err
+	}
+	err = os.Rename(tmp, p)
+	nodeSettingsMu.Unlock()
+	if err != nil {
+		return err
+	}
+	// Apply live. Persisting without applying is the failure mode that makes
+	// a panel feel broken: the operator flips a switch, nothing changes, and
+	// only a restart reveals that the setting did save.
+	setDHTEnabled(dht)
+	if gRelayClient != nil {
+		gRelayClient.SetEnabled(useRelays)
+	}
+	if gBandwidth != nil {
+		gBandwidth.Configure(upBps, downBps, quotaBytes, 0)
+	}
+	if gPublicRelay != nil {
+		gPublicRelay.SetEnabled(publicRelay)
+	}
+	return nil
 }
 
 // saveNodeRendezvous persists the rendezvous server list + credential.

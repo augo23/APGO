@@ -43,8 +43,7 @@ and run it again.)
 
 ```
 cd /path/to/P2P-Overlay-Network/ios
-xcodegen generate
-open APGO.xcodeproj
+xcodegen generate && open APGO.xcodeproj
 ```
 
 ## Step 3 — Sign in and set your Team

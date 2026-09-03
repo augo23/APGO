@@ -123,6 +123,7 @@ struct SettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             }
+            .phoneWidthLayout()
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

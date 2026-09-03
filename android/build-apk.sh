@@ -15,6 +15,12 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ANDROID_DIR="$(cd "$(dirname "$0")" && pwd)"
 OS="$(uname -s)"
 
+# The release version, handed down by build-release.sh (which reads it from the
+# newest git tag). It becomes the APK's OWN versionName/versionCode — see
+# app/build.gradle.kts — so Android will install a new release over an old one.
+# A standalone run of this script has no release to name, hence the fallback.
+APGO_VERSION="${APGO_VERSION:-1.0.0}"
+
 # --- package-manager helpers ------------------------------------------------
 pm_install() { # pm_install <brew-name> <apt-name>
   if [ "$OS" = "Darwin" ]; then brew install "$1"
@@ -98,8 +104,8 @@ else
   GRADLE="$([ -x ./gradlew ] && echo ./gradlew || echo gradle)"
 fi
 
-say "Assembling debug APK…"
-$GRADLE :app:assembleDebug
+say "Assembling debug APK (version $APGO_VERSION)…"
+$GRADLE -PapgoVersion="$APGO_VERSION" :app:assembleDebug
 
 APK="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
 say "Done. APK: $APK"

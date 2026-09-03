@@ -20,19 +20,16 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSCameraUsageDescription</key>
-	<string>APGO uses the camera to scan a network "Join QR" so you can join without typing.</string>
-	<key>NSFaceIDUsageDescription</key>
-	<string>APGO uses Face ID to unlock the app when the app lock is enabled in Settings.</string>
-	<!-- iOS 14+ Local Network privacy: without this permission the tunnel can't
-	     reach peers on the same Wi-Fi (LAN discovery + direct LAN connections).
-	     The prompt is triggered from the app on first Connect (LocalNetworkPrompt). -->
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>APGO connects directly to your own devices on the same network. Without this, devices on the same Wi‑Fi can't find each other.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_apgo._udp.</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>APGO uses the camera to scan a network "Join QR" so you can join without typing.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>APGO uses Face ID to unlock the app when the app lock is enabled in Settings.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>APGO connects directly to your own devices on the same network. Without this, devices on the same Wi‑Fi can't find each other.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiresFullScreen</key>
@@ -40,6 +37,13 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>

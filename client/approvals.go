@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,40 +70,110 @@ func admissionRequired() bool {
 // --- data-plane enforcement toggle ----------------------------------------
 
 // admissionEnforced reports whether unapproved peers are actually BLOCKED, as
-// opposed to merely logged. Read once at startup from ADMISSION_ENFORCE
-// ("1"/"true"/"yes"/"on").
+// opposed to merely logged.
 //
-// DEFAULT OFF, deliberately, and this default is load-bearing. Enforcement cuts
-// the data plane for every peer that has not been explicitly approved — and on
-// a network where approvals were never enforced, that is every peer at once.
-// The failure mode is nasty to debug because control frames stay exempt: the
-// node keeps gossiping, so it still appears in everyone's peer list at full
-// health while passing no traffic whatsoever. Visible but unreachable.
+// ADMISSION_ENFORCE forces the answer either way ("1"/"true"/"yes"/"on" or
+// "0"/"false"/"no"/"off"). With it unset, enforcement turns itself on once the
+// network is actually USING approvals — that is, once this node holds at least
+// one signed approval record.
 //
-// So the rollout is: deploy with this OFF, watch the "[admission] would drop"
-// lines to see the real blast radius, approve everything that belongs, and only
-// then set ADMISSION_ENFORCE=1.
+// THE HISTORY MATTERS, because both previous answers were wrong.
+//
+// It first defaulted OFF, so a staged rollout was possible: deploy warn-only,
+// watch the "would drop" lines, approve what belongs, then enforce. Sound plan,
+// bad default — an operator who set an admin key, watched devices land in
+// "pending", and never found an obscure environment variable believed they had
+// admission control and did not have it. The UI said pending; the data plane
+// said welcome.
+//
+// So it was flipped to default ON. That broke networks, and the reason is
+// worth stating plainly because it is not obvious from admitted():
+//
+//	admitted() is SYMMETRIC. It does not only decide whether OTHER nodes
+//	accept us — it decides whether WE accept THEM. A node evaluates every
+//	peer against its OWN approval store.
+//
+// On a network that had an admin key but had never approved anything (nothing
+// forced anyone to, because enforcement was off), that store is empty
+// everywhere. Turning enforcement on therefore did not gate the new device: it
+// made every upgraded node reject every peer it had, in both directions, at
+// once. A freshly reinstalled machine was hit hardest — its store is empty by
+// definition, so it dropped all inbound data from a mesh that was perfectly
+// willing to talk to it, and presented as 100% packet loss to every peer while
+// showing them all as connected.
+//
+// Approving that one device does not help, either: it fixes what peers think
+// of IT, and does nothing about what it thinks of THEM.
+//
+// The rule below keeps the gate closed by default without applying it
+// retroactively to networks that never opted in. Zero approval records means
+// approvals have never been issued here, so enforcing is a change nobody asked
+// for; one approval record means an admin has started using the feature, and
+// from then on it is enforced properly. A brand-new network crosses that line
+// the moment its first device is approved.
+//
+// The trade-off, stated honestly: between adopting an admin key and issuing
+// the first approval, this node does not block unapproved peers. That window
+// is the price of not disconnecting existing fleets on upgrade, and it closes
+// permanently with the first approval. ADMISSION_ENFORCE=1 removes the window
+// for anyone who wants strict behaviour from the first packet.
+//
+// Networks with NO admin key are unaffected either way: admissionRequired() is
+// false, so admitted() returns true for everyone and none of this engages.
 var (
-	admissionEnforceOnce sync.Once
-	admissionEnforceVal  bool
+	admissionEnvOnce sync.Once
+	// admissionEnvForce is nil when ADMISSION_ENFORCE is unset/unparseable.
+	admissionEnvForce *bool
+	// admissionEnforceLogged makes the state change log once, not per packet.
+	admissionEnforceLogged atomic.Bool
 )
 
-func admissionEnforced() bool {
-	admissionEnforceOnce.Do(func() {
+func admissionEnvOverride() *bool {
+	admissionEnvOnce.Do(func() {
 		switch strings.ToLower(strings.TrimSpace(os.Getenv("ADMISSION_ENFORCE"))) {
 		case "1", "true", "yes", "on":
-			admissionEnforceVal = true
-		}
-		if !admissionRequired() {
-			return // no admin key — nothing to gate, stay quiet
-		}
-		if admissionEnforceVal {
-			log.Printf("[admission] ENFORCING — unapproved peers cannot pass overlay data")
-		} else {
-			log.Printf("[admission] warn-only — unapproved peers still pass data; set ADMISSION_ENFORCE=1 to block")
+			v := true
+			admissionEnvForce = &v
+		case "0", "false", "no", "off":
+			v := false
+			admissionEnvForce = &v
 		}
 	})
-	return admissionEnforceVal
+	return admissionEnvForce
+}
+
+// admissionEnforced is evaluated LIVE, not memoised at startup. The approval
+// store is filled by mesh gossip seconds after the process starts, so a value
+// computed once at boot would freeze this node in the state it happened to
+// have before its first peer connected — which is exactly the empty-store case
+// this logic exists to handle.
+func admissionEnforced() bool {
+	if o := admissionEnvOverride(); o != nil {
+		if *o && admissionRequired() && admissionEnforceLogged.CompareAndSwap(false, true) {
+			log.Printf("[admission] ENFORCING (ADMISSION_ENFORCE=1) — unapproved peers cannot pass data")
+		}
+		return *o
+	}
+	if !admissionRequired() {
+		return false // no admin key — nothing to gate
+	}
+	if !approvals.hasAnyApproval() {
+		// Approvals have never been issued on this network. Do not retro-fit a
+		// gate onto a fleet that never had one; say so, once, so the state is
+		// discoverable rather than mysterious.
+		if admissionEnforceLogged.CompareAndSwap(false, true) {
+			log.Printf("[admission] NOT enforcing: this network has an admin key but no approval " +
+				"records yet, so blocking unapproved peers would disconnect every node at once. " +
+				"Approve one device (any dashboard, or the phone apps) and enforcement turns on " +
+				"automatically from then on. ADMISSION_ENFORCE=1 forces it on now.")
+		}
+		return false
+	}
+	if admissionEnforceLogged.CompareAndSwap(false, true) {
+		log.Printf("[admission] ENFORCING — unapproved peers cannot pass overlay data, " +
+			"advertise as exits, inject peer endpoints, or appear in the roster")
+	}
+	return true
 }
 
 // admissionLogEvery throttles the per-peer message. Without it an unapproved
@@ -229,6 +300,21 @@ func (s *approvalStore) isApproved(pub [32]byte) bool {
 	defer s.mu.Unlock()
 	r, ok := s.recs[pub]
 	return ok && r.Action == "approve"
+}
+
+// hasAnyApproval reports whether ANY device has been approved on this network.
+// It is the signal that an admin has actually started using admission control,
+// which is what admissionEnforced() keys enforcement off — see the long note
+// there for why "has an admin key" was not a safe enough signal on its own.
+func (s *approvalStore) hasAnyApproval() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.recs {
+		if r.Action == "approve" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *approvalStore) put(pub [32]byte, e storedApproval) bool {
