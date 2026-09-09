@@ -314,6 +314,28 @@ func PendingAddress() string {
 	return getPendingAddress()
 }
 
+// IPConflictJSON returns the last overlay-address collision as JSON, or "null"
+// when there is none. See ipclaim.go for the shape and what each state means.
+//
+// A pending address set by the collision resolver reaches the app through
+// PendingAddress like any admin assignment — the app reconnects and the move is
+// done. This exists so the app can also SAY why the address changed: without
+// it, a device silently comes back on a different overlay IP than the one the
+// person was told to use.
+//
+// gomobile exposes this to Kotlin/Swift as ipConflictJSON().
+func IPConflictJSON() string {
+	rec := getIPConflict()
+	if rec == nil {
+		return "null"
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
 func toClientConfig(mc mobileConfig) *ClientConfig {
 	cfg := &ClientConfig{
 		NetworkName:       mc.NetworkName,

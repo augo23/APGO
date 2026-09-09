@@ -100,6 +100,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(OverlaymobilePeersJSON().data(using: .utf8))
         case "pending":
             completionHandler?(OverlaymobilePendingAddress().data(using: .utf8))
+        case "ipconflict":
+            // The last overlay-address collision, or "null". The address the UI
+            // shows may have MOVED (a taken address is vacated automatically),
+            // and this is what lets the app say so instead of silently coming
+            // back on a different IP.
+            completionHandler?(OverlaymobileIPConflictJSON().data(using: .utf8))
         case "admission":
             // Three booleans the app needs before it can offer an Approve
             // button: does this network gate devices at all, is THIS device

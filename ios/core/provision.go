@@ -311,6 +311,12 @@ func handleProvision(payload []byte) {
 	}
 	if pub == gKP.pub {
 		applyProvisionSelf(rec)
+		return
+	}
+	// Someone ELSE was just assigned an address. If it is the one this device
+	// is on, an operator has spoken and this device is the one that moves.
+	if rec.Address != "" && stripMask(normalizeOverlayAddr(rec.Address)) == myOverlayIP {
+		go resolveOverlayIPCollision("provision")
 	}
 }
 

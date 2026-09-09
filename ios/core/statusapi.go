@@ -108,9 +108,14 @@ func ExitsJSON() string {
 		"use_exit": useExitNow,
 		"pin":      pin,
 		"exits":    out,
+		// Why full-VPN traffic is not moving, in one sentence, or "" when an
+		// exit is selected and usable. The exits array alone cannot express
+		// this: an EMPTY array is the most common failure and says nothing
+		// about which of its several causes applies. See exitDiagnosis.
+		"reason": exitDiagnosis(),
 	})
 	if err != nil {
-		return `{"use_exit":false,"pin":"","exits":[]}`
+		return `{"use_exit":false,"pin":"","exits":[],"reason":""}`
 	}
 	return string(b)
 }
@@ -134,8 +139,18 @@ func ExitsJSON() string {
 // gomobile exposes this to Kotlin/Swift as networkStatusJSON().
 func NetworkStatusJSON() string {
 	status := map[string]any{
-		"nat_type": natTypeLabel(),
-		"nat":      natSummary(),
+		"nat_type":   natTypeLabel(),
+		"nat":        natSummary(),
+		"overlay_ip": myOverlayIP,
+		// Last overlay-address collision, or null. Non-null means this device's
+		// address was already held by another node: "resolved" with a new_ip is
+		// an automatic move the app has adopted (the address on screen is the
+		// NEW one, which is exactly why it has to be announced), "stale" is a
+		// leftover claim from a key nothing has heard from — usually this
+		// device before it was reinstalled — and needs an admin to re-provision
+		// the address onto self_fp. Same shape as the desktop's
+		// /api/info "ip_conflict". See ipclaim.go.
+		"ip_conflict": getIPConflict(),
 	}
 	if GlobalSessions != nil {
 		status["sessions"] = GlobalSessions.EstablishedPeerCount()

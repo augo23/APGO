@@ -392,6 +392,16 @@ func loadConfig() (*ClientConfig, error) {
 // odds stay negligible for small fleets; if two nodes ever do collide, pin
 // one of them with an explicit tun.address_cidr.
 func deriveOverlayIP(cidr string, pub [32]byte) (string, error) {
+	return deriveOverlayIPSalted(cidr, pub, 0)
+}
+
+// deriveOverlayIPSalted is deriveOverlayIP with a hop counter mixed into the
+// hash. Salt 0 reproduces the classic (unchanged) derivation; salts 1..n give a
+// deterministic sequence of alternative addresses, used to move off an address
+// another node already holds (see ipclaim.go). Must stay byte-identical to
+// client/main.go's copy: a phone and a desktop that disagree on this sequence
+// would hop to different addresses from the same key.
+func deriveOverlayIPSalted(cidr string, pub [32]byte, salt int) (string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return "", fmt.Errorf("overlay_cidr: %w", err)
@@ -407,7 +417,11 @@ func deriveOverlayIP(cidr string, pub [32]byte) (string, error) {
 	hostBits := uint(32 - ones)
 	usable := (uint32(1) << hostBits) - 2 // exclude network + broadcast
 
-	h := sha256.Sum256(append([]byte("OVLY-ip-v1:"), pub[:]...))
+	seed := append([]byte("OVLY-ip-v1:"), pub[:]...)
+	if salt > 0 {
+		seed = append(seed, []byte(fmt.Sprintf("|hop%d", salt))...)
+	}
+	h := sha256.Sum256(seed)
 	hostNum := binary.BigEndian.Uint32(h[:4])%usable + 1 // 1 .. usable
 
 	base := binary.BigEndian.Uint32(ip4)
@@ -878,7 +892,12 @@ func startNATProbing(conn *net.UDPConn, stunServers []string) {
 // another, and never cap the public endpoint at all.
 const (
 	maxLANCandidates = 3 // enough for Wi-Fi + Ethernet + one more
-	maxV6Candidates  = 2
+	// maxV6Candidates was 2, which is not enough on the devices that most need
+	// IPv6. A phone with Wi-Fi and cellular both up has a SLAAC address and a
+	// privacy/temporary address on each, so two slots could be filled entirely
+	// by addresses on the interface that is not carrying traffic — advertising
+	// dead endpoints and none of the working ones. Four covers both.
+	maxV6Candidates = 4
 	// predictedPortSpread is how many symmetric-NAT port guesses to advertise.
 	// Was 8; that wide a spread buys very little hit rate and costs every peer
 	// a burst of doomed handshakes.
@@ -1278,14 +1297,13 @@ func globalIPv6Endpoints(port int) []string {
 			if !ok {
 				continue
 			}
-			ip := ipnet.IP
-			if ip.To4() != nil {
+			// isGlobalIPv6 rejects IPv4, v4-mapped v6, ULA and link-local in
+			// one place, shared with routeClass — so the address we ADVERTISE
+			// and the address we PREFER are decided by the same rule.
+			if !isGlobalIPv6(ipnet.IP) {
 				continue
 			}
-			if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-				continue
-			}
-			out = append(out, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+			out = append(out, net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port)))
 		}
 	}
 	return out
@@ -1726,6 +1744,16 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			return
 		}
 		if ip == myOverlayIP {
+			// Record the claim against the peer's KEY and let the resolver
+			// decide which side moves — an approved or admin-provisioned
+			// incumbent keeps the address, and a claim from a key nothing has
+			// heard from is a stale record rather than a collision. Falls back
+			// to the old warning when the claimant cannot be identified.
+			if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
+				setPeerOverlayIP(s.peerStatic, ip)
+				resolveOverlayIPCollision("announce")
+				return
+			}
 			log.Printf("[WARN] OVERLAY IP CONFLICT: peer %s claims OUR address %s! "+
 				"Two nodes derived or were assigned the same IP — pin one of them "+
 				"with OVERLAY_ADDRESS (or /etc/overlay-node.env).", raddr, ip)
@@ -2587,6 +2615,15 @@ func localInterfaceIPs() []string {
 			}
 			if ip4 := ip.To4(); ip4 != nil {
 				out = append(out, ip4.String())
+				continue
+			}
+			// IPv6 too. Callers use this list to recognise OUR OWN addresses
+			// gossiped back at us; with v6 omitted, a peer that shared our v6
+			// endpoint got dialled by us as if it were somebody else.
+			// Link-local is excluded deliberately: interface-scoped, never
+			// announced, pure noise here.
+			if ip.IsGlobalUnicast() && !ip.IsLinkLocalUnicast() {
+				out = append(out, ip.String())
 			}
 		}
 	}

@@ -190,6 +190,10 @@ func handleRoster(payload []byte) {
 	if sawNew {
 		go connectRosterNodes()
 	}
+	// The roster is the first thing a joining device hears that lists the
+	// addresses existing members hold — earlier than anything on its own
+	// (admission-gated) data plane.
+	go resolveOverlayIPCollision("roster")
 }
 
 // connectRosterNodes fires coordinated-connect signaling at every roster node

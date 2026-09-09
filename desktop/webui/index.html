@@ -191,6 +191,7 @@
     <!-- Full-VPN status: fail-closed mode pauses internet while no exit is
          reachable; say so here instead of letting it look like an outage. -->
     <div id="inboundStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
+    <div id="ipConflict" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="selfApproval" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="dataPath" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="exitStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
@@ -220,6 +221,7 @@
         </table>
       </div>
     </details>
+
 
     <div id="netsWrap"></div>
     <div><button class="addnet" id="addNetBtn">+ Add Network</button></div>
@@ -351,6 +353,31 @@
           <input id="cfgExitDown" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
         <div><label for="cfgExitQuota">Exit quota (GB)</label>
           <input id="cfgExitQuota" type="number" min="0" step="1" placeholder="e.g. 500"></div>
+      </div>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgSocks">
+        <span><strong>SOCKS5 proxy</strong>
+        <em>Lets applications on that machine reach overlay addresses through a local
+        proxy port. Point a browser at it with remote DNS
+        (<code>--socks5-hostname</code>) so overlay names resolve there.</em></span>
+      </label>
+      <div id="cfgSocksBox" class="cfglimits">
+        <div style="grid-column:1/-1"><label for="cfgSocksListen">Listen address</label>
+          <input id="cfgSocksListen" type="text" spellcheck="false" autocapitalize="off"
+                 placeholder="127.0.0.1:1080"></div>
+        <div><label for="cfgSocksUser">Username</label>
+          <input id="cfgSocksUser" type="text" spellcheck="false" autocapitalize="off"
+                 autocomplete="off" placeholder="blank = none"></div>
+        <div><label for="cfgSocksPass">Password</label>
+          <input id="cfgSocksPass" type="password" autocomplete="new-password"
+                 placeholder="unchanged"></div>
+        <label class="cfgrow" style="grid-column:1/-1; border-top:none; padding:4px 0">
+          <input type="checkbox" id="cfgSocksOverlayOnly">
+          <span><strong>Overlay destinations only</strong>
+          <em>Blocks the proxy from reaching the internet through this node.</em></span>
+        </label>
+        <p class="lc" id="cfgSocksWarn" style="grid-column:1/-1; margin:0"></p>
       </div>
 
       <label class="cfgrow">
@@ -576,6 +603,31 @@ function trafficOf(s){ return (s && s.traffic) || {}; }
 function esc(s){ return (s??"").toString().replace(/[&<>"']/g, c => (
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+// Node lists sort by overlay IP NUMERICALLY, not as text. A string sort orders
+// by digit characters, which puts .115 above .3 and scatters a /24 across the
+// table — the addresses people actually read are the last octet, so the list
+// has to count the way they do. Packing the four octets into one integer
+// (a<<24 | b<<16 | c<<8 | d, via multiplication to stay clear of JS's signed
+// 32-bit bitwise ops) gives one comparable number, so 10.22.22.3 < 10.22.22.5 <
+// 10.22.23.5 < 10.22.23.123 falls out in a single ascending run: subnets end up
+// adjacent without being split into separate groups, because a lower third
+// octet always sorts below a higher one. Rows with no address yet sort last
+// rather than colliding at zero, and ties fall back to the name so the order
+// stays stable between refreshes.
+function ipSortKey(ip){
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(
+    String(ip||"").trim().split("/")[0]);
+  if(!m) return Number.MAX_SAFE_INTEGER; // unknown/blank → bottom of the list
+  const o = m.slice(1).map(Number);
+  if(o.some(n => n > 255)) return Number.MAX_SAFE_INTEGER;
+  return ((o[0]*256 + o[1])*256 + o[2])*256 + o[3];
+}
+function byOverlayIP(a, b){
+  const d = ipSortKey(a && a.overlay_ip) - ipSortKey(b && b.overlay_ip);
+  if(d) return d;
+  return String((a&&a.name)||"").localeCompare(String((b&&b.name)||""));
+}
+
 function setConnectBtn(up){
   const b = document.getElementById("connectBtn");
   if(!b) return;
@@ -641,6 +693,38 @@ async function loadInfo(){
     if (p.length === 4) overlayPrefix = p[0]+"."+p[1]+"."+p[2]+".";
   }
   document.getElementById("cOverlay").textContent = j.overlay_ip || "—";
+  // OVERLAY ADDRESS COLLISION. When this device joined with an address another
+  // (approved) node already held, the client moved itself to a free one — the
+  // card above already shows the NEW address, which is exactly why this banner
+  // has to exist: without it the address silently differs from the one the
+  // person was given, or wrote down, or configured a service against.
+  const ipc = document.getElementById("ipConflict");
+  if (ipc) {
+    const c = j.ip_conflict;
+    if (!c) {
+      ipc.style.display = "none";
+    } else if (c.resolved) {
+      ipc.style.display = "";
+      ipc.style.color = "#e6b400"; ipc.style.borderColor = "#e6b400";
+      ipc.innerHTML = "⚠ Overlay IP changed automatically. " + esc(c.old_ip) +
+        " was already in use by " + esc(c.peer_name || c.peer_fp || "another node") +
+        ", so this device now uses <b>" + esc(c.new_ip) + "</b>. Use the new address for anything " +
+        "pointed at this device; an admin can pin a different one from the admin panel.";
+    } else if (c.stale) {
+      // A leftover claim from a key nothing has heard from — the reinstall
+      // case. Amber, not red: nothing is broken right now, and the fix is to
+      // RECLAIM the address, not to move off it.
+      ipc.style.display = "";
+      ipc.style.color = "#e6b400"; ipc.style.borderColor = "#e6b400";
+      ipc.innerHTML = "⚠ " + esc(c.reason) +
+        (c.self_fp ? '<br><span class="tdim">This device\'s current key: <b class="mono">' +
+          esc(c.self_fp) + "</b></span>" : "");
+    } else {
+      ipc.style.display = "";
+      ipc.style.color = "#ff6b6b"; ipc.style.borderColor = "#ff6b6b";
+      ipc.innerHTML = "⚠ " + esc(c.reason || ("Overlay IP " + (c.old_ip||"") + " is already in use."));
+    }
+  }
   const pubEl = document.getElementById("cPubIP");
   pubEl.textContent = j.public_ip || "discovering…";
   if (j.public_endpoint) pubEl.title = "Public endpoint: " + j.public_endpoint + " (STUN reflexive address)";
@@ -837,7 +921,7 @@ async function loadSessions(){
     tb.innerHTML = '<tr><td class="empty" colspan="11">No peers connected.</td></tr>';
     return;
   }
-  list.sort((a,b)=> (a.overlay_ip||"").localeCompare(b.overlay_ip||""));
+  list.sort(byOverlayIP);
   tb.innerHTML = list.map(s => {
     const relayed = !!s.relayed;
     // Admin actions are addressed to a device's PUBLIC KEY, not to a socket:
@@ -904,7 +988,7 @@ async function loadRevocations(){
   list = list.filter(x => x.action === "revoke");
   const tb = document.getElementById("revokedRows");
   if(list.length===0){ tb.innerHTML = '<tr><td class="empty" colspan="5">None.</td></tr>'; return; }
-  list.sort((a,b)=>(a.overlay_ip||"").localeCompare(b.overlay_ip||""));
+  list.sort(byOverlayIP);
   tb.innerHTML = list.map(x => `
     <tr>
       <td class="mono">${esc(x.overlay_ip||"unknown")}</td>
@@ -1406,7 +1490,7 @@ async function loadNetSessions(id){
     tb.innerHTML = '<tr><td class="empty" colspan="7">No peers connected on this network.</td></tr>';
     return;
   }
-  list.sort((a,b)=> (a.overlay_ip||"").localeCompare(b.overlay_ip||""));
+  list.sort(byOverlayIP);
   tb.innerHTML = list.map(s => {
     const relayed = !!s.relayed;
     // Gate on the device KEY, not on `relayed` — see the note in the main peer
@@ -1540,6 +1624,8 @@ async function tick(){
 loadConfig().then(tick);
 setInterval(tick, 3000);
 
+
+
 /* ---- Per-node discovery & relay ---------------------------------------
    Reads  /api/node-config-get?pubkey=<b64>
    Writes /api/node-config   (admin server signs, then forwards to the node)
@@ -1599,11 +1685,13 @@ async function openCfgModal(pubkey, label){
      right is worse than a blank form, and this one was one Apply away from
      writing another node's address onto this one. */
   for(const id of ["cfgName","cfgIp","cfgRv","cfgRvAuth","cfgRelayList",
+                   "cfgSocksListen","cfgSocksUser","cfgSocksPass",
                    "cfgRelayUp","cfgRelayDown","cfgRelayQuota",
                    "cfgExitUp","cfgExitDown","cfgExitQuota"]){
     document.getElementById(id).value = "";
   }
-  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit"]){
+  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit",
+                   "cfgSocks","cfgSocksOverlayOnly"]){
     document.getElementById(id).checked = false;
   }
   document.getElementById("cfgTrackersOn").checked = true;
@@ -1649,6 +1737,15 @@ async function openCfgModal(pubkey, label){
     document.getElementById("cfgRelayList").value  = (d.trackers||[]).join("\n");
     document.getElementById("cfgTrackersOn").checked = d.trackers_on !== false;
     document.getElementById("cfgRv").value      = d.rendezvous || "";
+    document.getElementById("cfgSocksListen").value = d.socks5_listen || "";
+    document.getElementById("cfgSocksUser").value   = d.socks5_user || "";
+    document.getElementById("cfgSocks").checked     = !!d.socks5_listen;
+    document.getElementById("cfgSocksOverlayOnly").checked = !!d.socks5_overlay_only;
+    /* The password is never returned by the API -- a dashboard that can read
+       it back leaks it to anyone who can reach that endpoint. Show only
+       whether one is set, and treat a blank field as "leave unchanged". */
+    document.getElementById("cfgSocksPass").placeholder =
+      d.socks5_has_pass ? "set — leave blank to keep" : "blank = none";
     document.getElementById("cfgRvAuth").value  = d.rendezvous_auth || "";
 
     /* Say where the values came from. Without this, a node inheriting the
@@ -1666,6 +1763,7 @@ async function openCfgModal(pubkey, label){
   }
   cfgSyncLimits();
   cfgSyncTrackerGate();
+  cfgSyncSocks();
   document.getElementById("cfgModal").classList.add("show");
 }
 function closeCfgModal(){ document.getElementById("cfgModal").classList.remove("show"); cfgTarget = null; }
@@ -1716,6 +1814,9 @@ async function applyCfg(){
       trackers_on:       document.getElementById("cfgTrackersOn").checked,
       rendezvous:        document.getElementById("cfgRv").value.trim(),
       rendezvous_auth:   document.getElementById("cfgRvAuth").value.trim(),
+      socks5_listen:      socksListenValue(),
+      socks5_user:        document.getElementById("cfgSocksUser").value.trim(),
+      socks5_overlay_only: document.getElementById("cfgSocksOverlayOnly").checked,
       relay_up:    cfgMbpsField("cfgRelayUp"),
       relay_down:  cfgMbpsField("cfgRelayDown"),
       relay_quota: cfgGBField("cfgRelayQuota"),
@@ -1724,6 +1825,8 @@ async function applyCfg(){
       exit_quota:  cfgGBField("cfgExitQuota"),
       password: pass,
     };
+    const sp = document.getElementById("cfgSocksPass").value;
+    if(sp !== "") body.socks5_pass = sp;   // blank means "leave unchanged"
     const r = await fetch("/api/node-config", {method:"POST",
       headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify(body)});
     /* Surface the server's refusal verbatim: an unlimited public relay, a
@@ -1782,6 +1885,37 @@ function cfgSyncTrackerGate(){
   }
 }
 
+/* "" turns the proxy off; the checkbox and the address field are two views of
+   one value, so unticking clears it rather than leaving a stale address that
+   would come back on next Apply. */
+function socksListenValue(){
+  if(!document.getElementById("cfgSocks").checked) return "";
+  const v = document.getElementById("cfgSocksListen").value.trim();
+  return v || "127.0.0.1:1080";   // sensible default rather than silently off
+}
+function cfgSyncSocks(){
+  const on = document.getElementById("cfgSocks").checked;
+  document.getElementById("cfgSocksBox").hidden = !on;
+  const warn = document.getElementById("cfgSocksWarn");
+  const addr = document.getElementById("cfgSocksListen").value.trim() || "127.0.0.1:1080";
+  const host = addr.replace(/:[0-9]+$/, "");
+  const loopback = host === "127.0.0.1" || host === "::1" || host === "[::1]" || host === "localhost";
+  const hasUser = document.getElementById("cfgSocksUser").value.trim() !== "";
+  /* The node itself refuses an unauthenticated non-loopback bind. Say so here
+     rather than letting Apply succeed and the proxy silently not start. */
+  if(on && !loopback && !hasUser){
+    warn.textContent = "A proxy on " + host + " must have a username and password — " +
+      "without them anyone who can reach that port can use this node to enter the overlay. " +
+      "The node will refuse to start it.";
+    warn.style.color = "#e6b400";
+  } else if(on && !loopback){
+    warn.textContent = "Reachable beyond this machine — make sure the credentials are strong.";
+    warn.style.color = "";
+  } else {
+    warn.textContent = "";
+  }
+}
+
 document.getElementById("cfgCancel").addEventListener("click", closeCfgModal);
 document.getElementById("cfgModal").addEventListener("click", (e)=>{ if(e.target.id==="cfgModal") closeCfgModal(); });
 document.getElementById("cfgApply").addEventListener("click", applyCfg);
@@ -1789,6 +1923,9 @@ document.getElementById("cfgSeed").addEventListener("click", cfgSeedFromSelf);
 document.getElementById("cfgPublicRelay").addEventListener("change", cfgSyncLimits);
 document.getElementById("cfgExit").addEventListener("change", cfgSyncLimits);
 document.getElementById("cfgDht").addEventListener("change", cfgSyncTrackerGate);
+document.getElementById("cfgSocks").addEventListener("change", cfgSyncSocks);
+document.getElementById("cfgSocksListen").addEventListener("input", cfgSyncSocks);
+document.getElementById("cfgSocksUser").addEventListener("input", cfgSyncSocks);
 document.getElementById("cfgRv").addEventListener("input", cfgSyncTrackerGate);
 document.getElementById("cfgApprove").addEventListener("click", ()=>{
   if(!cfgTarget) return;

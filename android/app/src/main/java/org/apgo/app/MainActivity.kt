@@ -736,6 +736,33 @@ fun MainScreen(
             // "why can I see peers but not reach them?" — had no answer here
             // at all. iOS grew these cards; this is the same information, from
             // the same core call, so the apps agree.
+            // OVERLAY ADDRESS COLLISION. The address shown above may not be
+            // the one this device was given: an address another node already
+            // held is vacated automatically (the core stages a free one and the
+            // pendingAddress branch above reconnects onto it), and a silent
+            // change is worse than the collision itself. A "stale" claim is the
+            // opposite case — a key nothing has heard from, usually this device
+            // before it was reinstalled — and it is cleared by re-provisioning
+            // the address onto this device's current key, not by moving.
+            if (connected) netStatus?.optJSONObject("ip_conflict")?.let { c ->
+                val resolved = c.optBoolean("resolved", false)
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        "⚠ " + (if (resolved) "Overlay IP changed automatically"
+                                else "Overlay IP already claimed"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFE6A400)
+                    )
+                    Text(c.optString("reason", ""),
+                        style = MaterialTheme.typography.bodySmall)
+                    val selfFp = c.optString("self_fp", "")
+                    if (c.optBoolean("stale", false) && selfFp.isNotEmpty()) {
+                        Text("This device's current key: $selfFp",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
             if (connected) netStatus?.let { ns ->
                 val nat = ns.optString("nat_type", "")
                 if (nat.isNotEmpty()) {

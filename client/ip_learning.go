@@ -116,10 +116,14 @@ func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 		//      RouteIsLive's own doc comment.
 		//   3. An established direct route always beats a relay route
 		//      (relay -> direct upgrade, as before).
-		//   4. Between two routes to the SAME peer key (its LAN + WAN
-		//      addresses), keep the incumbent while it is live — sticky, no
-		//      flip-flopping — but prefer an upgrade to the LAN path, and
-		//      fail over when the incumbent is dead and the candidate live.
+		//   4. Between two routes to the SAME peer key (its LAN, IPv6 and
+		//      NAT'd v4 addresses), keep the incumbent while it is live —
+		//      sticky, no flip-flopping — but prefer an upgrade to a BETTER
+		//      ROUTE CLASS (LAN over IPv6 over NAT'd IPv4; see routeClass),
+		//      and fail over when the incumbent is dead and the candidate
+		//      live. The upgrade needs no liveness test of its own: Learn is
+		//      only ever called for an address a frame just arrived from, so
+		//      the candidate has proven itself this instant.
 		//   5. Between two relay routes, last-writer-wins (as before): the
 		//      most recent forwarder is the one proven to reach us.
 		if GlobalSessions != nil {
@@ -127,8 +131,12 @@ func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 			cand := GlobalSessions.GetByAddr(addr)
 			if cur.Established() {
 				if cand.Established() && cur.peerStatic == cand.peerStatic {
-					// Rule 4: two routes to the same device.
-					if isPrivateUDPAddr(addr) && !isPrivateUDPAddr(e.addr) {
+					// Rule 4: two routes to the same device. Take the better
+					// route class immediately — this is what moves a peer off
+					// a NAT'd IPv4 path onto its LAN or IPv6 address as soon
+					// as one is heard from, instead of leaving it on whichever
+					// address happened to hand shake first.
+					if routeClass(addr) > routeClass(e.addr) {
 						e.addr = addr
 						e.seen = time.Now()
 						return

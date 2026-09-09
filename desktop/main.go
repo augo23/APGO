@@ -429,7 +429,27 @@ type mConfig struct {
 	// IP, friendly name, base64 public key, or key-fingerprint prefix.
 	UseExit  bool   `yaml:"use_exit"`
 	ExitPeer string `yaml:"exit_peer"`
-	Tun      struct {
+	// DHT, UseRelays and PublicRelay are the three discovery/relay switches.
+	// They were missing from this struct entirely, which had two consequences,
+	// the second much worse than the first: the desktop Settings page could not
+	// turn them on, AND — because saveConfig marshals THIS struct over the
+	// config file — saving settings DELETED the keys from client.yaml. Every
+	// one of them defaults to OFF in the client when absent, so a node that had
+	// the DHT and public relays enabled lost both the next time anyone opened
+	// Settings and pressed Save. (saveConfig now merges rather than
+	// overwrites, so an unmodelled key can never be dropped again.)
+	//
+	// Pointers, matching the client's own config type: nil means "not set here"
+	// and lets an admin-signed node-config record decide, while false means
+	// "explicitly off". Collapsing that to a plain bool would make every save
+	// from this page an explicit network-wide "off".
+	DHT       *bool `yaml:"dht,omitempty"`
+	UseRelays *bool `yaml:"use_public_relays,omitempty"`
+	// PublicRelay makes this device SERVE as a relay for other members: it
+	// advertises in the DHT relay directory and carries opaque, end-to-end
+	// encrypted traffic for peers that cannot reach each other directly.
+	PublicRelay bool `yaml:"public_relay"`
+	Tun         struct {
 		MTU         int    `yaml:"mtu"`
 		AddressCIDR string `yaml:"address_cidr"`
 	} `yaml:"tun"`
@@ -461,9 +481,12 @@ func applyDefaults(c *mConfig) {
 	if c.OverlayCIDR == "" {
 		c.OverlayCIDR = "10.22.55.0/24"
 	}
-	if c.UDPListenPort == 0 {
-		c.UDPListenPort = 6969
-	}
+	// NO DEFAULT PORT ON PURPOSE. 0 means "choose automatically", and the
+	// client then derives a stable port from this node's key (see
+	// bindListenPort). A shared constant here was the bug: every device in one
+	// house asked its router for the same external port, only the first could
+	// have it, and the rest fell back to ephemeral mappings that expire and
+	// change — reachable from outside for a few minutes at a time.
 	if len(c.STUNServers) == 0 {
 		c.STUNServers = []string{
 			"stun:stun.l.google.com:19302",
@@ -513,12 +536,47 @@ func loadConfig() mConfig {
 // first run. Used to seed the Settings form when adding a new network.
 func blankConfig() mConfig { return mConfig{PostQuantum: true, IPv6: true, PortPrediction: true} }
 
+// saveConfig writes the config, PRESERVING every key this struct does not
+// model.
+//
+// It used to marshal mConfig straight over client.yaml. mConfig is a subset of
+// the client's own ClientConfig — it always has been — so each save silently
+// deleted every key the desktop does not know about: dht, use_public_relays,
+// public_relay, advertise_port, static_peers, the SOCKS5 block, relay and exit
+// rate limits. The client treats those as OFF/absent when missing, so opening
+// Settings and pressing Save turned features off that the user never touched
+// and was never told about. Adding the three relay switches to the struct fixes
+// today's instance; merging fixes the CLASS, including every field added to the
+// client from now on.
+//
+// The merge is one level deep, which is what the shape needs: the struct's own
+// keys win outright, everything else in the file is carried through untouched.
 func saveConfig(c mConfig) error {
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(), data, 0o600)
+	existing, err := os.ReadFile(configPath())
+	if err != nil {
+		// No file yet (first run) — nothing to preserve.
+		return os.WriteFile(configPath(), data, 0o600)
+	}
+	var prev, next map[string]any
+	if yaml.Unmarshal(existing, &prev) != nil || prev == nil {
+		// Unparseable or empty: do not try to be clever with it.
+		return os.WriteFile(configPath(), data, 0o600)
+	}
+	if err := yaml.Unmarshal(data, &next); err != nil || next == nil {
+		return os.WriteFile(configPath(), data, 0o600)
+	}
+	for k, v := range next {
+		prev[k] = v
+	}
+	merged, err := yaml.Marshal(prev)
+	if err != nil {
+		return os.WriteFile(configPath(), data, 0o600)
+	}
+	return os.WriteFile(configPath(), merged, 0o600)
 }
 
 func appDir() string {
@@ -537,12 +595,12 @@ func approvalsPath() string   { return filepath.Join(appDir(), "approvals.json")
 func netConfigPath() string   { return filepath.Join(appDir(), "netconfig.json") }
 func trackersPath() string    { return filepath.Join(appDir(), "trackers.txt") }
 func policyPath() string      { return filepath.Join(appDir(), "policy.json") }
-func netSharesPath() string { return filepath.Join(appDir(), "netshares.json") }
+func netSharesPath() string   { return filepath.Join(appDir(), "netshares.json") }
 
 // networksStateDir holds secondary-network profiles + per-network child state
 // (see client/multinet.go). NOT the tray's profile-switcher dir ("networks").
 func networksStateDir() string { return filepath.Join(appDir(), "netstate") }
-func logPath() string       { return filepath.Join(appDir(), "overlay-client.log") }
+func logPath() string          { return filepath.Join(appDir(), "overlay-client.log") }
 
 // lastClientError digs the actual reason out of the tail of the client log so
 // a failed Connect can SAY what went wrong instead of pointing at a file.
@@ -588,8 +646,8 @@ func lastClientError() string {
 	}
 	return "the log is empty; open it from the menu for details."
 }
-func pidPath() string        { return filepath.Join(appDir(), "client.pid") }
-func nodeKeyPath() string    { return filepath.Join(appDir(), "node.key") }
+func pidPath() string         { return filepath.Join(appDir(), "client.pid") }
+func nodeKeyPath() string     { return filepath.Join(appDir(), "node.key") }
 func adminPubKeyPath() string { return filepath.Join(appDir(), "admin-pubkey") }
 
 // clientBinary locates the overlay-client: $OVERLAY_CLIENT_BIN, then next to

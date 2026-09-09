@@ -61,6 +61,15 @@ type SignedNodeConfig struct {
 	Rendezvous     *string `json:"rendezvous,omitempty"`
 	RendezvousAuth *string `json:"rendezvous_auth,omitempty"`
 
+	// SOCKS5 proxy (socks5.go). Listen is "host:port" ("" = off). Pass is
+	// carried in the signed record like any other setting: the record travels
+	// inside the encrypted tunnel and is only accepted from the admin key, so
+	// it is no more exposed than the PSK rotation that uses the same path.
+	Socks5Listen      *string `json:"socks5_listen,omitempty"`
+	Socks5User        *string `json:"socks5_user,omitempty"`
+	Socks5Pass        *string `json:"socks5_pass,omitempty"`
+	Socks5OverlayOnly *bool   `json:"socks5_overlay_only,omitempty"`
+
 	// Bandwidth budgets, in BYTES PER SECOND (and bytes for the quotas), already
 	// parsed. The wire format carries numbers rather than "5mbit" so that every
 	// node agrees on the value without re-running a string parser -- and so the
@@ -109,9 +118,10 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	if c.Trackers != nil {
 		trackers = strings.Join(*c.Trackers, ",")
 	}
-	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
+	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
 		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
 		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
 		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
 		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
 		c.Epoch, c.Ts)
@@ -230,6 +240,18 @@ func effectiveNodeConfig(self string) SignedNodeConfig {
 		}
 		if mine.RendezvousAuth != nil {
 			out.RendezvousAuth = mine.RendezvousAuth
+		}
+		if mine.Socks5Listen != nil {
+			out.Socks5Listen = mine.Socks5Listen
+		}
+		if mine.Socks5User != nil {
+			out.Socks5User = mine.Socks5User
+		}
+		if mine.Socks5Pass != nil {
+			out.Socks5Pass = mine.Socks5Pass
+		}
+		if mine.Socks5OverlayOnly != nil {
+			out.Socks5OverlayOnly = mine.Socks5OverlayOnly
 		}
 		if mine.RelayUp != nil {
 			out.RelayUp = mine.RelayUp
@@ -357,6 +379,13 @@ func nodeConfigSnapshot(pubB64 string) map[string]any {
 		"trackers_on":       eff.TrackersOn == nil || *eff.TrackersOn,
 		"rendezvous":        derefS(eff.Rendezvous),
 		"rendezvous_auth":   derefS(eff.RendezvousAuth),
+		"socks5_listen":     derefS(eff.Socks5Listen),
+		"socks5_user":       derefS(eff.Socks5User),
+		// The password is NOT returned. A dashboard that can read it back is a
+		// dashboard that leaks it to anyone who can reach the API; the field is
+		// write-only, and the UI shows whether one is set instead.
+		"socks5_has_pass":    derefS(eff.Socks5Pass) != "",
+		"socks5_overlay_only": eff.Socks5OverlayOnly != nil && *eff.Socks5OverlayOnly,
 		"relay_up_bps":      derefI(eff.RelayUp),
 		"relay_down_bps":    derefI(eff.RelayDown),
 		"relay_quota_bytes": derefI(eff.RelayQuota),
@@ -498,6 +527,11 @@ func applyNodeConfigLive(c SignedNodeConfig, source string) {
 			changed = append(changed, "exit_quota="+formatRate(quota))
 		}
 		l.Configure(up, down, quota, cur.PeriodDays)
+	}
+	if c.Socks5Listen != nil || c.Socks5User != nil || c.Socks5Pass != nil || c.Socks5OverlayOnly != nil {
+		if applySocks5Config(c) {
+			changed = append(changed, "socks5="+socks5ListenDesc())
+		}
 	}
 	if c.ExitNode != nil {
 		if err := setExitNodeEnabled(*c.ExitNode); err != nil {

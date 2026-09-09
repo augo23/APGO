@@ -112,6 +112,38 @@ func buildPeerExchangeFor(dst *net.UDPAddr) []byte {
 		}
 		add(s)
 	}
+
+	// OUR OWN IPv6 endpoints, gossiped to everyone.
+	//
+	// This is the only way a peer can learn them. The loop above shares each
+	// session's CURRENT transport address, so a peer's v6 address is shared
+	// only once the session already runs over v6 — circular. The other
+	// discovery paths cannot carry it either: the BitTorrent tracker peer list
+	// and the DHT are both compact-IPv4 formats by protocol. That left exactly
+	// one carrier, the candidate list inside a coordinated-connect frame,
+	// which is only exchanged between two nodes that have ALREADY found each
+	// other over IPv4.
+	//
+	// So in practice every session started on IPv4 and, because a live route
+	// is sticky, stayed there — a node with a perfectly good NAT-free IPv6
+	// address spent its life hole-punching. Advertising ours here closes the
+	// loop: any peer we can reach at all learns the address, dials it (the
+	// receiver skips endpoints it is already connected to and damps the rest),
+	// and routeClass then promotes the v6 path over the NAT'd one.
+	//
+	// Safe to hand to a peer that is already connected to us: the second
+	// session to the same static key is kept as a backup route by design (see
+	// sessions.go, "primary route ... backup route(s) kept for roaming
+	// failover") and becomes primary only if it is genuinely the better class.
+	if myUDPPort > 0 {
+		for _, ep := range globalIPv6Endpoints(myUDPPort) {
+			if dst != nil && ep == dst.String() {
+				continue // never hand a peer its own endpoint
+			}
+			add(ep)
+		}
+	}
+
 	if len(eps) == 0 {
 		return nil
 	}

@@ -298,6 +298,56 @@ func (s *provStore) load(path string) {
 			setPeerName(pub, rec.Name)
 		}
 	}
+	s.pruneSupersededAddresses()
+}
+
+// pruneSupersededAddresses enforces "one overlay address, one node key" across
+// the whole store: where several keys hold a provision for the same address,
+// only the newest signature survives.
+//
+// put() already applies this rule to each record as it ARRIVES, but nothing
+// applied it to the records that came off disk, and a stale claim never
+// arrives again — it is simply there, every start, forever. So a machine that
+// had been reinstalled twice kept all three of its keys claiming one address,
+// and which key a peer resolved that address to was decided by whichever
+// record it happened to hold. The visible result is a node that looks fully
+// connected and receives nothing, because traffic for its address is being
+// sent to a key that no longer exists anywhere. warnOnDuplicateOverlayClaim
+// was already shouting about exactly this state once a minute; it had no way
+// to clear it.
+//
+// Called after load, so a table poisoned by earlier reinstalls repairs itself
+// on the next start rather than needing an admin to revoke each dead key.
+func (s *provStore) pruneSupersededAddresses() {
+	s.mu.Lock()
+	newest := map[string][32]byte{} // overlay ip -> winning key
+	for pub, rec := range s.recs {
+		ip := stripMask(normalizeOverlayAddr(rec.Address))
+		if ip == "" {
+			continue
+		}
+		if cur, ok := newest[ip]; !ok || rec.Seq > s.recs[cur].Seq {
+			newest[ip] = pub
+		}
+	}
+	var dropped []string
+	for pub, rec := range s.recs {
+		ip := stripMask(normalizeOverlayAddr(rec.Address))
+		if ip == "" {
+			continue
+		}
+		if win, ok := newest[ip]; ok && win != pub {
+			delete(s.recs, pub)
+			dropped = append(dropped, ip+" from "+peerKeyFingerprint(pub[:]))
+		}
+	}
+	s.mu.Unlock()
+	if len(dropped) > 0 {
+		log.Printf("[provision] pruned %d superseded address claim(s) left behind by "+
+			"earlier installs: %s. Each address now resolves to exactly one node key.",
+			len(dropped), strings.Join(dropped, ", "))
+		s.save()
+	}
 }
 
 // buildProvisionFrame returns an "OVLYCTL1V<json>" control payload for gossip.
@@ -361,6 +411,12 @@ func handleProvision(payload []byte) {
 	}
 	if pub == gKP.pub {
 		applyProvisionSelf(rec)
+		return
+	}
+	// Someone ELSE was just assigned an address. If it is the one we are
+	// sitting on, an operator has spoken and we are the ones who move.
+	if rec.Address != "" && stripMask(normalizeOverlayAddr(rec.Address)) == myOverlayIP() {
+		go resolveOverlayIPCollision("provision")
 	}
 }
 

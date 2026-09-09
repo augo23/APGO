@@ -626,7 +626,120 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 			})
 		}
 	}
-	return out
+	return collapseByDevice(out)
+}
+
+// collapseByDevice is the LAST word on "one device, one row".
+//
+// Four independent sources feed the list above — direct sessions, learned
+// relay routes, the gossip'd roster, and mesh-heard nodes — and each dedupes
+// itself against the ones before it. That works only while a device's IDENTITY
+// resolves the same way in every source, and it does not always. A relay row's
+// key is resolved by looking its overlay ADDRESS up in the provisions table, so
+// a device whose address changed (re-provisioned, or a stale record from an
+// earlier install) resolves to a different key — or to no key at all — and
+// slips past every per-source check. The visible result is the one people
+// actually report: the same phone or laptop listed twice, once "direct" and
+// once "relayed", with a peer count larger than the number of devices they own.
+//
+// Rather than add a fifth special case, collapse once at the end on the
+// strongest identity each row has, and keep the row that describes the path
+// traffic is really taking: a direct session beats a relayed one, an
+// established row beats a placeholder, and among equals the most recently seen
+// wins. The losing row is not a separate connection — it is another view of the
+// same device — so nothing is lost by hiding it, and the relay path underneath
+// keeps working until the routing table stops choosing it.
+//
+// Identity gaps are filled from the row being dropped: a direct session that
+// has not yet learned a peer's name or overlay address should not lose the ones
+// the roster already knew.
+func collapseByDevice(rows []SessionInfo) []SessionInfo {
+	// identity returns the strongest stable key this row carries. Overlay IP
+	// is the last resort ONLY: two rows for one device under two addresses is
+	// exactly the case this exists to merge, so it must not be tried first.
+	identity := func(si SessionInfo) string {
+		switch {
+		case si.PubKey != "":
+			return "pk:" + si.PubKey
+		case si.KeyFP != "":
+			return "fp:" + si.KeyFP
+		case si.OverlayIP != "":
+			return "ip:" + si.OverlayIP
+		default:
+			return "rm:" + si.Remote
+		}
+	}
+	// better reports whether a should replace b as the row shown for a device.
+	better := func(a, b SessionInfo) bool {
+		if a.Relayed != b.Relayed {
+			return !a.Relayed // a real path beats a relayed one
+		}
+		if a.Established != b.Established {
+			return a.Established
+		}
+		return a.LastSeenUnix > b.LastSeenUnix
+	}
+	fill := func(keep, drop SessionInfo) SessionInfo {
+		if keep.Name == "" {
+			keep.Name = drop.Name
+		}
+		if keep.OverlayIP == "" {
+			keep.OverlayIP = drop.OverlayIP
+		}
+		if keep.KeyFP == "" {
+			keep.KeyFP = drop.KeyFP
+		}
+		if keep.PubKey == "" {
+			keep.PubKey = drop.PubKey
+			keep.Approved = drop.Approved
+		}
+		if keep.Via == "" {
+			keep.Via = drop.Via
+		}
+		if drop.LastSeenUnix > keep.LastSeenUnix {
+			keep.LastSeenUnix = drop.LastSeenUnix
+		}
+		return keep
+	}
+
+	at := map[string]int{} // identity -> index into out
+	out := make([]SessionInfo, 0, len(rows))
+	for _, si := range rows {
+		id := identity(si)
+		i, seen := at[id]
+		if !seen {
+			at[id] = len(out)
+			out = append(out, si)
+			continue
+		}
+		if better(si, out[i]) {
+			out[i] = fill(si, out[i])
+		} else {
+			out[i] = fill(out[i], si)
+		}
+	}
+	// A row can carry a key that another row only learned later (the roster
+	// arrives after the session). Merge once more on fingerprint alone so a
+	// device that was keyless on its first pass still collapses.
+	byFP := map[string]int{}
+	merged := make([]SessionInfo, 0, len(out))
+	for _, si := range out {
+		if si.KeyFP == "" {
+			merged = append(merged, si)
+			continue
+		}
+		if i, seen := byFP[si.KeyFP]; seen {
+			if better(si, merged[i]) {
+				merged[i] = fill(si, merged[i])
+			} else {
+				merged[i] = fill(merged[i], si)
+			}
+			continue
+		}
+		byFP[si.KeyFP] = len(merged)
+		merged = append(merged, si)
+	}
+	return merged
 }
 
 // relayPeerIdentity returns a best-effort friendly name, key fingerprint, and

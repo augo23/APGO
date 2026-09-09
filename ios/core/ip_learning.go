@@ -60,10 +60,12 @@ func (t *IPLearning) Learn(ip string, addr *net.UDPAddr) {
 			cur := GlobalSessions.GetByAddr(e.addr)
 			cand := GlobalSessions.GetByAddr(addr)
 			if cur.Established() && cand.Established() && cur.peerStatic == cand.peerStatic {
-				// Exception: upgrade to the peer's LAN route. Among two live
-				// routes to the same device, a directly-attached (private)
-				// path always beats a WAN/hairpin path.
-				if isPrivateUDPAddr(addr) && !isPrivateUDPAddr(e.addr) {
+				// Exception: upgrade to a BETTER ROUTE CLASS. Among live
+				// routes to the same device the order is LAN, then global
+				// IPv6, then NAT'd IPv4 (see routeClass) — so hearing from a
+				// peer's v6 address moves traffic off the NAT'd path at once
+				// instead of leaving it wherever the first handshake landed.
+				if routeClass(addr) > routeClass(e.addr) {
 					e.addr = addr
 					e.seen = time.Now()
 					return

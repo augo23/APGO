@@ -193,6 +193,15 @@ type SignedNodeConfig struct {
 	Rendezvous     *string `json:"rendezvous,omitempty"`
 	RendezvousAuth *string `json:"rendezvous_auth,omitempty"`
 
+	// SOCKS5 proxy (socks5.go). Listen is "host:port" ("" = off). Pass is
+	// carried in the signed record like any other setting: the record travels
+	// inside the encrypted tunnel and is only accepted from the admin key, so
+	// it is no more exposed than the PSK rotation that uses the same path.
+	Socks5Listen      *string `json:"socks5_listen,omitempty"`
+	Socks5User        *string `json:"socks5_user,omitempty"`
+	Socks5Pass        *string `json:"socks5_pass,omitempty"`
+	Socks5OverlayOnly *bool   `json:"socks5_overlay_only,omitempty"`
+
 	RelayUp    *int64 `json:"relay_up_bps,omitempty"`
 	RelayDown  *int64 `json:"relay_down_bps,omitempty"`
 	RelayQuota *int64 `json:"relay_quota_bytes,omitempty"`
@@ -231,9 +240,10 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	if c.Trackers != nil {
 		trackers = strings.Join(*c.Trackers, ",")
 	}
-	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
+	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
 		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
 		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
 		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
 		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
 		c.Epoch, c.Ts)

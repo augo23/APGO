@@ -171,10 +171,15 @@ func pathLabel(overlayIP string, addr *net.UDPAddr) string {
 		}
 	}
 	switch routeClass(hop) {
-	case 2:
+	case routeClassLAN:
 		return "lan"
-	case 1:
+	case routeClassPrivate:
 		return "direct"
+	case routeClassGlobalV6:
+		// End-to-end IPv6: no NAT on either side. Worth its own badge — it is
+		// the difference between a path that survives a router reboot and one
+		// that depends on a translation entry this node does not control.
+		return "ipv6"
 	default:
 		return "wan"
 	}
@@ -379,8 +384,15 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 		switch {
 		case a.info.Established != b.info.Established:
 			better = a.info.Established
-		case isPrivateUDPAddr(a.addr) != isPrivateUDPAddr(b.addr):
-			better = isPrivateUDPAddr(a.addr)
+		case routeClass(a.addr) != routeClass(b.addr):
+			// Ranked by route class rather than a plain private/public test,
+			// so the row shown for a device is its LAN session if it has one,
+			// then its IPv6 session, and only then a NAT'd IPv4 one — the same
+			// order ip_learning uses to pick the route that carries traffic.
+			// With the old two-way test a v6 and a v4 session were
+			// indistinguishable and the displayed "primary" could be the v4
+			// one while data actually flowed over v6.
+			better = routeClass(a.addr) > routeClass(b.addr)
 		default:
 			better = a.info.LastSeenUnix > b.info.LastSeenUnix
 		}
@@ -776,7 +788,121 @@ func (t *SessionTable) Snapshot() []SessionInfo {
 	for i := range out {
 		out[i].Traffic = trafficForB64(out[i].PubKey)
 	}
-	return out
+	return collapseByDevice(out)
+}
+
+// collapseByDevice is the LAST word on "one device, one row".
+//
+// Four independent sources feed the list above — direct sessions, learned relay
+// routes, the gossip'd roster, and mesh-heard nodes — and each dedupes itself
+// against the ones before it. That works only while a device's IDENTITY
+// resolves the same way in every source, and it does not always. A relay row's
+// key is resolved by looking its overlay ADDRESS up in the provisions table, so
+// a device whose address changed (re-provisioned, or a stale record from an
+// earlier install) resolves to a different key — or to no key at all — and
+// slips past every per-source check. The visible result is the one people
+// report: the same machine listed twice, once "direct" and once "relayed", with
+// a peer count larger than the number of devices they own.
+//
+// Rather than add a fifth special case, collapse once at the end on the
+// strongest identity each row has, and keep the row that describes the path
+// traffic is really taking: a direct session beats a relayed one, an
+// established row beats a placeholder, and among equals the most recently seen
+// wins. The losing row is not a separate connection — it is another view of the
+// same device — so nothing is lost by hiding it, and the relay path underneath
+// keeps working until the routing table stops choosing it.
+func collapseByDevice(rows []SessionInfo) []SessionInfo {
+	// identity returns the strongest stable key this row carries. Overlay IP is
+	// the last resort ONLY: two rows for one device under two addresses is
+	// exactly the case this exists to merge, so it must not be tried first.
+	identity := func(si SessionInfo) string {
+		switch {
+		case si.PubKey != "":
+			return "pk:" + si.PubKey
+		case si.KeyFP != "":
+			return "fp:" + si.KeyFP
+		case si.OverlayIP != "":
+			return "ip:" + si.OverlayIP
+		default:
+			return "rm:" + si.Remote
+		}
+	}
+	better := func(a, b SessionInfo) bool {
+		if a.Relayed != b.Relayed {
+			return !a.Relayed // a real path beats a relayed one
+		}
+		if a.Established != b.Established {
+			return a.Established
+		}
+		return a.LastSeenUnix > b.LastSeenUnix
+	}
+	// Identity gaps are filled from the row being dropped: a direct session
+	// that has not yet learned a peer's name or overlay address should not lose
+	// the ones the roster already knew.
+	fill := func(keep, drop SessionInfo) SessionInfo {
+		if keep.Name == "" {
+			keep.Name = drop.Name
+		}
+		if keep.OverlayIP == "" {
+			keep.OverlayIP = drop.OverlayIP
+		}
+		if keep.KeyFP == "" {
+			keep.KeyFP = drop.KeyFP
+		}
+		if keep.PubKey == "" {
+			keep.PubKey = drop.PubKey
+			keep.Approved = drop.Approved
+		}
+		if keep.Via == "" {
+			keep.Via = drop.Via
+		}
+		if keep.Traffic == (peerTraffic{}) {
+			keep.Traffic = drop.Traffic
+		}
+		if drop.LastSeenUnix > keep.LastSeenUnix {
+			keep.LastSeenUnix = drop.LastSeenUnix
+		}
+		return keep
+	}
+
+	at := map[string]int{}
+	out := make([]SessionInfo, 0, len(rows))
+	for _, si := range rows {
+		id := identity(si)
+		i, seen := at[id]
+		if !seen {
+			at[id] = len(out)
+			out = append(out, si)
+			continue
+		}
+		if better(si, out[i]) {
+			out[i] = fill(si, out[i])
+		} else {
+			out[i] = fill(out[i], si)
+		}
+	}
+	// A row can carry a key that another row only learned later (the roster
+	// arrives after the session). Merge once more on fingerprint alone so a
+	// device that was keyless on its first pass still collapses.
+	byFP := map[string]int{}
+	merged := make([]SessionInfo, 0, len(out))
+	for _, si := range out {
+		if si.KeyFP == "" {
+			merged = append(merged, si)
+			continue
+		}
+		if i, seen := byFP[si.KeyFP]; seen {
+			if better(si, merged[i]) {
+				merged[i] = fill(si, merged[i])
+			} else {
+				merged[i] = fill(merged[i], si)
+			}
+			continue
+		}
+		byFP[si.KeyFP] = len(merged)
+		merged = append(merged, si)
+	}
+	return merged
 }
 
 // trafficForB64 looks up a peer's byte counters by its base64 static key,
@@ -995,6 +1121,11 @@ func startControlServer(socketPath string) {
 			"key_fp":          peerKeyFingerprint(gKP.pub[:]),
 			"friendly_name":   getMyFriendlyName(),
 			"pending_address": getPendingAddress(),
+			// Last overlay-address collision. Non-null when this device's
+			// address was already in use by another node: it carries the old
+			// and new address so the dashboard can tell the person their IP
+			// changed and why (see ipclaim.go).
+			"ip_conflict": getIPConflict(),
 			// This node's public (STUN reflexive) endpoint: "ip:port", or "" if
 			// STUN hasn't succeeded yet. public_ip is the host part alone for
 			// simple display.

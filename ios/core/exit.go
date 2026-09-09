@@ -21,6 +21,7 @@ package overlaymobile
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -202,6 +203,76 @@ func handleExitPong(raddr *net.UDPAddr, ts []byte) {
 	exitMu.Unlock()
 }
 
+// exitDiagnosis explains, in one sentence, why full-VPN traffic is not moving.
+//
+// This exists because the failure was previously SILENT: the egress path drops
+// every internet-bound packet when no exit is selected, with no log line and no
+// status field, so "the VPN doesn't work" was the complete extent of what
+// anyone — user or developer — could observe. Each branch below is a different
+// problem with a different fix, and telling them apart on a phone is otherwise
+// impossible.
+//
+// Returns "" when an exit IS selected and usable.
+func exitDiagnosis() string {
+	if !useExit {
+		return ""
+	}
+	exitMu.Lock()
+	defer exitMu.Unlock()
+	if len(exitCandidates) == 0 {
+		return "no node on this network has announced itself as an exit — set exit_node on the node that should provide internet, and check this device holds a direct session to it (exit announcements only travel over direct sessions, never relays)"
+	}
+	var established, replied int
+	for _, e := range exitCandidates {
+		s := GlobalSessions.GetByAddr(e.addr)
+		if s == nil || !s.Established() {
+			continue
+		}
+		established++
+		if time.Since(e.lastReply) <= 90*time.Second {
+			replied++
+		}
+	}
+	switch {
+	case established == 0:
+		return fmt.Sprintf("%d exit node(s) known but none has a live session right now — this device can see them announced but cannot reach them directly", len(exitCandidates))
+	case replied == 0:
+		return fmt.Sprintf("%d exit node(s) have live sessions but none answered a latency probe in the last 90s — the session is up in one direction only", established)
+	case exitPin != "" && selectedExit == nil:
+		return fmt.Sprintf("pinned exit %q is not among the %d reachable exit(s) — pinned mode never falls back, so traffic stays paused until it returns", exitPin, replied)
+	case selectedExit == nil:
+		return "an exit is reachable but none is selected yet — selection runs within a few seconds of a probe reply"
+	}
+	return ""
+}
+
+// noteExitDrop reports internet-bound traffic being discarded because no exit
+// is usable, at most once every 30s so a busy device does not fill the log.
+var (
+	exitDropMu   sync.Mutex
+	exitDropLast time.Time
+	exitDropN    int
+)
+
+func noteExitDrop(dst string) {
+	exitDropMu.Lock()
+	exitDropN++
+	n := exitDropN
+	if time.Since(exitDropLast) < 30*time.Second {
+		exitDropMu.Unlock()
+		return
+	}
+	exitDropLast = time.Now()
+	exitDropN = 0
+	exitDropMu.Unlock()
+	why := exitDiagnosis()
+	if why == "" {
+		why = "no exit selected"
+	}
+	log.Printf("[exit] FULL-VPN IS DROPPING TRAFFIC: %d packet(s) for the internet (most recently %s) discarded because %s",
+		n, dst, why)
+}
+
 // exitStatusFor reports whether the peer with static key pub advertises as an
 // exit node, and whether it is the exit THIS device currently egresses
 // through (full-VPN mode). Used by the session snapshot so every UI can badge
@@ -237,7 +308,14 @@ func currentExit() (*net.UDPAddr, *session) {
 // is on.
 func exitSelectionLoop() {
 	if !useExit {
-		return
+		// Do NOT return. This goroutine is started once, at tunnel start, and
+		// returning here retires the only thing that can ever select an exit —
+		// so if full-VPN is turned on later in the session, currentExit() stays
+		// nil forever and every internet-bound packet is dropped by the egress
+		// path while the UI happily shows "connected". Park until it is on.
+		for !useExit {
+			time.Sleep(2 * time.Second)
+		}
 	}
 	probe := func() {
 		exitMu.Lock()

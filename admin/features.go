@@ -115,6 +115,42 @@ func handleAPIRendezvousConfig(w http.ResponseWriter, r *http.Request) {
 	proxyJSON(w, code, resp, err)
 }
 
+// handleAPIDiscovery proxies this node's discovery and relay switches — the
+// DHT, using public relays, and serving as one — to and from the client's
+// control socket.
+//
+// It was missing, and that is the whole reason those settings appeared not to
+// exist. The client has served /api/discovery for a while, but this panel
+// proxies an explicit ALLOWLIST of endpoints, so anything absent from that list
+// is simply not reachable through it: the dashboard's fetch would 404 no matter
+// what the page rendered. On a containerized node there is no desktop Settings
+// window either, which left the DHT and both relay halves with no interface at
+// all except the admin-signed node-config modal — unavailable on a network with
+// no admin key.
+//
+// GET returns live state (what the node is ACTUALLY doing, not what a record
+// says); POST applies and persists. The client refuses two combinations on
+// purpose — a public relay with no rate limit, and one with the DHT off — and
+// proxyJSON passes those messages through so the panel can show the reason.
+func handleAPIDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		code, resp, err := ctlGet("/api/discovery")
+		proxyJSON(w, code, resp, err)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("X-Requested-With") != "overlay-admin" {
+		http.Error(w, "missing X-Requested-With header", http.StatusBadRequest)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	code, resp, err := ctlPost("/api/discovery", body)
+	proxyJSON(w, code, resp, err)
+}
+
 func handleAPINetwork(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -287,6 +323,67 @@ func networkPage(current string, pq, ipv6 bool) string {
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
 
+  <h1>Discovery &amp; relays</h1>
+  <p class="sub">How this node finds its peers, and whether it helps other members reach each
+  other. Per-node setting, applied and persisted immediately; the transport changes take effect
+  on this node's next restart.</p>
+  <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
+    <input id="dcDht" type="checkbox" style="width:auto"> Find peers through the BitTorrent DHT
+  </label>
+  <p class="sub" style="margin:4px 0 14px 24px">A second discovery path, independent of the
+  tracker list &mdash; useful when trackers are blocked, rate-limited or down. It carries endpoint
+  addresses only; joining still requires this network's pre-shared key.</p>
+
+  <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
+    <input id="dcUseRelays" type="checkbox" style="width:auto"> Use public relays when a direct path fails
+  </label>
+  <p class="sub" style="margin:4px 0 14px 24px">Last-resort reachability: two nodes that cannot
+  punch through their NATs meet through a volunteer relay found in the DHT. The relay forwards
+  ciphertext only &mdash; it holds no key and can read nothing.</p>
+
+  <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
+    <input id="dcPublicRelay" type="checkbox" style="width:auto" onchange="dcSync()"> Be a public relay for others
+  </label>
+  <p class="sub" style="margin:4px 0 8px 24px">Offers this node as one of those relays, to anyone
+  &mdash; not only your own network. It spends your bandwidth on strangers' encrypted traffic, so
+  at least one limit below is required, and the DHT must be on or nobody can find it.</p>
+  <div id="dcLimits" style="display:none;margin-left:24px">
+    <label for="dcUp">Upload limit <span class="lc">&mdash; e.g. 5mbit, blank = none</span></label>
+    <input id="dcUp" type="text" spellcheck="false" autocapitalize="off" placeholder="5mbit">
+    <label for="dcDown">Download limit</label>
+    <input id="dcDown" type="text" spellcheck="false" autocapitalize="off" placeholder="5mbit">
+    <label for="dcQuota">Period quota <span class="lc">&mdash; e.g. 200GB</span></label>
+    <input id="dcQuota" type="text" spellcheck="false" autocapitalize="off" placeholder="200GB">
+  </div>
+  <button type="button" class="primary" onclick="saveDiscovery()">Save discovery settings</button>
+  <p id="dcmsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
+  <h1>SOCKS5 proxy</h1>
+  <p class="sub">Lets applications on THIS machine reach overlay addresses through a local proxy
+  port, without them needing to know anything about the overlay. Point a browser or curl at it
+  with remote DNS (<code>curl --socks5-hostname 127.0.0.1:1080 http://10.22.22.22/</code>) so
+  overlay names resolve here rather than on the client.</p>
+  <p class="sub"><strong>Binding anything other than 127.0.0.1 requires a username and
+  password.</strong> An open proxy port lets anyone who can reach it use this node as a way into
+  the overlay without ever being admitted to it — the node refuses to start it that way.</p>
+  <label for="skListen">Listen address <span class="lc">— blank = proxy off</span></label>
+  <input id="skListen" type="text" spellcheck="false" autocapitalize="off" placeholder="127.0.0.1:1080">
+  <label for="skUser">Username</label>
+  <input id="skUser" type="text" spellcheck="false" autocapitalize="off" autocomplete="off">
+  <label for="skPass">Password <span class="lc">— blank leaves it unchanged</span></label>
+  <input id="skPass" type="password" autocomplete="new-password">
+  <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
+    <input id="skOverlayOnly" type="checkbox" style="width:auto"> Overlay destinations only
+  </label>
+  <label for="skPw">Network admin password</label>
+  <input id="skPw" type="password">
+  <button onclick="saveSocks()">Save proxy settings</button>
+  <p id="skmsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
   <h1>Security policy</h1>
   <p class="sub">Toggle the hybrid post-quantum layer (ML-KEM-768) for the WHOLE network with the network admin password. It applies live to every device on every platform — no reconnect. Slightly slower; safe to roll out (peers negotiate automatically).</p>
   <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
@@ -445,6 +542,95 @@ async function setIPv6(){
   msg.textContent = r.ok ? ('IPv6 '+(on?'enabled':'disabled')+' — restart this node to apply.') : ('Failed: '+t);
   msg.style.color = r.ok ? '#38c172' : '#e6b400';
 }
+// SOCKS5 proxy for THIS node. Goes through the same admin-signed node-config
+// record as the per-node sheet, targeting our own key, so there is one code
+// path and one audit trail rather than a second local-only endpoint.
+async function loadSocks(){
+  try{
+    const r=await fetch('/api/node-config-get',{headers:{'X-Requested-With':'overlay-admin'}});
+    if(!r.ok) return;
+    const d=await r.json();
+    document.getElementById('skListen').value=d.socks5_listen||'';
+    document.getElementById('skUser').value=d.socks5_user||'';
+    document.getElementById('skOverlayOnly').checked=!!d.socks5_overlay_only;
+    document.getElementById('skPass').placeholder=d.socks5_has_pass?'set — leave blank to keep':'';
+  }catch(e){}
+}
+async function saveSocks(){
+  const msg=document.getElementById('skmsg');
+  const pw=document.getElementById('skPw').value;
+  if(!pw){ msg.textContent='Network admin password is required.'; msg.style.color='#e6b400'; return; }
+  const listen=document.getElementById('skListen').value.trim();
+  const user=document.getElementById('skUser').value.trim();
+  const host=listen.replace(/:[0-9]+$/,'');
+  const loop=host===''||host==='127.0.0.1'||host==='::1'||host==='[::1]'||host==='localhost';
+  // Warn before the round trip: the node refuses this configuration, and a
+  // rejection arriving as a generic failure is harder to act on than a
+  // sentence naming the reason.
+  if(listen && !loop && !user){
+    msg.textContent='A proxy on '+host+' needs a username and password — the node will refuse to start it.';
+    msg.style.color='#e6b400'; return;
+  }
+  msg.textContent='Signing…'; msg.style.color='';
+  const body={socks5_listen:listen, socks5_user:user,
+              socks5_overlay_only:document.getElementById('skOverlayOnly').checked, password:pw};
+  const sp=document.getElementById('skPass').value;
+  if(sp!=='') body.socks5_pass=sp;   // blank = leave unchanged
+  const r=await fetch('/api/node-config',{method:'POST',
+    headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+    body:JSON.stringify(body)});
+  const t=await r.text();
+  msg.textContent=r.ok?(listen?('Proxy listening on '+(listen)+'.'):'Proxy disabled.'):('Failed: '+t);
+  msg.style.color=r.ok?'#38c172':'#e6b400';
+  if(r.ok){ document.getElementById('skPw').value=''; document.getElementById('skPass').value=''; loadSocks(); }
+}
+loadSocks();
+// Discovery + relays for THIS node. A LOCAL setting (no admin key, no
+// signature) proxied to the client's /api/discovery, which persists it to
+// NODE_SETTINGS_FILE. Kept on this page rather than the per-node sheet because
+// it is not a network-wide policy — each node decides how it finds peers.
+function dcSync(){
+  const pr=document.getElementById('dcPublicRelay').checked;
+  document.getElementById('dcLimits').style.display = pr ? 'block' : 'none';
+}
+async function loadDiscovery(){
+  try{
+    const r=await fetch('/api/discovery',{headers:{'X-Requested-With':'overlay-admin'}});
+    if(!r.ok) return;
+    const d=await r.json();
+    // Report what the node is ACTUALLY doing right now, not what a record
+    // claims it should be — that gap is the whole reason for a live panel.
+    document.getElementById('dcDht').checked         = !!(d.dht && d.dht.enabled);
+    document.getElementById('dcUseRelays').checked   = !!(d.relay_client && d.relay_client.enabled);
+    document.getElementById('dcPublicRelay').checked = !!(d.public_relay && d.public_relay.enabled);
+    dcSync();
+  }catch(e){}
+}
+async function saveDiscovery(){
+  const msg=document.getElementById('dcmsg'); msg.textContent='Saving…'; msg.style.color='';
+  const body=JSON.stringify({
+    dht:               document.getElementById('dcDht').checked,
+    use_public_relays: document.getElementById('dcUseRelays').checked,
+    public_relay:      document.getElementById('dcPublicRelay').checked,
+    up_limit:          document.getElementById('dcUp').value.trim(),
+    down_limit:        document.getElementById('dcDown').value.trim(),
+    quota:             document.getElementById('dcQuota').value.trim(),
+  });
+  try{
+    const r=await fetch('/api/discovery',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'}, body});
+    const t=await r.text();
+    // The client refuses two combinations on purpose — a public relay with no
+    // limit, and one with the DHT off — and its message names the fix, so show
+    // it rather than a generic failure.
+    msg.textContent = r.ok ? 'Saved — restart this node to apply the transport changes.' : ('Failed: '+t.trim());
+    msg.style.color = r.ok ? '#38c172' : '#e6b400';
+    if(r.ok) loadDiscovery();
+  }catch(e){
+    msg.textContent='Request failed — is the client running?'; msg.style.color='#e6b400';
+  }
+}
+loadDiscovery();
 function genPsk(){
   const b=new Uint8Array(32); crypto.getRandomValues(b);
   let s=btoa(String.fromCharCode.apply(null,b));
@@ -588,6 +774,10 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		TrackersOn     *bool     `json:"trackers_on"`
 		Rendezvous     *string   `json:"rendezvous"`
 		RendezvousAuth *string   `json:"rendezvous_auth"`
+		Socks5Listen      *string `json:"socks5_listen"`
+		Socks5User        *string `json:"socks5_user"`
+		Socks5Pass        *string `json:"socks5_pass"`
+		Socks5OverlayOnly *bool   `json:"socks5_overlay_only"`
 		RelayUp      *string   `json:"relay_up"`
 		RelayDown    *string   `json:"relay_down"`
 		RelayQuota   *string   `json:"relay_quota"`
@@ -627,6 +817,10 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		TrackersOn:     req.TrackersOn,
 		Rendezvous:     req.Rendezvous,
 		RendezvousAuth: req.RendezvousAuth,
+		Socks5Listen:      req.Socks5Listen,
+		Socks5User:        req.Socks5User,
+		Socks5Pass:        req.Socks5Pass,
+		Socks5OverlayOnly: req.Socks5OverlayOnly,
 		RelayUp:      rate(req.RelayUp),
 		RelayDown:    rate(req.RelayDown),
 		RelayQuota:   rate(req.RelayQuota),

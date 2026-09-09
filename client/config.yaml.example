@@ -107,3 +107,25 @@ min_announce_interval_seconds: 30
 #
 # static_relays:                 # skip DHT discovery, use a relay you run
 #   - "relay.example.com:6969"   # env: STATIC_RELAYS (comma-separated)
+
+# --- SOCKS5 proxy ----------------------------------------------------------
+# Exposes the overlay through a local SOCKS5 proxy, so an application can reach
+# overlay addresses WITHOUT this machine holding a TUN device. Empty = off.
+#
+# Point a browser or curl at it:
+#   curl --socks5-hostname 127.0.0.1:1080 http://10.22.22.22/
+#
+# Use --socks5-hostname (not --socks5): it sends the HOSTNAME to the proxy for
+# resolution here, so overlay names resolve and the client leaks no DNS.
+socks5_listen: ""            # e.g. "127.0.0.1:1080"
+
+# Binding anything other than loopback REQUIRES these. An unauthenticated proxy
+# reachable from the LAN lets anyone who can open the port use this node as a
+# door into the overlay, without ever being admitted to it. The client refuses
+# to start the proxy in that configuration.
+socks5_user: ""
+socks5_pass: ""
+
+# Restrict the proxy to overlay destinations, so it cannot double as a general
+# internet proxy through this node.
+socks5_overlay_only: false

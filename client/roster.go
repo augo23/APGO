@@ -261,6 +261,12 @@ func handleRoster(payload []byte) {
 	if sawNew {
 		go connectRosterNodes()
 	}
+	// The roster is the FIRST thing a joining device hears that lists the
+	// addresses existing members already hold — earlier than any keepalive on
+	// its own (gated) data plane. Check our address against it immediately, so
+	// a newcomer that derived an address someone else owns moves off it within
+	// a round-trip of joining rather than after minutes of silent collision.
+	go resolveOverlayIPCollision("roster")
 }
 
 // connectRosterNodes fires coordinated-connect signaling at every roster node

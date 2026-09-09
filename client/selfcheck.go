@@ -62,13 +62,23 @@ func logSelfCheck() {
 			if err != nil || len(addrs) == 0 {
 				continue
 			}
-			var v4 []string
+			// IPv6 is listed too. It used to be filtered out entirely, which
+			// made the most important reachability fact about a node — whether
+			// it has a NAT-free path at all — impossible to read off its own
+			// diagnostics.
+			var v4, v6 []string
 			for _, a := range addrs {
-				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+				ipn, ok := a.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				if ipn.IP.To4() != nil {
 					v4 = append(v4, ipn.String())
+				} else if isGlobalIPv6(ipn.IP) {
+					v6 = append(v6, ipn.String())
 				}
 			}
-			if len(v4) == 0 {
+			if len(v4) == 0 && len(v6) == 0 {
 				continue
 			}
 			mark := ""
@@ -81,8 +91,20 @@ func logSelfCheck() {
 					}
 				}
 			}
-			fmt.Fprintf(&b, "[selfcheck]   %-10s %s%s\n", ifc.Name, strings.Join(v4, ","), mark)
+			all := append(append([]string{}, v4...), v6...)
+			fmt.Fprintf(&b, "[selfcheck]   %-10s %s%s\n", ifc.Name, strings.Join(all, ","), mark)
 		}
+	}
+
+	// --- IPv6 reachability ---------------------------------------------------
+	// The one path that needs no hole punching, no port mapping and no relay.
+	if v6eps := globalIPv6Endpoints(myUDPPort); len(v6eps) > 0 {
+		fmt.Fprintf(&b, "[selfcheck] ipv6: advertising %s (NAT-free path available)\n",
+			strings.Join(v6eps, ", "))
+	} else if !ipv6Enabled {
+		fmt.Fprintf(&b, "[selfcheck] ipv6: DISABLED in config — all paths must cross NAT\n")
+	} else {
+		fmt.Fprintf(&b, "[selfcheck] ipv6: no global address — all paths must cross NAT\n")
 	}
 
 	// --- learned routes ------------------------------------------------------

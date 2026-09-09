@@ -643,10 +643,12 @@ func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 // routeClass ranks an endpoint by how good a path it is to the same peer.
 // Higher is better:
 //
-//	2  on one of OUR directly-attached subnets — same wire, no router hop
-//	1  private (RFC1918/link-local) but not attached — another VLAN, a
+//	3  on one of OUR directly-attached subnets — same wire, no router hop
+//	2  private (RFC1918/link-local) but not attached — another VLAN, a
 //	   site-to-site path; still not the public internet
-//	0  public — a NAT hairpin at best, a full internet round trip at worst
+//	1  GLOBAL IPv6 — end-to-end, no NAT anywhere on the path
+//	0  public IPv4 — a NAT hairpin at best, a full internet round trip at
+//	   worst, and always dependent on a translation table entry we do not own
 //
 // This is the same preference ip_learning.Learn applies (rule 4: "prefer an
 // upgrade to the LAN path"), factored out so the session table can apply it
@@ -654,17 +656,51 @@ func (t *SessionTable) set(addr *net.UDPAddr, s *session) {
 // same LAN is reachable at its LAN address AND, through the router's hairpin,
 // at its public one — and which of the two carries the traffic is the whole
 // difference between wire speed and "it feels relayed".
+//
+// WHY IPv6 OUTRANKS PUBLIC IPv4, and why it was wrong not to. Both used to be
+// class 0, so between a peer's v6 address and its NAT'd v4 address the winner
+// was simply whichever handshake completed first, and rule 4's "sticky while
+// live" then kept it. In practice that meant v4: it is the address trackers
+// and the DHT carry, so it is always the one found first. The v4 path depends
+// on a NAT mapping on each side — an entry neither node owns, that a router
+// can drop, renumber, or hand to another device at any moment (which is
+// exactly how a laptop that shares a listen port with another node on the same
+// LAN ends up unreachable from outside). The v6 path has no such dependency:
+// the address is the host's own, inbound needs no translation, and it survives
+// everything that breaks the v4 mapping. When a peer offers both, v6 is the
+// one that should carry the traffic.
+const (
+	routeClassPublicV4 = 0
+	routeClassGlobalV6 = 1
+	routeClassPrivate  = 2
+	routeClassLAN      = 3
+)
+
 func routeClass(a *net.UDPAddr) int {
 	if a == nil || a.IP == nil {
-		return 0
+		return routeClassPublicV4
 	}
 	if isAttachedLANAddr(a) {
-		return 2
+		return routeClassLAN
 	}
 	if a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback() {
-		return 1
+		return routeClassPrivate
 	}
-	return 0
+	if isGlobalIPv6(a.IP) {
+		return routeClassGlobalV6
+	}
+	return routeClassPublicV4
+}
+
+// isGlobalIPv6 reports whether ip is a globally-routable IPv6 address — the
+// only kind that means "reachable with no NAT in the way". v4-mapped v6
+// addresses (::ffff:a.b.c.d, which is how IPv4 peers arrive on our dual-stack
+// socket) are IPv4 and must not be counted here.
+func isGlobalIPv6(ip net.IP) bool {
+	if ip == nil || ip.To4() != nil {
+		return false
+	}
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }
 
 func isPrivateUDPAddr(a *net.UDPAddr) bool {

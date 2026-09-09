@@ -464,6 +464,57 @@ func isPrivateUDPAddr(a *net.UDPAddr) bool {
 	return a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback()
 }
 
+// routeClass ranks an endpoint by how good a path it is to the same peer.
+// Higher is better:
+//
+//	3  on one of OUR directly-attached subnets — same wire, no router hop
+//	2  private (RFC1918/link-local) but not attached — another VLAN, a
+//	   site-to-site path; still not the public internet
+//	1  GLOBAL IPv6 — end-to-end, no NAT anywhere on the path
+//	0  public IPv4 — always dependent on a NAT mapping this device does not own
+//
+// WHY IPv6 OUTRANKS PUBLIC IPv4. Both used to be indistinguishable here, so
+// between a peer's v6 address and its NAT'd v4 address the winner was whichever
+// handshake completed first — and that is always v4, because v4 is the address
+// the tracker peer list carries. The v4 path then became sticky and the v6
+// address was never used, on a device that changes networks several times an
+// hour and whose v4 mappings therefore die constantly. On a phone this is the
+// difference between a session that survives a Wi-Fi/cellular switch and one
+// that has to be rebuilt from scratch every time.
+const (
+	routeClassPublicV4 = 0
+	routeClassGlobalV6 = 1
+	routeClassPrivate  = 2
+	routeClassLAN      = 3
+)
+
+func routeClass(a *net.UDPAddr) int {
+	if a == nil || a.IP == nil {
+		return routeClassPublicV4
+	}
+	if isAttachedLANAddr(a) {
+		return routeClassLAN
+	}
+	if a.IP.IsPrivate() || a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback() {
+		return routeClassPrivate
+	}
+	if isGlobalIPv6(a.IP) {
+		return routeClassGlobalV6
+	}
+	return routeClassPublicV4
+}
+
+// isGlobalIPv6 reports whether ip is a globally-routable IPv6 address — the
+// only kind that means "reachable with no NAT in the way". v4-mapped v6
+// addresses (::ffff:a.b.c.d, how IPv4 peers arrive on the dual-stack socket)
+// are IPv4 and must not count.
+func isGlobalIPv6(ip net.IP) bool {
+	if ip == nil || ip.To4() != nil {
+		return false
+	}
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
+}
+
 // EstablishedPeerCount returns the number of distinct DEVICES with an
 // established session — not the number of sessions.
 //

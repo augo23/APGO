@@ -94,6 +94,7 @@ A standalone shareable diagram is in [`docs/apgo-architecture.svg`](docs/apgo-ar
 | `config/client.yaml` | Shared network config (identical on every node) |
 | `config/trackers.txt` | Public tracker list |
 | `easy-deploy.sh` | One-command build + up for a single host (podman/docker) |
+| `docs/cli.md` | Command-line reference: every binary, flag, env var and control-API endpoint |
 | `easy-compose.yml` | Compose stack used by `easy-deploy.sh` (`overlay-client` / `overlay-admin`) |
 | `apgoclient.containerfile`, `apgoadmin.containerfile` | Image builds for the client and dashboard |
 
@@ -154,6 +155,10 @@ Set machine-local values in `.env` (or the environment). Common ones:
 - `RENDEZVOUS_SERVERS=https://rv.example.com` — HTTPS discovery for BitTorrent-blocked networks.
 
 For raw-config deployments, `config/client.yaml` exposes the same settings plus `static_peers`, `tracker_mode: "passive"`, inline `trackers`, `compression`, and `cipher` (`chacha` or `aesgcm`).
+
+Every environment variable, config key, script flag and control-API endpoint in
+the project is catalogued in **[`docs/cli.md`](docs/cli.md)** — the full
+command-line reference.
 
 ### 4. Verify
 

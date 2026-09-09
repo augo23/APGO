@@ -209,6 +209,19 @@ type ClientConfig struct {
 	// PORT_PREDICTION environment variable. Only takes effect behind a
 	// symmetric NAT; port-stable NATs ignore it.
 	PortPrediction bool `yaml:"port_prediction"`
+
+	// SOCKS5 proxy (socks5.go). "host:port" enables it; empty disables.
+	// Env: SOCKS5_LISTEN / SOCKS5_USER / SOCKS5_PASS.
+	//
+	// Binding anything but loopback REQUIRES a username and password: an open
+	// proxy on the LAN lets anyone who can reach the port use this node as a
+	// door into the overlay without ever being admitted to it.
+	Socks5Listen string `yaml:"socks5_listen"`
+	Socks5User   string `yaml:"socks5_user"`
+	Socks5Pass   string `yaml:"socks5_pass"`
+	// Socks5OverlayOnly restricts the proxy to overlay destinations, so it
+	// cannot be used as a general internet proxy through this node.
+	Socks5OverlayOnly bool `yaml:"socks5_overlay_only"`
 	// IPv6 enables the dual-stack transport: bind on :: and advertise/dial
 	// global IPv6 endpoints (no NAT on v6, which fixes CGNAT/hotspot). ON by
 	// default. The overlay itself stays IPv4 regardless. Set false to force the
@@ -669,6 +682,23 @@ func loadConfig() (*ClientConfig, error) {
 	case "0", "false", "no", "off":
 		cfg.PortPrediction = false
 	}
+	// SOCKS5 proxy. Env wins over the config file, matching every other
+	// setting here, so a container can enable it without a rebuilt image.
+	if v := strings.TrimSpace(os.Getenv("SOCKS5_LISTEN")); v != "" {
+		cfg.Socks5Listen = v
+	}
+	if v := os.Getenv("SOCKS5_USER"); v != "" {
+		cfg.Socks5User = v
+	}
+	if v := os.Getenv("SOCKS5_PASS"); v != "" {
+		cfg.Socks5Pass = v
+	}
+	switch strings.ToLower(os.Getenv("SOCKS5_OVERLAY_ONLY")) {
+	case "1", "true", "yes", "on":
+		cfg.Socks5OverlayOnly = true
+	case "0", "false", "no", "off":
+		cfg.Socks5OverlayOnly = false
+	}
 	switch strings.ToLower(os.Getenv("EXIT_NODE")) {
 	case "1", "true", "yes", "on":
 		cfg.ExitNode = true
@@ -829,6 +859,19 @@ var (
 // this build, hops to its own new address — both sides converge). Pinned or
 // admin-assigned addresses never hop; that conflict is the operator's call.
 func handleAddrConflict(raddr *net.UDPAddr, ip string) {
+	// Record the claim against the claimant's KEY (not just its endpoint) and
+	// route the decision through the common resolver, so the same yield rules
+	// apply here as to a claim learned from roster or provision gossip: an
+	// approved or admin-provisioned incumbent keeps the address, and the node
+	// that moves records the change for its own UI. Only when we cannot
+	// identify the claimant do we fall back to the endpoint-only handling.
+	if GlobalSessions != nil {
+		if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
+			setPeerOverlayIP(s.peerStatic, ip)
+			resolveOverlayIPCollision("announce")
+			return
+		}
+	}
 	if !addrAutoDerived {
 		log.Printf("[WARN] OVERLAY IP CONFLICT: peer %s claims OUR address %s! "+
 			"Two nodes were assigned the same IP — fix one assignment (admin "+
@@ -1391,7 +1434,14 @@ func hasGlobalIPv6() bool {
 // another, and never cap the public endpoint at all.
 const (
 	maxLANCandidates = 3 // enough for Wi-Fi + Ethernet + one more
-	maxV6Candidates  = 2
+	// maxV6Candidates was 2, which is not enough on the machines that most
+	// need IPv6. A host with two NICs up (Ethernet + Wi-Fi) gets a SLAAC
+	// address and a privacy/temporary address on each, so the two slots could
+	// be filled entirely by addresses on the interface that does not carry the
+	// default route — advertising two dead endpoints and none of the working
+	// ones. Four covers both interfaces; the cost of a spare is one handshake
+	// that fails fast, against the benefit of a NAT-free path.
+	maxV6Candidates = 4
 	// predictedPortSpread is how many symmetric-NAT port guesses to advertise.
 	// Was 8; that wide a spread buys very little hit rate and costs every peer
 	// a burst of doomed handshakes.
@@ -1459,21 +1509,30 @@ func myConnectCandidates() string {
 		}
 	}
 
-	// 2. A configured, known-good inbound port (Kubernetes hostPort, manual
+	// 2. IPv6: no NAT anywhere on the path, so a v6-capable peer reaches us
+	// directly at an address this host actually owns.
+	//
+	// Promoted ahead of every IPv4 form below (it used to sit after the
+	// configured inbound port). A peer punches this list in order, and every
+	// IPv4 entry depends on a NAT mapping that some router owns and can drop,
+	// renumber or reassign at any time; the v6 entry depends on nothing. When
+	// both work, the one that keeps working should be tried first — otherwise
+	// the v4 path wins the race, ip_learning makes it sticky, and the v6
+	// address is never used at all.
+	if myUDPPort > 0 {
+		tier = 0
+		for _, ep := range globalIPv6Endpoints(myUDPPort) {
+			addN(ep, maxV6Candidates)
+		}
+	}
+
+	// 3. A configured, known-good inbound port (Kubernetes hostPort, manual
 	// port-forward). This beats the STUN-observed endpoint because it was set
 	// up deliberately and does not change per destination — which is exactly
 	// what a masquerading CNI or a symmetric NAT breaks about the observed one.
 	if advertisePort > 0 {
 		if host := publicIPOnly(); host != "" {
 			addAlways(net.JoinHostPort(host, strconv.Itoa(advertisePort)))
-		}
-	}
-
-	// 3. IPv6: no NAT at all, so a v6-capable peer reaches us directly.
-	if myUDPPort > 0 {
-		tier = 0
-		for _, ep := range globalIPv6Endpoints(myUDPPort) {
-			addN(ep, maxV6Candidates)
 		}
 	}
 
@@ -1926,17 +1985,43 @@ func globalIPv6Endpoints(port int) []string {
 			if !ok {
 				continue
 			}
-			ip := ipnet.IP
-			if ip.To4() != nil {
-				continue // IPv4
+			// isGlobalIPv6 rejects IPv4, v4-mapped v6, ULA (fc00::/7) and
+			// fe80:: link-local in one place, shared with routeClass so the
+			// address we ADVERTISE and the address we PREFER are decided by
+			// the same rule.
+			if !isGlobalIPv6(ipnet.IP) {
+				continue
 			}
-			if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-				continue // skip ULA (fc00::/7) and fe80:: link-local
-			}
-			out = append(out, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+			out = append(out, net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port)))
 		}
 	}
 	return out
+}
+
+// reportIPv6Reachability logs, once at startup, whether this node has a
+// globally-routable IPv6 address — and says so plainly when it does not.
+//
+// This exists because the absence of IPv6 is invisible: everything keeps
+// working over NAT'd IPv4, a little worse, forever. IPv6 is the only path
+// here that needs no hole punching, no port mapping and no relay — a peer
+// dials the address directly — so whether a node has one is the single most
+// useful fact about its reachability, and it was nowhere in the log.
+func reportIPv6Reachability(port int) {
+	if !ipv6Enabled {
+		log.Printf("[v6] IPv6 is DISABLED in this node's config (ipv6: false). " +
+			"Every path to this node must therefore survive NAT: consider enabling it.")
+		return
+	}
+	eps := globalIPv6Endpoints(port)
+	if len(eps) == 0 {
+		log.Printf("[v6] no global IPv6 address on any physical interface — this node " +
+			"is reachable over NAT'd IPv4 only (hole punching + relay). If your ISP " +
+			"offers IPv6, enabling it on the router removes NAT from this node's paths " +
+			"entirely and is the single biggest reachability win available.")
+		return
+	}
+	log.Printf("[v6] reachable over IPv6 at %s — peers that also have IPv6 will "+
+		"connect directly, with no NAT, no port mapping and no relay", strings.Join(eps, ", "))
 }
 
 type keypair struct{ priv, pub [32]byte }
@@ -2041,6 +2126,153 @@ func udpListener(listenPort int) (*net.UDPConn, int, error) {
 	setSocketBuffers(conn)
 	la := conn.LocalAddr().(*net.UDPAddr)
 	return conn, la.Port, nil
+}
+
+// ---------------------------------------------------------- listen port
+//
+// WHY THE DEFAULT PORT IS DERIVED FROM THE NODE KEY, and not a constant.
+//
+// A shared default (it was 6969) is the one configuration value that is
+// guaranteed to collide, because the machines most likely to run this software
+// are the several machines in one house — behind one router, sharing one
+// public address.
+//
+// A home NAT preserves a source port when it can: an internal 6969 becomes an
+// external 6969, so the node is reachable at <public ip>:6969 with no port
+// forward, no NAT-PMP and no static IP, and its advertised endpoint stays true
+// across restarts and idle periods. That is the whole basis of this project's
+// "no port forwarding" claim, and it works for exactly ONE device per port per
+// router. The second device asking for 6969 cannot have it, so the router
+// gives it an arbitrary high port instead — an ephemeral mapping that is not
+// predictable, expires on idle, and comes back DIFFERENT. From outside, that
+// node is reachable for a few minutes at a time and then is not, while every
+// other node in the house works perfectly. It also poisons two other things:
+// the "public IP + own listen port" candidate now points at a DIFFERENT
+// machine, and isSelf() treats the sibling that does hold the port as a ghost
+// of ourselves and filters it out of tracker results.
+//
+// Deriving the port from the node's own public key fixes it without any
+// configuration: every device gets a different port, each keeps it across
+// restarts (so NAT mappings and tracker records stay valid), and the collision
+// simply cannot happen. bindListenPort then VERIFIES the result against STUN
+// and moves to another derived port if the mapping was not preserved after
+// all, which also covers a collision with something else entirely — another
+// application, or a node whose port was pinned by hand.
+const (
+	listenPortBase     = 41000
+	listenPortSpan     = 20000
+	listenPortAttempts = 3
+	legacyDefaultPort  = 6969
+)
+
+// derivedListenPort returns a stable, per-node UDP port in
+// [listenPortBase, listenPortBase+listenPortSpan). attempt lets the caller ask
+// for a different one when the first turns out to be unusable; the result is
+// still deterministic, so a node that had to move to attempt 1 lands on the
+// same port every time it starts.
+func derivedListenPort(pub [32]byte, attempt int) int {
+	h := sha256.Sum256(append([]byte("apgo-listen-port:"+strconv.Itoa(attempt)+":"), pub[:]...))
+	return listenPortBase + int(binary.BigEndian.Uint16(h[:2]))%listenPortSpan
+}
+
+// externalPortOf returns the port component of a STUN-reported endpoint.
+func externalPortOf(endpoint string) int {
+	_, p, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// bindListenPort opens the transport socket, choosing the port automatically
+// unless the operator pinned one, and confirms with STUN that the NAT kept it.
+//
+// The verification is the part that matters. Binding a free LOCAL port proves
+// nothing about reachability — the question is whether the router maps it
+// straight through, and the only way to find that out is to ask a STUN server
+// what it saw. When the answer is "no", trying another port is very likely to
+// work, because the usual cause is one specific port already being spoken for.
+// Three attempts, then keep the first socket: on a genuinely symmetric NAT no
+// port is ever preserved and further attempts are wasted time.
+func bindListenPort(cfg *ClientConfig) (*net.UDPConn, int, error) {
+	if cfg.UDPListenPort > 0 {
+		conn, port, err := udpListener(cfg.UDPListenPort)
+		if err != nil {
+			return nil, 0, err
+		}
+		// Honour the pin, but still say whether it actually works. A pinned
+		// port that the NAT does not preserve is the exact failure described
+		// above, and silence about it is what made this hard to find.
+		if ep, serr := fetchPublicEndpoint(conn, cfg.STUNServers, 4*time.Second); serr == nil {
+			if ext := externalPortOf(ep); ext != 0 && ext != port {
+				log.Printf("[port] udp_listen_port %d is pinned in config, but this "+
+					"router maps it to external port %d — it is NOT preserved, so the "+
+					"endpoint peers are told about is an ephemeral mapping that changes "+
+					"whenever it expires. The usual cause is another node on this LAN "+
+					"already holding %d. Set udp_listen_port to 0 to let this node pick "+
+					"a collision-free port automatically.", port, ext, port)
+				if port == legacyDefaultPort {
+					log.Printf("[port] (%d is the old built-in default, so every node "+
+						"installed before automatic ports asks for it — the first one "+
+						"to start wins and the rest get ephemeral mappings.)", legacyDefaultPort)
+				}
+			}
+		}
+		return conn, port, nil
+	}
+
+	var keepConn *net.UDPConn
+	var keepPort int
+	for attempt := 0; attempt < listenPortAttempts; attempt++ {
+		want := derivedListenPort(gKP.pub, attempt)
+		conn, port, err := udpListener(want)
+		if err != nil {
+			// Locally in use (a second node in this network namespace, or an
+			// unrelated program). Deterministically try the next one.
+			log.Printf("[port] cannot bind udp/%d (%v) — trying the next derived port", want, err)
+			continue
+		}
+		ep, serr := fetchPublicEndpoint(conn, cfg.STUNServers, 4*time.Second)
+		if serr != nil {
+			log.Printf("[port] listening on udp/%d (derived from this node's key); "+
+				"STUN did not answer, so NAT port preservation could not be verified", port)
+			if keepConn != nil {
+				keepConn.Close()
+			}
+			return conn, port, nil
+		}
+		ext := externalPortOf(ep)
+		if ext == port {
+			log.Printf("[port] listening on udp/%d (derived from this node's key) and "+
+				"the NAT preserves it — peers can reach this node at %s with no port "+
+				"forward and no port mapping", port, ep)
+			if keepConn != nil {
+				keepConn.Close()
+			}
+			return conn, port, nil
+		}
+		log.Printf("[port] udp/%d is mapped to external port %d — not preserved; "+
+			"trying another port (attempt %d of %d)", port, ext, attempt+1, listenPortAttempts)
+		if keepConn == nil {
+			keepConn, keepPort = conn, port
+		} else {
+			conn.Close()
+		}
+	}
+	if keepConn != nil {
+		log.Printf("[port] no port survived translation on this network — it is a "+
+			"symmetric NAT, so no fixed port can be preserved. Staying on udp/%d and "+
+			"relying on port prediction, IPv6 where available, and relay.", keepPort)
+		return keepConn, keepPort, nil
+	}
+	// Every derived port failed to bind locally. Fall back to whatever the OS
+	// gives us rather than refusing to start.
+	log.Printf("[port] no derived port could be bound; falling back to an ephemeral port")
+	return udpListener(0)
 }
 
 // maxFrameSize bounds the reusable outbound datagram buffers: the 11-byte
@@ -3534,7 +3766,16 @@ func sweepTargets() []net.IP {
 	return out
 }
 
-// localInterfaceIPs returns all non-loopback IPv4 addresses on this machine.
+// localInterfaceIPs returns all non-loopback addresses on this machine — IPv6
+// as well as IPv4.
+//
+// It used to be v4-only, and that silently disabled two things for every IPv6
+// path. rememberSelfEndpointsAt records "every address this host answers on"
+// so a stale tracker/PEX record of ourselves is recognised as a ghost rather
+// than dialled as a peer; with v6 omitted, our own v6 endpoint was never
+// remembered and every restart left a ghost of it that we then punched at.
+// handlePeerExchange uses the same list to avoid dialling itself when a
+// same-site peer gossips our address back to us. Both now cover v6.
 func localInterfaceIPs() []string {
 	var out []string
 	ifaces, err := net.Interfaces()
@@ -3559,6 +3800,12 @@ func localInterfaceIPs() []string {
 			}
 			if ip4 := ip.To4(); ip4 != nil {
 				out = append(out, ip4.String())
+				continue
+			}
+			// Link-local (fe80::) is excluded deliberately: it is scoped to an
+			// interface, is never announced, and would only add noise.
+			if ip.IsGlobalUnicast() && !ip.IsLinkLocalUnicast() {
+				out = append(out, ip.String())
 			}
 		}
 	}
@@ -3850,6 +4097,13 @@ func main() {
 	}
 	tunIF = globalTunIF
 
+	// SOCKS5 proxy. Started AFTER the TUN and its route exist: the default
+	// dialer is the kernel's, so a connection to an overlay address only
+	// resolves once 10.x.y.0/24 points at the tunnel. Starting it earlier
+	// would leave a window where the port is open and every dial fails.
+	rememberSocks5Config(cfg)
+	startSocks5(cfg)
+
 	// This node's own overlay IP (package-level, set before any traffic
 	// goroutine starts). Used to (a) tag keepalives and announces, (b)
 	// filter inbound packets so only traffic addressed to us reaches the
@@ -3858,12 +4112,15 @@ func main() {
 		setMyOverlayIP(ip.To4().String())
 	}
 
-	udpConn, port, err := udpListener(cfg.UDPListenPort)
+	udpConn, port, err := bindListenPort(cfg)
 	if err != nil {
 		log.Fatalf("udp listen: %v", err)
 	}
 	defer udpConn.Close()
 	myUDPPort = port
+	// Say plainly whether this node has a NAT-free path available. Done here,
+	// once the port is settled, so the addresses logged are the real ones.
+	reportIPv6Reachability(port)
 
 	GlobalSessions = NewSessionTable(udpConn)
 	sessions = GlobalSessions
@@ -4650,7 +4907,7 @@ func main() {
 			warnIfSelfUnapproved()
 			// A stale provision from a previous install of THIS machine silently
 			// black-holes everything addressed to it — see overlayIPClaimants.
-			warnOnDuplicateOverlayClaim()
+			resolveOverlayIPCollision("tick")
 			if heavy {
 				rosterFrame = buildRosterFrame()
 				pqStatus = buildPQStatus()

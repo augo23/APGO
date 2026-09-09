@@ -350,6 +350,10 @@ func handleAdminNodeConfig(w http.ResponseWriter, r *http.Request) {
 		TrackersOn     *bool     `json:"trackers_on"`
 		Rendezvous     *string   `json:"rendezvous"`
 		RendezvousAuth *string   `json:"rendezvous_auth"`
+		Socks5Listen      *string `json:"socks5_listen"`
+		Socks5User        *string `json:"socks5_user"`
+		Socks5Pass        *string `json:"socks5_pass"`
+		Socks5OverlayOnly *bool   `json:"socks5_overlay_only"`
 		RelayUp      *string   `json:"relay_up"`
 		RelayDown    *string   `json:"relay_down"`
 		RelayQuota   *string   `json:"relay_quota"`
@@ -389,6 +393,10 @@ func handleAdminNodeConfig(w http.ResponseWriter, r *http.Request) {
 		TrackersOn:     req.TrackersOn,
 		Rendezvous:     req.Rendezvous,
 		RendezvousAuth: req.RendezvousAuth,
+		Socks5Listen:      req.Socks5Listen,
+		Socks5User:        req.Socks5User,
+		Socks5Pass:        req.Socks5Pass,
+		Socks5OverlayOnly: req.Socks5OverlayOnly,
 		RelayUp:      rate(req.RelayUp),
 		RelayDown:    rate(req.RelayDown),
 		RelayQuota:   rate(req.RelayQuota),

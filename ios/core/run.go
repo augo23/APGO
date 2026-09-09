@@ -96,6 +96,10 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	if cfg.Tun.AddressCIDR == "" && cfg.OverlayCIDR != "" {
 		if derived, derr := deriveOverlayIP(cfg.OverlayCIDR, kp.pub); derr == nil {
 			cfg.Tun.AddressCIDR = derived
+			// Derived, not chosen: eligible to be moved automatically if it
+			// turns out another node already holds it (ipclaim.go). An address
+			// the person typed into the app, or an admin assigned, is not.
+			addrAutoDerived = true
 		}
 	}
 	if ip, _, perr := net.ParseCIDR(cfg.Tun.AddressCIDR); perr == nil && ip.To4() != nil {
@@ -209,6 +213,12 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			if len(pt) == 5 && pt[0] == 0x00 {
 				srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
 				if srcIP == myOverlayIP {
+					// A peer keepalive carrying OUR address: record the claim
+					// against its key and let the resolver decide who moves.
+					if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
+						setPeerOverlayIP(s.peerStatic, srcIP)
+						resolveOverlayIPCollision("keepalive")
+					}
 					continue
 				}
 				ipLearning.Learn(srcIP, raddr)
@@ -284,6 +294,12 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			if useExit && isInternetDst(dst) {
 				if ea, es := currentExit(); ea != nil {
 					_ = sendPacket(udpConn, ea, es, ip)
+				} else {
+					// Dropping here is correct — never leak traffic the user
+					// asked to be tunnelled straight out the physical
+					// interface — but doing it silently is not. See
+					// noteExitDrop / exitDiagnosis.
+					noteExitDrop(dst)
 				}
 				continue
 			}
@@ -393,6 +409,11 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			}
 			tickN++
 			heavy := tickN%slowGossipEvery == 1
+			// Another node may hold this device's overlay address — from a
+			// stale admin provision, or because two keys derived the same
+			// address. Check on the tick as well as on gossip arrival, so the
+			// state is re-evaluated even on a quiet network (see ipclaim.go).
+			resolveOverlayIPCollision("tick")
 			// Rebuild the keepalive payload each tick (matches the desktop
 			// client) so a live overlay-address change is reflected
 			// immediately instead of advertising the stale IP forever.

@@ -96,15 +96,27 @@ func saveSettingsForm(r *http.Request) error {
 	c.IPv6 = r.FormValue("ipv6") == "on"
 	c.ExitNode = r.FormValue("exit_node") == "on"
 	c.UseExit = r.FormValue("use_exit") == "on"
+	// Discovery + relay switches. Written as explicit true/false (not left nil)
+	// because they are presented here as checkboxes: an unticked box is a
+	// decision, and treating it as "unset" would let a stale node-config record
+	// silently turn the feature back on.
+	dht := r.FormValue("dht") == "on"
+	useRelays := r.FormValue("use_public_relays") == "on"
+	c.DHT = &dht
+	c.UseRelays = &useRelays
+	c.PublicRelay = r.FormValue("public_relay") == "on"
 	c.ExitPeer = strings.TrimSpace(r.FormValue("exit_peer"))
 	c.OverlayCIDR = strings.TrimSpace(r.FormValue("overlay_cidr"))
 	if c.OverlayCIDR == "" {
 		c.OverlayCIDR = "10.22.55.0/24"
 	}
+	// Blank (or invalid) means AUTOMATIC: 0 tells the client to derive a
+	// stable, per-device port instead of contending for a shared default with
+	// every other node behind this router.
 	if p, err := strconv.Atoi(strings.TrimSpace(r.FormValue("port"))); err == nil && p > 0 {
 		c.UDPListenPort = p
 	} else {
-		c.UDPListenPort = 6969
+		c.UDPListenPort = 0
 	}
 	c.Tun.AddressCIDR = overlayAddrFromInput(r.FormValue("last_octet"), c.OverlayCIDR)
 	// Recombine the two credential boxes into the single string the client
@@ -185,7 +197,7 @@ func saveSettingsForm(r *http.Request) error {
 }
 
 func settingsPage(c mConfig) string {
-	port := "6969"
+	port := "" // blank = automatic
 	if c.UDPListenPort > 0 {
 		port = strconv.Itoa(c.UDPListenPort)
 	}
@@ -215,6 +227,19 @@ func settingsPage(c mConfig) string {
 	if c.ExitNode {
 		exitNodeChecked = "checked"
 	}
+	// All three default to OFF in the client when the key is absent, so an
+	// unset pointer must render unticked — showing them ticked would claim a
+	// node is on the DHT when it is not.
+	checkedIf := func(b bool) string {
+		if b {
+			return "checked"
+		}
+		return ""
+	}
+	setBool := func(p *bool) bool { return p != nil && *p }
+	dhtChecked := checkedIf(setBool(c.DHT))
+	useRelaysChecked := checkedIf(setBool(c.UseRelays))
+	publicRelayChecked := checkedIf(c.PublicRelay)
 	// Split the stored rendezvous credential back into its two boxes.
 	rvUser, rvPass := c.RendezvousAuth, ""
 	if u, p, ok := strings.Cut(c.RendezvousAuth, ":"); ok {
@@ -227,6 +252,9 @@ func settingsPage(c mConfig) string {
 		"{{IPV6CHECK}}", ipv6Checked,
 		"{{USEEXITCHECK}}", useExitChecked,
 		"{{EXITNODECHECK}}", exitNodeChecked,
+		"{{DHTCHECK}}", dhtChecked,
+		"{{USERELAYSCHECK}}", useRelaysChecked,
+		"{{PUBLICRELAYCHECK}}", publicRelayChecked,
 		"{{EXITPEER}}", html.EscapeString(c.ExitPeer),
 		"{{CIDR}}", html.EscapeString(cidr),
 		"{{PORT}}", html.EscapeString(port),
@@ -364,8 +392,24 @@ const settingsTmpl = `<!DOCTYPE html>
     </label>
     <div class="hint">Connects directly over IPv6 where available (no NAT) — fixes hotspot/CGNAT reachability. The overlay stays IPv4. Applies on reconnect.</div>
 
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" name="dht" {{DHTCHECK}} style="width:auto"> Find peers through the BitTorrent DHT
+    </label>
+    <div class="hint">A second way to find your own nodes, independent of the tracker list — useful when trackers are blocked, rate-limited, or simply down. The DHT only ever carries endpoint addresses; it never sees traffic, and joining still requires your network's pre-shared key. Applies on reconnect.</div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" name="use_public_relays" {{USERELAYSCHECK}} style="width:auto"> Use public relays when a direct path fails
+    </label>
+    <div class="hint">Last-resort reachability: when two of your devices cannot punch through their NATs, they meet through a volunteer relay found in the DHT. The relay forwards ciphertext only — it holds no key and can read nothing. Applies on reconnect.</div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" name="public_relay" {{PUBLICRELAYCHECK}} style="width:auto"> Be a public relay for others
+    </label>
+    <div class="hint">Offers this device as one of those volunteer relays, for anyone — not just your own network. It carries opaque encrypted traffic for strangers and uses your bandwidth; the dashboard's node settings can cap the rate and set a monthly quota. Worth enabling only on a machine with a good connection that stays online. Applies on reconnect.</div>
+
     <label for="port">UDP listen port</label>
-    <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535">
+    <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535" placeholder="automatic">
+    <div class="hint">Leave blank for automatic. A port picked automatically is stable for this device and unique to it, so several nodes behind one router never contend for the same external port &mdash; which is what makes a node reachable from outside without a port forward.</div>
 
     <label for="rendezvous">Discovery (rendezvous) servers (optional)</label>
     <input id="rendezvous" name="rendezvous" type="text" value="{{RENDEZVOUS}}" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">

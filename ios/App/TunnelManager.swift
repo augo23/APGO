@@ -191,6 +191,45 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    /// The last overlay-address collision reported by the core, or nil.
+    /// `resolved` with a `newIP` means the address was already in use and this
+    /// device moved; `stale` means a leftover claim from a key nothing has
+    /// heard from (usually this device before a reinstall), which an admin
+    /// clears by re-provisioning the address onto `selfFP`.
+    struct IPConflict: Decodable {
+        var oldIP: String = ""
+        var newIP: String = ""
+        var peerName: String = ""
+        var reason: String = ""
+        var resolved: Bool = false
+        var stale: Bool = false
+        var selfFP: String = ""
+
+        enum CodingKeys: String, CodingKey {
+            case oldIP = "old_ip", newIP = "new_ip", peerName = "peer_name"
+            case reason, resolved, stale, selfFP = "self_fp"
+        }
+    }
+
+    func fetchIPConflict() async -> IPConflict? {
+        guard status == .connected,
+              let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { (cont: CheckedContinuation<IPConflict?, Never>) in
+            do {
+                try session.sendProviderMessage(Data("ipconflict".utf8)) { resp in
+                    guard let resp = resp,
+                          let c = try? JSONDecoder().decode(IPConflict.self, from: resp) else {
+                        cont.resume(returning: nil) // "null" or an older extension
+                        return
+                    }
+                    cont.resume(returning: c)
+                }
+            } catch {
+                cont.resume(returning: nil)
+            }
+        }
+    }
+
     func fetchAdmission() async -> AdmissionStatus {
         guard status == .connected,
               let session = manager?.connection as? NETunnelProviderSession else { return AdmissionStatus() }

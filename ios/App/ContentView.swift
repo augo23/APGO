@@ -26,6 +26,7 @@ struct ContentView: View {
     @State private var peers: [Peer] = []
     // Admission control state, refreshed on the same poll as the peer list.
     @State private var admission = TunnelManager.AdmissionStatus()
+    @State private var ipConflict: TunnelManager.IPConflict?
     @State private var approveTarget: Peer? = nil     // nil + showApprove = self
     @State private var showApprove = false
     @State private var approvePassword = ""
@@ -156,6 +157,32 @@ struct ContentView: View {
                          ? "All internet traffic egresses via an exit node on your mesh. Needs at least one device with exit-node mode enabled (a server or desktop — phones can't be exits)."
                          : "Off: only overlay traffic is tunneled.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+
+                // --- Overlay address collision ---------------------------------
+                // The address on the card above may not be the one the person
+                // was given: an address another node already held is vacated
+                // automatically, and a silent change is worse than the
+                // collision. A stale claim (a key nothing has heard from, most
+                // often this device before a reinstall) needs the opposite
+                // action — reclaim the address rather than move off it — so the
+                // two states read differently.
+                if isConnected, let c = ipConflict {
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(c.resolved ? "Overlay IP changed automatically"
+                                             : "Overlay IP already claimed",
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.orange)
+                            Text(c.reason).font(.caption).foregroundStyle(.secondary)
+                            if c.stale, !c.selfFP.isEmpty {
+                                Text("This device's current key: \(c.selfFP)")
+                                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
                 }
 
                 // --- Not approved on this network ------------------------------
@@ -447,9 +474,11 @@ struct ContentView: View {
         while !Task.isCancelled {
             if isConnected {
                 await refreshPeers()
+                ipConflict = await tunnel.fetchIPConflict()
                 await adoptPendingAddressIfAny()
             } else {
                 peers = []
+                ipConflict = nil
             }
             // 1.5s cadence: sessions form within a few seconds of connecting, so
             // a snappier poll makes new peers (and dropped ones) appear promptly

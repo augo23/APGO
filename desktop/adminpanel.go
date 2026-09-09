@@ -131,6 +131,18 @@ func startAdminServer() {
 	// exit duty with their budgets). These were registered on the k8s admin
 	// server and on the client's control port but NOT here, so the desktop
 	// dashboard -- which has its own route table -- answered 404 for both.
+	// Discovery + relay switches (DHT, use public relays, be a public relay).
+	// This proxy is an explicit allowlist, so an endpoint missing from it is
+	// unreachable however the page is written — which is why these settings
+	// looked absent even though the client has served /api/discovery all along.
+	mux.HandleFunc("/api/discovery", apiAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+			proxyCtl(w, "POST", "/api/discovery", body)
+			return
+		}
+		proxyCtl(w, "GET", "/api/discovery", nil)
+	}))
 	mux.HandleFunc("/api/node-config", apiAuth(handleAdminNodeConfig))
 	mux.HandleFunc("/api/node-config-get", apiAuth(handleAdminNodeConfigGet))
 	registerMultinetPanel(mux)
