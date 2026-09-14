@@ -1,7 +1,6 @@
 package overlaymobile
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"log"
@@ -153,115 +152,19 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			if dispatchSTUN(buf[:n]) {
 				continue
 			}
+			// Public-relay framing shares this socket with the overlay
+			// transport. They demux on the first byte with no ambiguity:
+			// overlay frames are 0x01-0x05, relay frames are 0x10. Sharing one
+			// socket is not a space optimisation — it is what makes the NAT
+			// mapping the relay keeps warm the SAME mapping peers punch to.
+			if pkt0 := buf[0]; pkt0 == PktRelay {
+				handleRelayPacket(append([]byte(nil), buf[:n]...), raddr)
+				continue
+			}
 			if !isOverlayPacket(buf[0]) {
 				continue
 			}
-			typ := buf[0]
-			body := buf[1:n]
-
-			if GlobalSessions.deliverPacket(raddr, typ, body, kp, psk) {
-				continue
-			}
-			s := GlobalSessions.GetByAddr(raddr)
-			if s == nil || !s.Established() {
-				if typ == PktData && GlobalSessions.RoamData(raddr, body) {
-					s = GlobalSessions.GetByAddr(raddr)
-				}
-				if s == nil || !s.Established() {
-					continue
-				}
-			}
-			pt, err := recvPacket(s, body)
-			if err != nil {
-				// Single failures are garbage/forgery/replay — never evict on
-				// one. NoteDecryptFailure tears down only when everything has
-				// failed for multiple keepalive intervals (key desync), forcing
-				// a clean re-handshake instead of a minute-long blackhole.
-				logDecryptError(raddr.String(), err)
-				GlobalSessions.NoteDecryptFailure(raddr)
-				continue
-			}
-			GlobalSessions.TouchLastSeen(raddr)
-			// Post-quantum: peel the ML-KEM AEAD layer FIRST (once up we wrap all
-			// frames on a direct session), so control + data dispatch correctly.
-			if isPQPacket(pt) {
-				if s := GlobalSessions.GetByAddr(raddr); s != nil {
-					if inner, ok := pqUnwrap(s.peerStatic, pt); ok {
-						pt = inner
-					} else {
-						continue
-					}
-				} else {
-					continue
-				}
-			}
-			if bytes.HasPrefix(pt, ctlMagic) {
-				handleControl(pt[len(ctlMagic):], raddr)
-				continue
-			}
-
-			// ADMISSION CONTROL — data path only; control frames above are
-			// deliberately exempt so an unapproved peer can still learn the
-			// admin key and its own approval (approvals.go). Past this point a
-			// peer that is not admitted gets nothing: no TUN delivery, no relay
-			// transit, no ipLearning entry. Mirrors client/main.go.
-			// No-op when no admin key is set (admissionRequired() == false).
-			if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "ingress") {
-				continue
-			}
-
-			if len(pt) == 5 && pt[0] == 0x00 {
-				srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
-				if srcIP == myOverlayIP {
-					// A peer keepalive carrying OUR address: record the claim
-					// against its key and let the resolver decide who moves.
-					if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
-						setPeerOverlayIP(s.peerStatic, srcIP)
-						resolveOverlayIPCollision("keepalive")
-					}
-					continue
-				}
-				ipLearning.Learn(srcIP, raddr)
-				if s := GlobalSessions.GetByAddr(raddr); s != nil {
-					setPeerOverlayIP(s.peerStatic, srcIP)
-				}
-				continue
-			}
-			if !isIPv4Packet(pt) {
-				continue
-			}
-			if ifIP := extractIPv4Src(pt); ifIP != "" {
-				ipLearning.Learn(ifIP, raddr)
-			}
-			if myOverlayIP != "" {
-				if dst := extractIPv4Dst(pt); dst != "" && dst != myOverlayIP {
-					if amExit && isInternetDst(dst) {
-						tunIF.Write(pt)
-						continue
-					}
-					// Relay transit for the RETURN path. When we relay an 'R'
-					// frame, the destination learns "reach the sender via us"
-					// and sends its replies back here as ORDINARY data frames
-					// — but this branch used to just drop them, so relayed
-					// connections passed exactly one packet and then went
-					// dark. Forward one hop over a direct established
-					// session, same rules as the 'R' handler: never to/from a
-					// revoked node, and never back out the session it arrived
-					// on (split horizon — no loops).
-					if !isInternetDst(dst) &&
-						!isOverlayIPRevoked(dst) && !isOverlayIPRevoked(extractIPv4Src(pt)) {
-						if a := ipLearning.Lookup(dst); a != nil && a.String() != raddr.String() {
-							// …and admitted: never relay onward into a pending
-							// device. Mirrors client/main.go.
-							if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-return") {
-								_ = sendPacket(GlobalConn, a, s, pt)
-							}
-						}
-					}
-					continue
-				}
-			}
-			tunIF.Write(pt)
+			handleTransportPacket(buf[:n], raddr, kp, psk)
 		}
 	}()
 
@@ -344,6 +247,30 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	infoHash := deriveInfoHash(cfg.NetworkName)
 	peerID := buildPeerID()
 	log.Printf("info_hash=%x peer_id=%s udp_port=%d", infoHash, peerID, port)
+
+	// PUBLIC-RELAY CLIENT (relayclient.go).
+	//
+	// This is the path that makes a phone reachable at all on a cellular
+	// carrier. Carrier NAT is symmetric and a home router is port-restricted;
+	// that pairing cannot be hole-punched from either end, so without a relay
+	// the only outcome is an unbounded retry loop against a port that has
+	// already moved. The mobile core carried no relay client until now, which
+	// is why desktops held relay reservations that phones could never answer.
+	//
+	// Client half only: a phone must never BE a relay, so nothing here
+	// advertises us into the directory.
+	//
+	// gTransportDeliver is wired to the SAME handler the UDP read loop uses,
+	// so a frame arriving over a circuit is decrypted, admission-checked and
+	// delivered identically to a direct one.
+	gTransportDeliver = func(p []byte, ra *net.UDPAddr) {
+		handleTransportPacket(p, ra, kp, psk)
+	}
+	rc := startRelayClient(udpConn, relayGroupKey(cfg.NetworkName, psk), port, kp, psk)
+	rc.SetEnabled(cfg.UseRelays == nil || *cfg.UseRelays)
+	for _, ep := range cfg.StaticRelays {
+		rc.AddRelay(ep)
+	}
 
 	pub, err := fetchPublicEndpoint(udpConn, cfg.STUNServers, 10*time.Second)
 	if err == nil {

@@ -1,17 +1,42 @@
-package main
+package overlaymobile
 
-// relayclient.go is the other half of publicrelay.go: USING a public relay
-// when direct connectivity is impossible.
+// relayclient.go — using a public relay from the mobile core.
 //
-// The hard problem it solves is not the wire protocol — it is making a relayed
-// peer look exactly like a direct one to the 15,000 lines above it. Sessions,
-// routing, admission control, PEX and the dashboard are all keyed by
-// *net.UDPAddr, and rewriting that to carry a "transport" abstraction would
-// touch every one of them.
+// This is a port of client/relayclient.go. It is kept deliberately close to
+// that file, line for line where the languages allow, so the two can be
+// diffed when either changes. The differences are forced and are listed here
+// rather than scattered as surprises:
 //
-// So a circuit is given a SYNTHETIC ADDRESS instead: 240.<24-bit circuit id>,
-// out of 240.0.0.0/4, which is reserved, never routed, and can never collide
-// with a real peer endpoint. Two small pieces of plumbing make it work:
+//   1. NO SERVER HALF. A phone must never BE a relay: it would spend a
+//      stranger's traffic out of the user's battery and cellular plan. Only
+//      the client half is ported; publicrelay.go stays desktop-only.
+//   2. DISCOVERY VIA TRACKERS, NOT THE DHT. The mobile core has no DHT (see
+//      relaydirectory.go for why, and for the tracker-based directory that
+//      replaces it).
+//   3. UNTYPED CONSTANTS. gobind rejects byte-typed constants — the same
+//      reason sessions.go spells PktData as an untyped 0x04 — so the relay
+//      protocol constants are untyped here while the wire bytes are
+//      identical.
+//
+// WHY THIS FILE HAD TO EXIST
+//
+// Its absence was the whole bug. A phone on a cellular carrier sits behind
+// symmetric NAT; a laptop at home sits behind a port-restricted router.
+// Neither can punch the other (see relaypolicy.go). Relay is the only path
+// that can work — and the mobile core could not so much as FIND a relay, let
+// alone open a circuit through one. So it did the only thing left: retried
+// direct handshakes against a carrier port that had already moved, for as
+// long as the app stayed open. The desktop side held relay reservations the
+// entire time, waiting for a peer that was structurally incapable of
+// answering.
+//
+// HOW A RELAYED PEER LOOKS LIKE A DIRECT ONE
+//
+// Sessions, routing, admission control, PEX and the status API are all keyed
+// by *net.UDPAddr. Rather than thread a transport abstraction through every
+// one of them, a circuit is given a SYNTHETIC ADDRESS: 240.<24-bit circuit
+// id>, out of 240.0.0.0/4, which is reserved, never routed, and cannot
+// collide with a real peer endpoint. Two pieces of plumbing make it work:
 //
 //	send: overlayWriteTo() recognises a 240/4 destination and wraps the frame
 //	      in a relay DATA message addressed to the relay instead.
@@ -19,10 +44,11 @@ package main
 //	      transport handler as though it came from the synthetic address.
 //
 // Everything in between — the Noise handshake, the PSK check, admission
-// control, key gossip, the tunnel itself — runs unmodified and end-to-end. The
-// relay sees ciphertext and byte counts.
+// control, PQ, the tunnel itself — runs unmodified and end-to-end. The relay
+// sees ciphertext and byte counts and nothing else.
 
 import (
+	"crypto/sha1"
 	"encoding/binary"
 	"log"
 	"net"
@@ -31,17 +57,66 @@ import (
 	"time"
 )
 
+// PktRelay is the transport type byte for public-relay framing. It sits
+// outside the overlay's own range (0x01-0x05, see sessions.go
+// isOverlayPacket), so the two protocols sharing this socket demux on one
+// byte with no ambiguity. Untyped for gobind (see the file comment).
+const PktRelay = 0x10
+
+// Relay sub-types. Wire-identical to client/publicrelay.go.
+const (
+	relayReserve   = 0x01 // client -> relay: hold a slot for this group
+	relayReserveOK = 0x02 // relay -> client: slot held, here is your TTL
+	relayDeny      = 0x03 // relay -> client: refused, with a reason
+	relayConnect   = 0x04 // client -> relay: pair me with this group
+	relayConnectOK = 0x05 // relay -> connector: circuit id
+	relayOpen      = 0x06 // relay -> reserver: a circuit opened to you
+	relayData      = 0x07 // both ways: [4B circuit][opaque payload]
+	relayClose     = 0x08 // both ways: circuit torn down
+	relayKeepalive = 0x09 // client -> relay: refresh my reservation
+)
+
+// Deny reasons, so a client can tell "this relay is full" (try another) from
+// "this relay is out of quota" (stop asking).
+const (
+	denyDisabled = 1
+	denyFull     = 2
+	denyQuota    = 3
+	denyRate     = 4
+	denyNoGroup  = 5
+)
+
 const (
 	// relayClientReserveEvery refreshes our reservation well inside the
 	// relay's 120s TTL, so a single lost keepalive never drops the slot.
+	//
+	// This is the one timer a phone pays for continuously, so it is worth
+	// being explicit: it is a ~60-byte datagram per relay per 45s, which is
+	// far below the cost of the keepalives the overlay already sends, and it
+	// only runs while the tunnel is up.
 	relayClientReserveEvery = 45 * time.Second
+
 	// relayClientMaxRelays bounds how many relays we hold slots on. More than
 	// a few is pure overhead: one working relay is enough, and the extras
-	// exist only so a relay going away is not a reconnection event.
+	// exist only so that a relay going away is not a reconnection event.
 	relayClientMaxRelays = 3
-	// relayClientDiscoverEvery re-runs relay discovery in the DHT.
+
+	// relayClientDiscoverEvery re-runs relay discovery.
 	relayClientDiscoverEvery = 10 * time.Minute
 )
+
+// relayDirectoryKey is the directory under which public relays advertise
+// themselves. Deliberately PUBLIC and unblinded: the whole point is that a
+// node which has not yet reached any peer can still find a relay. Nothing
+// sensitive is published — being a public relay is a service announcement and
+// the operator opted into it. Must stay byte-identical to the desktop's
+// copy in client/publicrelay.go or the two halves look in different places.
+func relayDirectoryKey() []byte {
+	h := sha1.Sum([]byte("apgo-public-relay-directory-v1"))
+	out := make([]byte, 20)
+	copy(out, h[:])
+	return out
+}
 
 type relayCircuitClient struct {
 	id      uint32
@@ -49,6 +124,14 @@ type relayCircuitClient struct {
 	synth   *net.UDPAddr
 	created time.Time
 	lastRx  time.Time
+}
+
+type relayPeerState struct {
+	addr        *net.UDPAddr
+	reserved    bool
+	lastReserve time.Time
+	denied      byte
+	deniedAt    time.Time
 }
 
 type relayClientState struct {
@@ -65,7 +148,8 @@ type relayClientState struct {
 	bySynth  map[string]*relayCircuitClient
 
 	// observed is the endpoint a relay reported seeing us at — the only
-	// reliable way to learn our NAT mapping when STUN is blocked.
+	// reliable way to learn our NAT mapping when STUN is blocked, and on a
+	// carrier network that is not rare.
 	observed string
 
 	statTx, statRx, statOpened atomic.Uint64
@@ -77,7 +161,7 @@ type relayClientState struct {
 var gRelayClient *relayClientState
 
 // synthAddrFor maps a circuit id onto its reserved 240/4 address. The port is
-// fixed and meaningless — the id alone identifies the circuit — but it must be
+// fixed and meaningless — the id alone identifies the circuit — but must be
 // non-zero so nothing downstream treats the address as unresolved.
 func synthAddrFor(cid uint32) *net.UDPAddr {
 	id := cid & 0x00FFFFFF
@@ -88,7 +172,8 @@ func synthAddrFor(cid uint32) *net.UDPAddr {
 }
 
 // isSyntheticRelayAddr reports whether addr is one of our circuit addresses.
-// Used by overlayWriteTo on every send, so it is deliberately allocation-free.
+// Called by overlayWriteTo on every send, so it is deliberately
+// allocation-free.
 func isSyntheticRelayAddr(addr *net.UDPAddr) bool {
 	if addr == nil {
 		return false
@@ -97,17 +182,9 @@ func isSyntheticRelayAddr(addr *net.UDPAddr) bool {
 	return v4 != nil && v4[0] == 240
 }
 
-type relayPeerState struct {
-	addr        *net.UDPAddr
-	reserved    bool
-	lastReserve time.Time
-	denied      byte
-	deniedAt    time.Time
-}
-
-// startRelayClient enables outbound use of public relays. group is the blinded
-// DHT key of our network: presenting it to a relay is what pairs us with our
-// own members and nobody else.
+// startRelayClient enables outbound use of public relays. group is the
+// blinded discovery key of our network: presenting it to a relay is what
+// pairs us with our own members and nobody else.
 func startRelayClient(conn *net.UDPConn, group []byte, port int, kp keypair, psk []byte) *relayClientState {
 	c := &relayClientState{
 		conn:     conn,
@@ -145,11 +222,11 @@ func (c *relayClientState) send(relay *net.UDPAddr, sub byte, body []byte) {
 	_, _ = c.conn.WriteToUDP(buf, relay)
 }
 
-// AddRelay registers a candidate relay endpoint (from the DHT directory or
-// from config) and immediately tries to reserve on it.
+// AddRelay registers a candidate relay endpoint and immediately tries to
+// reserve on it.
 func (c *relayClientState) AddRelay(ep string) {
 	addr, err := net.ResolveUDPAddr("udp", ep)
-	if err != nil || addr == nil || !dhtRoutableAddr(addr) {
+	if err != nil || addr == nil || !isValidPeer(ep) {
 		return
 	}
 	c.mu.Lock()
@@ -166,6 +243,28 @@ func (c *relayClientState) AddRelay(ep string) {
 	c.send(addr, relayReserve, c.group[:])
 }
 
+// handleRelayPacket is the demux entry point for 0x10 frames arriving on the
+// shared transport socket.
+func handleRelayPacket(pkt []byte, raddr *net.UDPAddr) {
+	if len(pkt) < 2 || pkt[0] != PktRelay {
+		return
+	}
+	c := gRelayClient
+	if c == nil {
+		return
+	}
+	sub := pkt[1]
+	body := pkt[2:]
+	if sub == relayData {
+		if len(body) < 4 {
+			return
+		}
+		c.deliver(binary.BigEndian.Uint32(body[:4]), body[4:], raddr)
+		return
+	}
+	c.handleClient(sub, body, raddr)
+}
+
 // handleClient processes relay control messages addressed to us as a user of
 // somebody else's relay.
 func (c *relayClientState) handleClient(sub byte, body []byte, raddr *net.UDPAddr) {
@@ -178,12 +277,11 @@ func (c *relayClientState) handleClient(sub byte, body []byte, raddr *net.UDPAdd
 		if st := c.relays[raddr.String()]; st != nil {
 			st.reserved = true
 			st.lastReserve = time.Now()
-			st.denied = 0
 		}
-		// The relay echoes the endpoint it saw us arrive from. Behind a
-		// symmetric NAT this is the only address that will ever work, and
-		// STUN cannot tell us — it reports the mapping for the STUN server,
-		// which is a different mapping.
+		// The relay reports the endpoint it sees us at. On a carrier network
+		// this is often the ONLY way we learn our external mapping, because
+		// STUN cannot tell us — it reports the mapping toward the STUN
+		// server, which on a symmetric NAT is a different mapping entirely.
 		if len(body) >= 8 {
 			ip := net.IP(append([]byte(nil), body[2:6]...))
 			port := int(binary.BigEndian.Uint16(body[6:8]))
@@ -245,8 +343,8 @@ func (c *relayClientState) openCircuit(cid uint32, relay *net.UDPAddr) {
 	log.Printf("[relay] circuit %d open via %s (peer appears as %s)", cid, relay, synth)
 
 	// Drive the handshake. connectToPeer takes an endpoint string; the
-	// synthetic address round-trips through it unchanged, and every send to it
-	// is redirected onto the circuit by overlayWriteTo.
+	// synthetic address round-trips through it unchanged, and every send to
+	// it is redirected onto the circuit by overlayWriteTo.
 	go connectToPeer(synth.String(), c.kp, c.psk)
 }
 
@@ -269,8 +367,8 @@ func (c *relayClientState) closeCircuit(cid uint32) {
 }
 
 // WriteVia wraps an overlay frame for its circuit and sends it to the relay.
-// Returns false when addr is not one of ours, so the caller falls through to a
-// normal UDP write.
+// Returns false when addr is not one of ours, so the caller falls through to
+// a normal UDP write.
 func (c *relayClientState) WriteVia(addr *net.UDPAddr, frame []byte) bool {
 	c.mu.RLock()
 	cc := c.bySynth[addr.String()]
@@ -300,9 +398,9 @@ func (c *relayClientState) deliver(cid uint32, payload []byte, from *net.UDPAddr
 	c.mu.RLock()
 	cc := c.circuits[cid]
 	c.mu.RUnlock()
-	// A payload for an unknown circuit id from a relay we hold a slot on means
-	// the relay opened a circuit whose control message we lost. Adopt it
-	// rather than dropping traffic for the length of a retry cycle.
+	// A payload for an unknown circuit id from a relay we hold a slot on
+	// means the relay opened a circuit whose control message we lost. Adopt
+	// it rather than dropping traffic for the length of a retry cycle.
 	if cc == nil {
 		c.mu.RLock()
 		known := c.relays[from.String()] != nil
@@ -329,8 +427,8 @@ func (c *relayClientState) deliver(cid uint32, payload []byte, from *net.UDPAddr
 	c.statRx.Add(1)
 
 	if gTransportDeliver != nil {
-		// Copy: the caller's buffer is the shared read buffer and is reused as
-		// soon as this returns, while the handler may retain slices of it.
+		// Copy: the caller's buffer is the shared read buffer and is reused
+		// as soon as this returns, while the handler may retain slices of it.
 		buf := make([]byte, len(payload))
 		copy(buf, payload)
 		gTransportDeliver(buf, cc.synth)
@@ -369,24 +467,16 @@ func (c *relayClientState) loop() {
 	}
 }
 
-// discover finds public relays, from the DHT directory and from the tracker
-// directory (relaydirectory.go).
+// discover finds public relays in the tracker directory (relaydirectory.go).
 //
-// Two transports, because either can be unavailable. The DHT is the richer
-// source but is blocked on some networks and absent entirely from the mobile
-// cores; trackers are reachable almost everywhere a phone is and are already
-// contacted for peer discovery. Results are merged and AddRelay dedupes, so
-// running both costs one extra UDP round trip per ten-minute pass.
+// The desktop also queries the DHT; the mobile core has none, which is
+// precisely why the tracker directory exists.
 func (c *relayClientState) discover() {
 	if !c.enabled.Load() {
 		return
 	}
-	if gDHT != nil {
-		// announcePort 0: we are LOOKING for relays, not advertising as one.
-		for _, ep := range gDHT.lookupPeers(relayDirectoryKey(), 0) {
-			c.AddRelay(ep)
-		}
-	}
+	// announcePort 0: we are LOOKING for relays, not advertising as one — a
+	// phone must never publish itself as a relay.
 	for _, ep := range relayDirectoryPeers(currentTrackers(), 0) {
 		c.AddRelay(ep)
 	}
@@ -405,7 +495,7 @@ func (c *relayClientState) ObservedEndpoint() string {
 	return c.observed
 }
 
-// relayClientStatus is the dashboard view of the client half.
+// relayClientStatus is the status-API view of the client half.
 type relayClientStatus struct {
 	Enabled  bool   `json:"enabled"`
 	Relays   int    `json:"relays"`
@@ -460,4 +550,19 @@ func overlayWriteTo(conn *net.UDPConn, frame []byte, addr *net.UDPAddr) (int, er
 		return 0, net.ErrClosed
 	}
 	return conn.WriteToUDP(frame, addr)
+}
+
+// itoaPort avoids pulling strconv in for one call site.
+func itoaPort(p int) string {
+	if p <= 0 {
+		return "0"
+	}
+	var b [6]byte
+	i := len(b)
+	for p > 0 {
+		i--
+		b[i] = byte('0' + p%10)
+		p /= 10
+	}
+	return string(b[i:])
 }

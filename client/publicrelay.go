@@ -486,8 +486,16 @@ func (r *publicRelay) janitor() {
 // find it. Only ever called while the relay is enabled AND has quota left: a
 // relay that advertises while refusing every connection is worse than one that
 // stays quiet, because clients keep choosing it over working relays.
+// Advertise publishes this relay in BOTH directories: the DHT (rich, but
+// unreachable on some networks and absent from the mobile cores) and the
+// BitTorrent trackers this node already announces to (relaydirectory.go).
+//
+// Publishing to trackers is what makes a relay findable by a phone. Without
+// it a mobile client has no way to locate any relay at all, which is why a
+// cellular peer behind symmetric NAT had no working path and simply retried
+// direct punches until something coincidentally landed.
 func (r *publicRelay) Advertise(port int) {
-	if !r.enabled.Load() || r.limits.QuotaExceeded() || gDHT == nil {
+	if !r.enabled.Load() || r.limits.QuotaExceeded() {
 		return
 	}
 	if !r.advertiseRunning.CompareAndSwap(false, true) {
@@ -495,7 +503,12 @@ func (r *publicRelay) Advertise(port int) {
 	}
 	go func() {
 		defer r.advertiseRunning.Store(false)
-		gDHT.lookupPeers(relayDirectoryKey(), port)
+		if gDHT != nil {
+			gDHT.lookupPeers(relayDirectoryKey(), port)
+		}
+		// Announce with our real port: this PUBLISHES us as a relay rather
+		// than merely looking the directory up.
+		relayDirectoryPeers(currentTrackers(), port)
 		r.mu.Lock()
 		r.lastAdvertise = time.Now()
 		r.mu.Unlock()

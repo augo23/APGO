@@ -1585,6 +1585,15 @@ func myConnectCandidates() string {
 			}
 		}
 	}
+	// 8. Our NAT class, so the peer can tell a punchable pairing from an
+	// impossible one BEFORE spending minutes discovering it (relaypolicy.go).
+	// This is a token, not an endpoint: every existing build runs each
+	// candidate through isPunchableAddr, whose SplitHostPort rejects it, so
+	// older peers skip it silently and behave exactly as they did before.
+	if tok := natTokenFor(m); tok != "" {
+		addAlways(tok)
+	}
+
 	return strings.Join(cands, ",")
 }
 
@@ -1596,7 +1605,29 @@ func myConnectCandidates() string {
 // path. A stale/foreign private address just fails its handshake and backs
 // off, so accepting them is safe (the Noise handshake authenticates peers,
 // not the transport address).
-func punchCandidates(candidateList string, kp keypair, psk []byte) {
+// peerOverlayIP is the peer's overlay address, used to key the per-peer relay
+// policy (relaypolicy.go). Pass "" from call sites that genuinely do not know
+// it; the policy then simply never suppresses a punch.
+func punchCandidates(peerOverlayIP, candidateList string, kp keypair, psk []byte) {
+	// NAT-PAIRING CHECK, BEFORE ANY HANDSHAKE IS SPENT.
+	//
+	// A symmetric NAT on one side and a symmetric or port-restricted NAT on
+	// the other cannot be punched from either end: each side would have to
+	// address a mapping that the other's NAT has already moved. Recognising
+	// that from the candidate exchange turns four hours of "no handshake
+	// reply" into one relayed session that works immediately.
+	//
+	// This suppresses the DIRECT punch only. The relay path still forms, and
+	// relayUpgradeProbe keeps testing for a direct path in the background, so
+	// a phone that joins Wi-Fi is promoted within the minute.
+	punchDirect := true
+	if peerOverlayIP != "" {
+		punchDirect = noteConnectCandidates(peerOverlayIP, candidateList)
+		if !punchDirect && !shouldProbeDirect(peerOverlayIP) {
+			return
+		}
+	}
+
 	// IS THIS PEER AT OUR SITE? If any candidate it advertises carries our
 	// OWN public IP, we sit behind the same NAT, and its private addresses
 	// may well be routable from here — real sites routinely span several
@@ -1962,6 +1993,7 @@ func parseCompactPeers6(body []byte) []string {
 // other v6-capable nodes can reach us directly with no hole punching.
 func globalIPv6Endpoints(port int) []string {
 	var out []string
+	ifOf := map[string]string{}
 	if !ipv6Enabled {
 		return out // IPv6 turned off for this node
 	}
@@ -1992,10 +2024,19 @@ func globalIPv6Endpoints(port int) []string {
 			if !isGlobalIPv6(ipnet.IP) {
 				continue
 			}
-			out = append(out, net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port)))
+			ep := net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port))
+			out = append(out, ep)
+			ifOf[ep] = iface.Name
 		}
 	}
-	return out
+	// Rank before the caller's per-tier budget truncates the list. The OS
+	// keeps DEPRECATED addresses on an interface after a network goes away
+	// and Go does not expose the flag that says so, so a phone that has left
+	// a Wi-Fi network still lists that network's addresses here. Asking the
+	// kernel which source it would actually use puts the working address
+	// first, instead of letting four ghosts of a dead interface consume the
+	// whole v6 budget (v6preferred.go).
+	return rankV6Endpoints(out, ifOf)
 }
 
 // reportIPv6Reachability logs, once at startup, whether this node has a
@@ -2945,7 +2986,7 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		} else {
 			log.Printf("[connect] punch-ack from %s (candidates: %s); punching", srcIP, srcCands)
 		}
-		punchCandidates(srcCands, gKP, gPSK)
+		punchCandidates(srcIP, srcCands, gKP, gPSK)
 
 		// On a request, reply with OUR candidate set so the initiator
 		// punches back at the same time (relayed the reverse way).

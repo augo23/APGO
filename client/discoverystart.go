@@ -152,13 +152,19 @@ func startDiscoveryAndRelay(cfg *ClientConfig, conn *net.UDPConn, port int, kp k
 	pr.SetEnabled(publicRelay)
 	if publicRelay {
 		go func() {
-			// Advertise in the DHT directory on a slow loop. The first
-			// advertisement waits for the DHT to have a routing table —
-			// announcing into an empty table publishes nothing and just
-			// looks, in the logs, like the relay is working when it is not.
+			// Advertise in both directories on a slow loop.
+			//
+			// The DHT half still waits for a routing table — announcing into
+			// an empty table publishes nothing and merely looks, in the logs,
+			// like the relay is working when it is not. The TRACKER half has
+			// no such precondition and must not inherit one: it is the only
+			// directory the mobile cores can read (they carry no DHT), so
+			// gating it on DHT readiness would leave phones unable to find
+			// any relay on exactly the networks where the DHT is blocked.
 			time.Sleep(30 * time.Second)
 			for {
-				if gDHT != nil && gDHT.table.Count() >= dhtK {
+				dhtReady := gDHT != nil && gDHT.table.Count() >= dhtK
+				if dhtReady || trackersEnabled() {
 					pr.Advertise(port)
 				}
 				time.Sleep(dhtJitter(relayAdvertisePeriod))

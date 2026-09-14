@@ -115,6 +115,19 @@ type ClientConfig struct {
 	// key-fingerprint prefix to always egress through that one node (traffic
 	// pauses — is never re-routed elsewhere — while it's unreachable).
 	ExitPeer string `yaml:"exit_peer"`
+	// UseRelays lets THIS node reach peers through public relays when no
+	// direct path exists. Nil means enabled — the default has to be ON for a
+	// phone, because the pairing it hits most (symmetric carrier NAT against
+	// a port-restricted home router) has no direct path at all, and a
+	// defaulted-off relay would leave the common case simply broken.
+	//
+	// This is the CLIENT half only: a phone never acts as a relay, so there
+	// is no corresponding public_relay setting here.
+	UseRelays *bool `yaml:"use_public_relays"`
+	// StaticRelays are relay endpoints to use directly, skipping directory
+	// discovery. Useful when an operator runs their own relay, and as a
+	// fallback on networks where tracker traffic is filtered.
+	StaticRelays []string `yaml:"static_relays"`
 }
 
 // myOverlayIP is this node's overlay address (no mask), set once in main()
@@ -992,6 +1005,15 @@ func myConnectCandidates() string {
 			}
 		}
 	}
+	// 8. Our NAT class, so the peer can tell a punchable pairing from an
+	// impossible one BEFORE spending minutes discovering it (relaypolicy.go).
+	// This is a token, not an endpoint: every existing build runs each
+	// candidate through isPunchableAddr, whose SplitHostPort rejects it, so
+	// older peers skip it silently and behave exactly as they did before.
+	if tok := natTokenFor(m); tok != "" {
+		addAlways(tok)
+	}
+
 	return strings.Join(cands, ",")
 }
 
@@ -1004,7 +1026,30 @@ func myConnectCandidates() string {
 // path. A stale/foreign private address just fails its handshake and backs
 // off, so accepting them is safe (the Noise handshake authenticates peers,
 // not the transport address).
-func punchCandidates(candidateList string, kp keypair, psk []byte) {
+// peerOverlayIP is the peer's overlay address, used to key the per-peer relay
+// policy (relaypolicy.go). Pass "" from call sites that genuinely do not know
+// it; the policy then simply never suppresses a punch.
+func punchCandidates(peerOverlayIP, candidateList string, kp keypair, psk []byte) {
+	// NAT-PAIRING CHECK, BEFORE ANY HANDSHAKE IS SPENT.
+	//
+	// This is the phone's half of the fix. A symmetric carrier NAT against a
+	// port-restricted home router cannot be punched from either end, and the
+	// phone is the side that pays for trying: every doomed candidate is a
+	// radio wake, an X25519 keygen and a DH, repeated on the retry ladder for
+	// as long as the app is open. Recognising the pairing from the candidate
+	// exchange replaces that with one relayed session that works immediately.
+	//
+	// Only the DIRECT punch is suppressed. The relay path still forms, and
+	// shouldProbeDirect keeps retrying direct in the background, so walking
+	// into Wi-Fi promotes the session within the minute.
+	punchDirect := true
+	if peerOverlayIP != "" {
+		punchDirect = noteConnectCandidates(peerOverlayIP, candidateList)
+		if !punchDirect && !shouldProbeDirect(peerOverlayIP) {
+			return
+		}
+	}
+
 	for _, c := range strings.Split(candidateList, ",") {
 		c = strings.TrimSpace(c)
 		if c == "" || !isPunchableAddr(c) {
@@ -1274,6 +1319,7 @@ func isVirtualInterface(name string) bool {
 // what we advertise so other v6-capable nodes can reach us directly.
 func globalIPv6Endpoints(port int) []string {
 	var out []string
+	ifOf := map[string]string{}
 	if !ipv6Enabled {
 		return out
 	}
@@ -1303,10 +1349,19 @@ func globalIPv6Endpoints(port int) []string {
 			if !isGlobalIPv6(ipnet.IP) {
 				continue
 			}
-			out = append(out, net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port)))
+			ep := net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(port))
+			out = append(out, ep)
+			ifOf[ep] = iface.Name
 		}
 	}
-	return out
+	// Rank before the caller's per-tier budget truncates the list. iOS keeps
+	// DEPRECATED privacy/SLAAC addresses on an interface after the network
+	// goes away and Go does not expose the flag that says so, so a phone that
+	// has left a Wi-Fi network still lists that network's addresses here —
+	// four of them, in the field, crowding out the one candidate that worked.
+	// Asking the kernel which source it would actually use puts the live
+	// address first (v6preferred.go).
+	return rankV6Endpoints(out, ifOf)
 }
 
 // hasGlobalIPv6 reports whether this host currently has any global IPv6
@@ -1538,7 +1593,10 @@ func sendPacket(conn *net.UDPConn, addr *net.UDPAddr, s *session, payload []byte
 	}
 
 	binary.BigEndian.PutUint16(frame[9:11], uint16(len(frame)-hdrLen))
-	_, err = conn.WriteToUDP(frame, addr)
+	// overlayWriteTo, not conn.WriteToUDP: a peer reachable only through a
+	// relay circuit has a synthetic 240/4 address, and this is the single
+	// send point that redirects those frames onto the circuit.
+	_, err = overlayWriteTo(conn, frame, addr)
 	return err
 }
 
@@ -1852,7 +1910,7 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		} else {
 			log.Printf("[connect] punch-ack from %s (candidates: %s); punching", srcIP, srcCands)
 		}
-		punchCandidates(srcCands, gKP, gPSK)
+		punchCandidates(srcIP, srcCands, gKP, gPSK)
 
 		// On a request, reply with OUR candidate set so the initiator
 		// punches back at the same time (relayed the reverse way).

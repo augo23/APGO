@@ -826,7 +826,7 @@ func (t *SessionTable) EnsureSession(addr *net.UDPAddr, kp keypair, psk []byte) 
 
 	msg1Frame := append([]byte{PktMsg1}, msgE...)
 
-	if _, err := t.udpConn.WriteToUDP(msg1Frame, addr); err != nil {
+	if _, err := overlayWriteTo(t.udpConn, msg1Frame, addr); err != nil {
 		cleanupPending()
 		return nil, err
 	}
@@ -856,7 +856,7 @@ waitForR:
 		case <-retransmit.C:
 			// Refresh the NAT pinhole; the peer may not have started its
 			// outbound flow yet. Ignore send errors — best effort.
-			_, _ = t.udpConn.WriteToUDP(msg1Frame, addr)
+			_, _ = overlayWriteTo(t.udpConn, msg1Frame, addr)
 		}
 	}
 
@@ -890,7 +890,7 @@ waitForR:
 
 	cleanupPending()
 
-	if _, err := t.udpConn.WriteToUDP(msg3Frame, addr); err != nil {
+	if _, err := overlayWriteTo(t.udpConn, msg3Frame, addr); err != nil {
 		return nil, err
 	}
 
@@ -954,7 +954,7 @@ func (t *SessionTable) deliverPacket(raddr *net.UDPAddr, typ byte, body []byte, 
 		}
 		t.mu.Unlock()
 		if resend != nil {
-			_, _ = t.udpConn.WriteToUDP(resend, raddr)
+			_, _ = overlayWriteTo(t.udpConn, resend, raddr)
 		}
 		return true
 	}
@@ -1149,7 +1149,7 @@ func handleResponder(conn *net.UDPConn, addr *net.UDPAddr, pending *pendingHands
 	}
 	msg2Frame := append([]byte{PktMsg2}, msgR...)
 
-	if _, err := conn.WriteToUDP(msg2Frame, addr); err != nil {
+	if _, err := overlayWriteTo(conn, msg2Frame, addr); err != nil {
 		cleanupPending()
 		return
 	}
