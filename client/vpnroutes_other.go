@@ -13,3 +13,7 @@ func enableFullTunnelRoutes() error { return nil }
 func pinTransportToPhysicalInterface(*net.UDPConn) error { return nil }
 
 func pinAuxUDPSocket(*net.UDPConn) {}
+
+func disableFullTunnelRoutes() error { return nil }
+
+func unpinTransport(*net.UDPConn) {}

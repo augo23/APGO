@@ -80,7 +80,7 @@ func runSetupServerAndWait(sock string) {
 	if err != nil {
 		log.Fatalf("[setup] cannot listen on %s: %v", sock, err)
 	}
-	_ = os.Chmod(sock, 0o666)
+	secureControlSocket(sock)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {

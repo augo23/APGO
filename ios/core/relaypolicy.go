@@ -247,6 +247,13 @@ func noteConnectCandidates(overlayIP, candidateList string) bool {
 		log.Printf("[relay-policy] %s: %s — going relay-first (direct probes continue in the background)",
 			overlayIP, p.reason)
 	}
+	// "Cannot be punched" means "cannot be ADDRESSED": the peer's mapping
+	// exists, its port is simply unguessable. natspray.go probes for it while
+	// the relay carries traffic, so a symmetric peer stops being a permanent
+	// relay case (see that file for which half runs where).
+	if !directPunchViable(mine, theirs) {
+		maybeStartNATSpray(overlayIP, candidateList, mine, theirs)
+	}
 	return !p.relayFirst
 }
 

@@ -418,11 +418,22 @@ type mConfig struct {
 	// router with symmetric NAT that left every NATed peer permanently RELAYED
 	// with no way to change it short of hand-editing the file.
 	PortPrediction bool `yaml:"port_prediction"`
-	// ExitNode offers THIS device as an internet exit for the mesh: it NATs
-	// overlay-sourced traffic out its physical interface so full-VPN peers can
-	// egress here. Implemented on Linux (iptables) and macOS (pf); the client
-	// auto-disables it with a log line on platforms that can't forward.
+	// ExitNode offers THIS device as an INTERNAL exit node: it NATs traffic
+	// from devices on its own network out its physical interface so full-VPN
+	// peers can egress here (Linux iptables, macOS pf, Windows WinNAT).
 	ExitNode bool `yaml:"exit_node"`
+	// PublicExit offers this device as a PUBLIC exit node: its internet
+	// connection (internet only) is shared with any APGO user, within the
+	// limits below. Requires DHT and PublicRelay. Field names match the client.
+	PublicExit               bool   `yaml:"public_exit"`
+	PublicExitUpLimit        string `yaml:"public_exit_up_limit,omitempty"`
+	PublicExitDownLimit      string `yaml:"public_exit_down_limit,omitempty"`
+	PublicExitQuota          string `yaml:"public_exit_quota,omitempty"`
+	PublicExitMaxClients     int    `yaml:"public_exit_max_clients,omitempty"`
+	PublicExitPerClientLimit string `yaml:"public_exit_per_client_limit,omitempty"`
+	// UsePublicExits lets Full VPN fall back to public exit nodes when no
+	// internal exit is reachable ("public" as ExitPeer: public exits only).
+	UsePublicExits bool `yaml:"use_public_exits"`
 	// UseExit routes ALL of this device's internet traffic through an exit
 	// node on the mesh (full VPN). ExitPeer picks WHICH exit: blank = the
 	// fastest reachable exit (auto-switching); or pin one node by its overlay

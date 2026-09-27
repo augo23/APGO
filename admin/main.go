@@ -411,6 +411,7 @@ func networkSetupPage(msg string) string {
 
   <label for="address">Overlay IP for THIS node (optional)</label>
   <input id="address" name="address" type="text" spellcheck="false" placeholder="blank = auto-assign, or e.g. 10.22.55.5/24">
+  <div class="hint">Blank is recommended. Other devices give a manual address to the first device that uses it; assign it from the admin panel to make it permanent.</div>
 
   <label for="friendly_name">Friendly name (optional)</label>
   <input id="friendly_name" name="friendly_name" type="text" spellcheck="false">
@@ -601,9 +602,11 @@ func adminKeyPage(msg string) string {
 	if akf, ok := currentAdminKeyFile(); ok && akf.PublicKey != "" {
 		inner = `<p class="sub">The network admin key is set up and distributed (encrypted) to every node, so you can sign from any node with the network admin password. Its public key:</p>
   <textarea readonly onclick="this.select()">ADMIN_PUBLIC_KEY=` + html.EscapeString(akf.PublicKey) + `</textarea>
+  <p class="sub" style="margin-top:12px">Its fingerprint. Devices that join with the join QR pin it automatically; on nodes configured by hand, set it as <code>ADMIN_KEY_FP</code> (or <code>admin_key_fp</code> in the config) so they refuse any other admin key a peer offers:</p>
+  <textarea readonly onclick="this.select()" style="height:48px">ADMIN_KEY_FP=` + html.EscapeString(adminKeyFingerprintB64(akf.PublicKey)) + `</textarea>
   <p class="sub" style="margin-top:18px">Change the network admin password (re-encrypts and re-distributes the key):</p>
   <label>Current network admin password</label><input name="current_password" type="password">
-  <label>New network admin password (min 8 characters)</label><input name="new_password" type="password">
+  <label>New network admin password (min 12 characters)</label><input name="new_password" type="password">
   <label>Confirm new network admin password</label><input name="confirm_password" type="password">
   <button type="submit">Change network admin password</button>`
 	} else {
@@ -613,7 +616,7 @@ func adminKeyPage(msg string) string {
 			note = `<p class="msg">This node trusts an admin key but the encrypted signing key hasn't reached it. If the network already has one, it should sync within a few keepalive cycles once connected. If this is a fresh network (or a leftover key from a previous one), create a new key below — it will replace the trusted one.</p>`
 		}
 		inner = `<p class="sub">No network admin key here yet. Create one to enable signed, network-wide revocations, approvals, and IP/name changes — the encrypted key is distributed to every node so you can manage from anywhere with the <b>network admin password</b>. This is separate from your dashboard login.</p>
-  <label>Set the network admin password (min 8 characters)</label><input name="password" type="password" autofocus>
+  <label>Set the network admin password (min 12 characters)</label><input name="password" type="password" autofocus>
   <label>Confirm the network admin password</label><input name="confirm_password" type="password">
   <button type="submit">Create network admin key</button>` + note
 	}

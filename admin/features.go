@@ -294,9 +294,7 @@ func networkPage(current string, pq, ipv6 bool) string {
   <input id="selfName" type="text" spellcheck="false" autocapitalize="off">
   <label>Overlay IP (last octet or full address — blank = keep current)</label>
   <input id="selfIp" type="text" spellcheck="false" autocapitalize="off">
-  <label>Network admin password</label>
-  <input id="selfPw" type="password">
-  <button type="button" class="primary" onclick="saveSelf()">Apply device settings</button>
+  <button type="button" class="primary" onclick="saveSelf()">Apply device settings…</button>
   <p id="smsg" class="msg"></p>
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
@@ -360,6 +358,35 @@ func networkPage(current string, pq, ipv6 bool) string {
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
 
+  <h1>Exit node</h1>
+  <p class="sub"><strong>Internal exit node</strong> is set per device from the dashboard (click a
+  device, then Settings). It serves only devices on this network.</p>
+  <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
+    <input id="pxOn" type="checkbox" style="width:auto" onchange="pxSync()"> Public exit node &mdash; share this server's internet with any APGO user
+  </label>
+  <p class="sub" style="margin:4px 0 8px 24px">Any APGO user whose own network has no exit can
+  send internet traffic out through this server, and it will appear to come from this server's IP
+  address. They can reach <strong>public internet addresses only</strong>: this server, its LAN,
+  your overlay network and private ranges are blocked, and outgoing mail (port 25) is refused.
+  Each user is limited to 10&nbsp;Mbps. Needs the DHT and &ldquo;Be a public relay&rdquo; above
+  (saved and running) first.</p>
+  <p id="pxGate" class="warn" style="margin-left:24px"></p>
+  <div id="pxLimits" style="display:none;margin-left:24px">
+    <label for="pxUp">Public exit upload limit (Mbps) <span class="lc">&mdash; blank = unlimited</span></label>
+    <input id="pxUp" type="number" min="0" step="0.1">
+    <label for="pxDown">Public exit download limit (Mbps)</label>
+    <input id="pxDown" type="number" min="0" step="0.1">
+    <label for="pxQuota">Public exit quota (GB) <span class="lc">&mdash; blank = none</span></label>
+    <input id="pxQuota" type="number" min="0" step="1">
+    <label for="pxMax">Max users at once <span class="lc">&mdash; blank = 16</span></label>
+    <input id="pxMax" type="number" min="1" max="1024" step="1">
+  </div>
+  <p id="pxLive" class="sub" style="margin-left:24px"></p>
+  <button type="button" class="primary" onclick="savePublicExit()">Save exit settings…</button>
+  <p id="pxmsg" class="msg"></p>
+
+  <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
+
   <h1>SOCKS5 proxy</h1>
   <p class="sub">Lets applications on THIS machine reach overlay addresses through a local proxy
   port, without them needing to know anything about the overlay. Point a browser or curl at it
@@ -377,9 +404,7 @@ func networkPage(current string, pq, ipv6 bool) string {
   <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
     <input id="skOverlayOnly" type="checkbox" style="width:auto"> Overlay destinations only
   </label>
-  <label for="skPw">Network admin password</label>
-  <input id="skPw" type="password">
-  <button onclick="saveSocks()">Save proxy settings</button>
+  <button type="button" class="primary" onclick="saveSocks()">Save proxy settings…</button>
   <p id="skmsg" class="msg"></p>
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
@@ -389,9 +414,7 @@ func networkPage(current string, pq, ipv6 bool) string {
   <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
     <input id="pq" type="checkbox" `+pqChecked+` style="width:auto"> Post-quantum encryption (network-wide)
   </label>
-  <label>Network admin password</label>
-  <input id="pqpw" type="password">
-  <button type="button" class="primary" onclick="applyPolicy()">Apply security policy</button>
+  <button type="button" class="primary" onclick="applyPolicy()">Apply security policy…</button>
   <p id="pmsg" class="msg"></p>
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
@@ -409,10 +432,7 @@ func networkPage(current string, pq, ipv6 bool) string {
     <button type="button" class="gen" onclick="genPsk()">Generate</button>
   </div>
 
-  <label>Network admin password</label>
-  <input id="pw" type="password">
-
-  <button type="button" class="primary" onclick="rotate()">Apply rotation</button>
+  <button type="button" class="primary" onclick="rotate()">Apply rotation…</button>
   <p id="msg" class="msg"></p>
 
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
@@ -495,27 +515,24 @@ async function saveSelf(){
   const msg = document.getElementById('smsg');
   const name = document.getElementById('selfName').value.trim();
   let ip = document.getElementById('selfIp').value.trim();
-  const password = document.getElementById('selfPw').value;
   if(!selfInfo.pubkey){ msg.textContent='The client is not connected yet — try again in a moment.'; msg.style.color='#e6b400'; return; }
   if(!name && !ip){ msg.textContent='Enter a device name or an overlay IP.'; msg.style.color='#e6b400'; return; }
-  if(!password){ msg.textContent='Network admin password is required.'; msg.style.color='#e6b400'; return; }
   // A bare last-octet is expanded against this node's current subnet prefix.
   if(ip && !ip.includes('.')){
     const b = (selfInfo.ip||'10.22.55.0').split('/')[0].split('.');
     if(b.length >= 3) ip = b[0]+'.'+b[1]+'.'+b[2]+'.'+ip;
   }
-  msg.textContent='Applying…'; msg.style.color='';
-  try {
-    const r = await fetch('/api/provision', {method:'POST',
-      headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
-      body: JSON.stringify({pubkey: selfInfo.pubkey, address: ip, name, password})});
-    const t = await r.text();
-    msg.textContent = r.ok ? 'Applied — the mesh picks it up within seconds.' : ('Failed: '+t.trim());
-    msg.style.color = r.ok ? '#38c172' : '#e6b400';
-    if(r.ok) document.getElementById('selfPw').value='';
-  } catch(e) {
-    msg.textContent='Request failed — is the client running?'; msg.style.color='#e6b400';
-  }
+  msg.textContent='';
+  const ok = await withAdminPassword({title:'Apply device settings', who:(name||selfInfo.name||'This device')+(ip?' → '+ip:''), ok:'Apply', working:'Applying…'},
+    async (password) => {
+      try {
+        const r = await fetch('/api/provision', {method:'POST',
+          headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+          body: JSON.stringify({pubkey: selfInfo.pubkey, address: ip, name, password})});
+        return r.ok ? null : ('Failed: '+(await r.text()).trim());
+      } catch(e) { return 'Request failed — is the client running?'; }
+    });
+  if(ok){ msg.textContent='Applied — the mesh picks it up within seconds.'; msg.style.color='#38c172'; }
 }
 async function saveAccount(){
   const msg=document.getElementById('amsg');
@@ -558,8 +575,9 @@ async function loadSocks(){
 }
 async function saveSocks(){
   const msg=document.getElementById('skmsg');
-  const pw=document.getElementById('skPw').value;
-  if(!pw){ msg.textContent='Network admin password is required.'; msg.style.color='#e6b400'; return; }
+  // Signed for THIS node's key. Without the pubkey the record would be the
+  // network-wide default and open a proxy on every node.
+  if(!selfInfo.pubkey){ msg.textContent='The client is not connected yet — try again in a moment.'; msg.style.color='#e6b400'; return; }
   const listen=document.getElementById('skListen').value.trim();
   const user=document.getElementById('skUser').value.trim();
   const host=listen.replace(/:[0-9]+$/,'');
@@ -571,18 +589,22 @@ async function saveSocks(){
     msg.textContent='A proxy on '+host+' needs a username and password — the node will refuse to start it.';
     msg.style.color='#e6b400'; return;
   }
-  msg.textContent='Signing…'; msg.style.color='';
-  const body={socks5_listen:listen, socks5_user:user,
-              socks5_overlay_only:document.getElementById('skOverlayOnly').checked, password:pw};
+  msg.textContent='';
+  const body={pubkey:selfInfo.pubkey, socks5_listen:listen, socks5_user:user,
+              socks5_overlay_only:document.getElementById('skOverlayOnly').checked};
   const sp=document.getElementById('skPass').value;
   if(sp!=='') body.socks5_pass=sp;   // blank = leave unchanged
-  const r=await fetch('/api/node-config',{method:'POST',
-    headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
-    body:JSON.stringify(body)});
-  const t=await r.text();
-  msg.textContent=r.ok?(listen?('Proxy listening on '+(listen)+'.'):'Proxy disabled.'):('Failed: '+t);
-  msg.style.color=r.ok?'#38c172':'#e6b400';
-  if(r.ok){ document.getElementById('skPw').value=''; document.getElementById('skPass').value=''; loadSocks(); }
+  const ok=await withAdminPassword({title:'Save proxy settings', who:listen?('SOCKS5 proxy on '+listen):'Turn the SOCKS5 proxy off', ok:'Save', working:'Signing…'},
+    async (password)=>{
+      const r=await fetch('/api/node-config',{method:'POST',
+        headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+        body:JSON.stringify({...body, password})});
+      return r.ok?null:('Failed: '+(await r.text()));
+    });
+  if(ok){
+    msg.textContent=listen?('Proxy listening on '+(listen)+'.'):'Proxy disabled.'; msg.style.color='#38c172';
+    document.getElementById('skPass').value=''; loadSocks();
+  }
 }
 loadSocks();
 // Discovery + relays for THIS node. A LOCAL setting (no admin key, no
@@ -604,6 +626,8 @@ async function loadDiscovery(){
     document.getElementById('dcUseRelays').checked   = !!(d.relay_client && d.relay_client.enabled);
     document.getElementById('dcPublicRelay').checked = !!(d.public_relay && d.public_relay.enabled);
     dcSync();
+    pxRunning = !!(d.dht && d.dht.enabled) && !!(d.public_relay && d.public_relay.enabled);
+    pxSync();
   }catch(e){}
 }
 async function saveDiscovery(){
@@ -631,27 +655,98 @@ async function saveDiscovery(){
   }
 }
 loadDiscovery();
+// Public exit for THIS node: an admin-signed node-config record for our own
+// key, like the SOCKS proxy. The public-exit fields are only sent when the box
+// is ticked or already was: any of them makes a V2 record, which nodes on an
+// older APGO cannot verify.
+let pxRunning = false, pxWas = false;
+function pxMbps(bps){ return bps>0 ? +((bps*8)/1e6).toFixed(2) : ''; }
+function pxGB(b){ return b>0 ? +(b/1e9).toFixed(2) : ''; }
+function pxField(id, unit){
+  const v=(document.getElementById(id).value||'').trim(); if(v==='') return '';
+  const n=parseFloat(v); return (isFinite(n)&&n>0) ? n+unit : '';
+}
+function pxSync(){
+  const box=document.getElementById('pxOn');
+  const gate=document.getElementById('pxGate');
+  if(!pxRunning && !box.checked){
+    box.disabled=true;
+    gate.textContent='Turn on the DHT and "Be a public relay for others" above, save, and restart this node first.';
+  } else { box.disabled=false; gate.textContent=''; }
+  document.getElementById('pxLimits').style.display = box.checked ? 'block' : 'none';
+}
+async function loadPublicExit(){
+  try{
+    const r=await fetch('/api/node-config-get',{headers:{'X-Requested-With':'overlay-admin'}});
+    if(!r.ok) return;
+    const d=await r.json();
+    const live=d.public_exit_live||{};
+    const on=!!d.public_exit || !!live.enabled;
+    pxWas = on || !!d.public_exit_up_bps || !!d.public_exit_down_bps || !!d.public_exit_quota_bytes || !!d.public_exit_max_clients;
+    document.getElementById('pxOn').checked=on;
+    document.getElementById('pxUp').value=pxMbps(d.public_exit_up_bps);
+    document.getElementById('pxDown').value=pxMbps(d.public_exit_down_bps);
+    document.getElementById('pxQuota').value=pxGB(d.public_exit_quota_bytes);
+    document.getElementById('pxMax').value=d.public_exit_max_clients>0?d.public_exit_max_clients:'';
+    const lv=document.getElementById('pxLive');
+    lv.textContent = live.error ? ('Not running: '+live.error)
+      : (live.enabled && live.prerequisite) ? ('Paused: '+live.prerequisite)
+      : live.enabled ? ('Running — '+(live.clients||0)+' user(s) connected right now.') : '';
+    pxSync();
+  }catch(e){}
+}
+async function savePublicExit(){
+  const msg=document.getElementById('pxmsg'); msg.textContent=''; msg.style.color='';
+  if(!selfInfo.pubkey){ msg.textContent='The client is not connected yet — try again in a moment.'; msg.style.color='#e6b400'; return; }
+  const on=document.getElementById('pxOn').checked;
+  if(!on && !pxWas){ msg.textContent='Nothing to change.'; return; }
+  const maxRaw=document.getElementById('pxMax').value.trim();
+  const max=maxRaw===''?null:Number(maxRaw);
+  if(max!==null && !(Number.isInteger(max)&&max>=1&&max<=1024)){
+    msg.textContent='Max users must be a whole number from 1 to 1024.'; msg.style.color='#e6b400'; return;
+  }
+  const body={pubkey:selfInfo.pubkey, public_exit:on,
+    public_exit_up:pxField('pxUp','mbit'), public_exit_down:pxField('pxDown','mbit'),
+    public_exit_quota:pxField('pxQuota','GB')};
+  if(max!==null) body.public_exit_max_clients=max;
+  const ok=await withAdminPassword({title: on?'Become a public exit node':'Stop being a public exit node',
+      who: on?'Any APGO user will be able to reach the internet through this server\'s IP address.':'Public exit users are disconnected.',
+      ok: on?'Turn on':'Turn off', danger:on, working:'Signing…'},
+    async (password)=>{
+      const r=await fetch('/api/node-config',{method:'POST',
+        headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+        body:JSON.stringify({...body, password})});
+      return r.ok?null:('Failed: '+(await r.text()));
+    });
+  if(ok){ msg.textContent=on?'Public exit node enabled.':'Public exit node disabled.'; msg.style.color='#38c172'; pxWas=true; setTimeout(loadPublicExit, 1500); }
+}
+loadPublicExit();
 function genPsk(){
   const b=new Uint8Array(32); crypto.getRandomValues(b);
   let s=btoa(String.fromCharCode.apply(null,b));
   document.getElementById('psk').value='base64:'+s;
 }
 async function applyPolicy(){
-  const msg=document.getElementById('pmsg'); msg.textContent='Signing + distributing…';
-  const r=await fetch('/api/policy',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
-    body:JSON.stringify({post_quantum:document.getElementById('pq').checked,password:document.getElementById('pqpw').value})});
-  const t=await r.text();
-  msg.textContent = r.ok ? 'Security policy applied network-wide.' : ('Failed: '+t);
-  msg.style.color = r.ok ? '#38c172' : '#e6b400';
-  document.getElementById('pqpw').value='';
+  const msg=document.getElementById('pmsg'); msg.textContent='';
+  const on=document.getElementById('pq').checked;
+  const ok=await withAdminPassword({title:'Apply security policy', who:'Post-quantum encryption '+(on?'ON':'OFF')+' for every device on the network.', ok:'Apply', working:'Signing + distributing…'},
+    async (password)=>{
+      const r=await fetch('/api/policy',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+        body:JSON.stringify({post_quantum:on,password})});
+      return r.ok?null:('Failed: '+(await r.text()));
+    });
+  if(ok){ msg.textContent='Security policy applied network-wide.'; msg.style.color='#38c172'; }
 }
 async function rotate(){
-  const msg=document.getElementById('msg'); msg.textContent='Signing + distributing…';
-  const r=await fetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
-    body:JSON.stringify({network_name:document.getElementById('netname').value,psk:document.getElementById('psk').value,password:document.getElementById('pw').value})});
-  const t=await r.text();
-  msg.textContent = r.ok ? 'Rotation sent. Devices will reconnect under the new identity shortly.' : ('Failed: '+t);
-  msg.style.color = r.ok ? '#38c172' : '#e6b400';
+  const msg=document.getElementById('msg'); msg.textContent='';
+  const network_name=document.getElementById('netname').value, psk=document.getElementById('psk').value;
+  const ok=await withAdminPassword({title:'Rotate network identity', who:'Every device reconnects under the new name and key. Offline devices will not follow.', ok:'Rotate', danger:true, working:'Signing + distributing…'},
+    async (password)=>{
+      const r=await fetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},
+        body:JSON.stringify({network_name,psk,password})});
+      return r.ok?null:('Failed: '+(await r.text()));
+    });
+  if(ok){ msg.textContent='Rotation sent. Devices will reconnect under the new identity shortly.'; msg.style.color='#38c172'; }
 }
 `)
 }
@@ -746,6 +841,7 @@ func pageShell(title, body, script string) string {
 ` + body + `
     <div><a class="back" href="/">← Back to dashboard</a></div>
   </div>
+` + adminPasswordDialog + `
 <script>
 ` + script + `
 </script>
@@ -784,6 +880,12 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		ExitUp       *string   `json:"exit_up"`
 		ExitDown     *string   `json:"exit_down"`
 		ExitQuota    *string   `json:"exit_quota"`
+		// Public exit node (share with any APGO user).
+		PublicExit           *bool   `json:"public_exit"`
+		PublicExitUp         *string `json:"public_exit_up"`
+		PublicExitDown       *string `json:"public_exit_down"`
+		PublicExitQuota      *string `json:"public_exit_quota"`
+		PublicExitMaxClients *int64  `json:"public_exit_max_clients"`
 		Password     string    `json:"password"`
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 32768))
@@ -827,6 +929,24 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		ExitUp:       rate(req.ExitUp),
 		ExitDown:     rate(req.ExitDown),
 		ExitQuota:    rate(req.ExitQuota),
+		PublicExit:           req.PublicExit,
+		PublicExitUp:         rate(req.PublicExitUp),
+		PublicExitDown:       rate(req.PublicExitDown),
+		PublicExitQuota:      rate(req.PublicExitQuota),
+		PublicExitMaxClients: req.PublicExitMaxClients,
+	}
+	if c.PublicExitMaxClients != nil && (*c.PublicExitMaxClients < 1 || *c.PublicExitMaxClients > 1024) {
+		http.Error(w, "public exit: max clients must be between 1 and 1024", http.StatusBadRequest)
+		return
+	}
+	// A public exit is only allowed on a node that already offers public
+	// service: DHT on and public relay on. Refuse at signing time when the
+	// same record turns either off (the node itself enforces it too).
+	if c.PublicExit != nil && *c.PublicExit {
+		if (c.DHT != nil && !*c.DHT) || (c.PublicRelay != nil && !*c.PublicRelay) {
+			http.Error(w, "a public exit node must also have the DHT and public relay turned on", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Refuse an unlimited public relay at the point of signing, not only on the

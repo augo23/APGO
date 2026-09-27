@@ -15,6 +15,9 @@ struct JoinCode: Decodable {
     var cipher: String?          // "chacha" or "aesgcm"
     var post_quantum: Bool?      // absent = on (quantum-safe default)
     var pq_auth: Bool?           // absent = on (quantum-safe default)
+    // Fingerprint pin for the network admin key. With it the core refuses any
+    // other admin key a peer tries to seed (ios/core/adminpin.go).
+    var admin_key_fp: String?
 
     /// Parse a scanned string into a JoinCode (must look like an APGO join code).
     static func parse(_ s: String) -> JoinCode? {

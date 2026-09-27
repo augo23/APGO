@@ -20,6 +20,8 @@ tun:
   mtu: 1280
   # address_cidr: "10.22.55.2/24"   # optional: pin this node's IP manually
   #                                  # (OVERLAY_ADDRESS env overrides this)
+  # Peers give a pinned address to the first node using it; assign it in the
+  # admin panel to make it permanent (see ip_binding in docs/cli.md).
 
 # IPv6 dual-stack transport. ON by default. Wherever a node has a routable IPv6
 # address (many home ISPs and phone hotspots), peers connect directly over v6

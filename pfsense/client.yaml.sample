@@ -15,6 +15,8 @@ tun:
   name: "ovl0"
   mtu: 1280
   # address_cidr: "10.22.55.1/24"   # optional: pin this router's overlay IP
+  # Peers give a pinned address to the first node using it; assign it in the
+  # admin panel to make it permanent (see ip_binding in docs/cli.md).
 
 udp_listen_port: 6969
 keepalive_seconds: 10
@@ -39,4 +41,14 @@ stun_servers:
 # Make this router a full-VPN exit for your other devices? FreeBSD NAT isn't
 # auto-configured (that's Linux-only) — add an Outbound NAT rule for the
 # overlay subnet in the pfSense GUI instead; see pfsense/README.md.
+# INTERNAL exit node (serves only this network):
 # exit_node: true
+# PUBLIC exit node (serves any APGO user; needs dht + public_relay). On
+# pfSense the NAT and block rules are added by hand first — see README.md
+# "Public exit node" — and confirmed with public_exit_manual_nat.
+# dht: true
+# public_relay: true
+# public_exit: true
+# public_exit_manual_nat: true
+# public_exit_up_limit: "50mbit"
+# public_exit_down_limit: "50mbit"

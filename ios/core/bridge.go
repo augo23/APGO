@@ -37,9 +37,19 @@ type mobileConfig struct {
 	RendezvousServers []string `json:"rendezvous_servers"`
 	STUNServers       []string `json:"stun_servers"`
 	AdminPubKey       string   `json:"admin_public_key"`
+	// AdminKeyFP pins the network admin key ("sha256:..."), carried in the
+	// join QR. With it, a peer can't seed a different admin key (adminpin.go).
+	AdminKeyFP string `json:"admin_key_fp"`
 	KeyPath           string   `json:"key_path"`  // writable path for the node key
 	UseExit           bool     `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
-	ExitPeer          string   `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest
+	ExitPeer          string   `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest; "public" = public exits only
+	// UsePublicExits: fall back to public exit nodes (other APGO users
+	// sharing their connection) when no exit on this network is reachable.
+	UsePublicExits bool `json:"use_public_exits"`
+	// UseRelays: reach peers through a public relay when no direct path can be
+	// punched (symmetric NAT / CGNAT). Pointer so an ABSENT field keeps the
+	// default ON — an older app build must not silently turn relaying off.
+	UseRelays *bool `json:"use_public_relays"`
 	UDPPort           int      `json:"udp_listen_port"`
 	Cipher            string   `json:"cipher"`
 	// KeepaliveSeconds tunes the NAT keepalive (0 = default 10s).
@@ -69,6 +79,16 @@ type mobileConfig struct {
 	// defaults being unioned back in. An empty list with ManageTrackers=true
 	// deletes the managed file, i.e. resets to the curated defaults.
 	ManageTrackers bool `json:"manage_trackers"`
+	// LogPath / LogLevel drive the in-app diagnostic log (mobilelog.go).
+	//
+	// The path MUST be inside the shared App Group container: the overlay runs
+	// in the tunnel extension, whose own container the app process cannot read,
+	// so a log written beside the node key could never be exported from
+	// Settings. Level is 0=off, 1=normal, 2=verbose; absent means off, which is
+	// the behavior every build before this one had.
+	LogPath  string `json:"log_path"`
+	LogLevel int    `json:"log_level"`
+
 	// WipeStateNonce, when non-empty and DIFFERENT from the last nonce this
 	// device applied, wipes all persisted overlay state (node key, provisions,
 	// approvals, admin key material, netconfig, policy) before starting.
@@ -110,6 +130,11 @@ func Start(tunFD int, configJSON string) error {
 		return errors.New("network_name and psk are required")
 	}
 
+	// Before anything else can log: a capture session has to include startup,
+	// which is where the NAT classification and the first relay-policy verdicts
+	// are decided. Off (or no path) leaves logging on stderr, as before.
+	startMobileLog(mc.LogPath, mc.LogLevel)
+
 	cfg := toClientConfig(mc)
 
 	// One-shot state wipe requested by the app (user deleted / forgot this
@@ -122,6 +147,13 @@ func Start(tunFD int, configJSON string) error {
 	// the app-provided admin key is trusted from the first packet.
 	if mc.AdminPubKey != "" {
 		_ = os.Setenv("ADMIN_PUBLIC_KEY", mc.AdminPubKey)
+	}
+	// Set or CLEAR the pin: the extension process can outlive a network
+	// switch, and a stale pin would refuse the new network's admin key.
+	if mc.AdminKeyFP != "" {
+		_ = os.Setenv("ADMIN_KEY_FP", mc.AdminKeyFP)
+	} else {
+		_ = os.Unsetenv("ADMIN_KEY_FP")
 	}
 	// Persist admin-assigned provisions (IP/name) next to the node key so an
 	// assigned overlay IP is adopted on the next reconnect, and seeded admin keys
@@ -218,6 +250,8 @@ func Stop() {
 		tunFile = nil
 	}
 	running = false
+	// Flush and release the file so the app never shares a half-written tail.
+	stopMobileLog()
 }
 
 // Running reports whether the overlay is active (for the app's status UI).
@@ -358,6 +392,8 @@ func toClientConfig(mc mobileConfig) *ClientConfig {
 		Compression:    true,
 		UseExit:        mc.UseExit,
 		ExitPeer:       mc.ExitPeer,
+		UsePublicExits: mc.UsePublicExits,
+		UseRelays:      mc.UseRelays,
 		NodePrivateKey: keyPathOrDefault(mc.KeyPath),
 	}
 	if cfg.OverlayCIDR == "" {

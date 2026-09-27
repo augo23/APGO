@@ -23,14 +23,22 @@ import (
 	"encoding/binary"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// usingExit reports whether full-VPN mode is on.
+func usingExit() bool { return useExitFlag.Load() }
+
 var (
-	amExit  bool // this node forwards internet traffic for clients
-	useExit bool // this node routes its own internet traffic via an exit
+	amExit bool // this node forwards internet traffic for clients
+	// useExitFlag: this node routes its own internet traffic via an exit.
+	// Atomic because full VPN is switched at runtime (fulltunnel.go) while
+	// the packet path reads it. Read with usingExit().
+	useExitFlag atomic.Bool
 
 	overlayNet *net.IPNet // parsed overlay subnet, for dst classification
 
@@ -62,7 +70,11 @@ type exitInfo struct {
 
 func initExit(cfg *ClientConfig) {
 	amExit = cfg.ExitNode
-	useExit = cfg.UseExit
+	exitAllowLAN = cfg.ExitAllowLAN
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("EXIT_ALLOW_LAN"))); v != "" {
+		exitAllowLAN = v == "1" || v == "true" || v == "yes" || v == "on"
+	}
+	useExitFlag.Store(cfg.UseExit)
 	exitPin = strings.TrimSpace(cfg.ExitPeer)
 	if _, n, err := net.ParseCIDR(cfg.OverlayCIDR); err == nil {
 		overlayNet = n
@@ -81,9 +93,12 @@ func initExit(cfg *ClientConfig) {
 			log.Printf("[exit] exit-node mode DISABLED — could not enable internet forwarding (NAT): %v", err)
 		} else {
 			log.Printf("[exit] exit-node mode ON — forwarding internet traffic for overlay clients")
+			if exitAllowLAN {
+				log.Printf("[exit] exit_allow_lan ON — overlay clients can also reach this exit's private networks (LAN, link-local, cloud metadata)")
+			}
 		}
 	}
-	if useExit {
+	if usingExit() {
 		if exitPin != "" {
 			log.Printf("[exit] full-VPN mode ON — routing internet traffic via pinned exit %q", exitPin)
 		} else {
@@ -147,7 +162,10 @@ func buildExitAnnounce() []byte {
 	if !amExit {
 		return nil
 	}
-	return append(append([]byte(nil), ctlMagic...), 'E')
+	// One payload byte (version). handleControl on every build discards
+	// control frames shorter than two bytes, so the bare "E" this used to
+	// send was dropped on arrival and no device ever learned of an exit.
+	return append(append([]byte(nil), ctlMagic...), 'E', 1)
 }
 
 // buildExitWithdraw announces that this node is NO LONGER an exit, so peers
@@ -156,7 +174,7 @@ func buildExitAnnounce() []byte {
 // builds ignore an unknown control letter but would read a modified 'E' as an
 // ordinary announce, i.e. as the exact opposite of what it means.
 func buildExitWithdraw() []byte {
-	return append(append([]byte(nil), ctlMagic...), 'U')
+	return append(append([]byte(nil), ctlMagic...), 'U', 1) // see buildExitAnnounce
 }
 
 // handleExitWithdraw drops a peer from the exit candidates on request.
@@ -265,7 +283,7 @@ func exitStatusFor(pub [32]byte) (isExit, isActive bool) {
 	if !ok {
 		return false, false
 	}
-	return true, useExit && selectedExit != nil && selectedExit == e
+	return true, usingExit() && selectedExit != nil && selectedExit == e
 }
 
 // currentExit returns the selected exit's endpoint + session, or (nil,nil).
@@ -288,9 +306,19 @@ func currentExit() (*net.UDPAddr, *session) {
 // (and ONLY the pinned node) when exit_peer is set. Runs only when use_exit
 // is on.
 func exitSelectionLoop() {
-	if !useExit {
-		return
+	// Never return while off: full VPN can be switched on at runtime
+	// (applyUseExit), and this loop is the only thing that selects an exit.
+	// Returning here left a desktop that enabled Full VPN after connecting
+	// with no exit, forever.
+	waitUntilOn := func() {
+		for !usingExit() {
+			select {
+			case <-exitRepick:
+			case <-time.After(2 * time.Second):
+			}
+		}
 	}
+	waitUntilOn()
 	probe := func() {
 		exitMu.Lock()
 		cands := make([]*exitInfo, 0, len(exitCandidates))
@@ -367,6 +395,12 @@ func exitSelectionLoop() {
 			log.Printf("[exit] selected exit %v (rtt %dms, %s)", chosen.addr, chosen.rttMs, mode)
 		}
 		selectedExit = chosen
+		if chosen != nil {
+			// First usable exit: now it is safe to steer internet traffic
+			// into the tunnel (fulltunnel.go). Outside exitMu — it runs
+			// route commands and reads the selection itself.
+			go ensureFullTunnelSteering()
+		}
 	}
 
 	// Convergence: while NO exit is selected, retry every few seconds — at
@@ -377,8 +411,12 @@ func exitSelectionLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
+		waitUntilOn()
 		probe()
 		time.Sleep(3 * time.Second)
+		if !usingExit() {
+			continue
+		}
 		pick()
 		exitMu.Lock()
 		haveExit := selectedExit != nil
@@ -396,4 +434,30 @@ func exitSelectionLoop() {
 			}
 		}
 	}
+}
+
+// exitAllowLAN lets an exit forward to private, loopback, link-local and other
+// non-public destinations (its LAN, 169.254.169.254 cloud metadata, ...).
+// OFF by default: an exit exists to reach the INTERNET, and forwarding into
+// the exit host's own networks would let every overlay member use it as a
+// pivot — including stealing cloud instance credentials from the metadata
+// service. exit_allow_lan: true / EXIT_ALLOW_LAN=1 turns it on.
+var exitAllowLAN bool
+
+// exitForwardAllowed is the exit node's outbound policy for a client packet's
+// destination: outside the overlay, and public unless exitAllowLAN.
+func exitForwardAllowed(dst string) bool {
+	if !isInternetDst(dst) {
+		return false
+	}
+	if exitAllowLAN {
+		return true
+	}
+	v4 := net.ParseIP(dst).To4()
+	if v4 == nil {
+		return false
+	}
+	var a [4]byte
+	copy(a[:], v4)
+	return pxIsPublicIPv4(a)
 }

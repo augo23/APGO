@@ -47,6 +47,11 @@ type adminKeyFile struct {
 	Sealed    string `json:"sealed"`     // base64(std) AES-GCM ciphertext of the 32-byte seed
 	Seq       int64  `json:"seq"`        // legacy; signing now uses a wall-clock nanosecond seq
 	Epoch     int64  `json:"epoch"`      // bumped on password change; newer epoch supersedes when gossiped
+	// Sig is the admin key's own ML-DSA signature over canonicalSealedBlob.
+	// Nodes only let a SIGNED blob replace the one they hold, so no peer can
+	// flood a garbage blob that locks the admin password out (see the
+	// client's adminpin.go).
+	Sig string `json:"sig,omitempty"`
 }
 
 // canonicalRevocation is the exact byte string that is signed and verified. It
@@ -209,6 +214,16 @@ type SignedNodeConfig struct {
 	ExitDown   *int64 `json:"exit_down_bps,omitempty"`
 	ExitQuota  *int64 `json:"exit_quota_bytes,omitempty"`
 
+	// Public exit node (pubexit_server.go): share this node's internet with
+	// any APGO user. Version-2 fields: a record that sets any of them is
+	// signed as OVLYNODECFG2 (see canonicalNodeConfig), which older nodes
+	// cannot verify and therefore ignore as a whole.
+	PublicExit           *bool  `json:"public_exit,omitempty"`
+	PublicExitUp         *int64 `json:"public_exit_up_bps,omitempty"`
+	PublicExitDown       *int64 `json:"public_exit_down_bps,omitempty"`
+	PublicExitQuota      *int64 `json:"public_exit_quota_bytes,omitempty"`
+	PublicExitMaxClients *int64 `json:"public_exit_max_clients,omitempty"`
+
 	Epoch int64  `json:"epoch"`
 	Ts    int64  `json:"ts"`
 	Sig   string `json:"sig"`
@@ -240,11 +255,33 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	if c.Trackers != nil {
 		trackers = strings.Join(*c.Trackers, ",")
 	}
-	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
+	v1 := fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
 		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
 		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
 		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
 		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
 		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
 		c.Epoch, c.Ts)
+	// NOTE: the v1 format string above has one %s too few, so ExitQuota
+	// renders as "%!d(string=…)" and Ts as "%!(EXTRA int64=…)". Every field is
+	// still covered, and existing signatures were made over exactly this
+	// string — it must never be "fixed".
+	//
+	// Version 2 only when a version-2 field is present, so every existing
+	// record keeps its exact signed string. It is a separately built, well
+	// formed string. Stripping the v2 fields from a v2 record (or adding them
+	// to a v1 one) changes the version and breaks the signature.
+	if c.PublicExit == nil && c.PublicExitUp == nil && c.PublicExitDown == nil &&
+		c.PublicExitQuota == nil && c.PublicExitMaxClients == nil {
+		return v1
+	}
+	return strings.Join([]string{"OVLYNODECFG2",
+		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
+		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
+		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
+		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
+		b(c.PublicExit), i(c.PublicExitUp), i(c.PublicExitDown), i(c.PublicExitQuota), i(c.PublicExitMaxClients),
+		fmt.Sprintf("%d", c.Epoch), fmt.Sprintf("%d", c.Ts),
+	}, "|")
 }

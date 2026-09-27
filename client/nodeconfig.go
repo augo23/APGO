@@ -81,6 +81,16 @@ type SignedNodeConfig struct {
 	ExitDown   *int64 `json:"exit_down_bps,omitempty"`
 	ExitQuota  *int64 `json:"exit_quota_bytes,omitempty"`
 
+	// Public exit node (pubexit_server.go): share this node's internet with
+	// any APGO user. Version-2 fields: a record that sets any of them is
+	// signed as OVLYNODECFG2 (see canonicalNodeConfig), which older nodes
+	// cannot verify and therefore ignore as a whole.
+	PublicExit           *bool  `json:"public_exit,omitempty"`
+	PublicExitUp         *int64 `json:"public_exit_up_bps,omitempty"`
+	PublicExitDown       *int64 `json:"public_exit_down_bps,omitempty"`
+	PublicExitQuota      *int64 `json:"public_exit_quota_bytes,omitempty"`
+	PublicExitMaxClients *int64 `json:"public_exit_max_clients,omitempty"`
+
 	Epoch int64  `json:"epoch"`
 	Ts    int64  `json:"ts"`
 	Sig   string `json:"sig"`
@@ -118,13 +128,35 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	if c.Trackers != nil {
 		trackers = strings.Join(*c.Trackers, ",")
 	}
-	return fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
+	v1 := fmt.Sprintf("OVLYNODECFG1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%d|%d",
 		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
 		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
 		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
 		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
 		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
 		c.Epoch, c.Ts)
+	// NOTE: the v1 format string above has one %s too few, so ExitQuota
+	// renders as "%!d(string=…)" and Ts as "%!(EXTRA int64=…)". Every field is
+	// still covered, and existing signatures were made over exactly this
+	// string — it must never be "fixed".
+	//
+	// Version 2 only when a version-2 field is present, so every existing
+	// record keeps its exact signed string. It is a separately built, well
+	// formed string. Stripping the v2 fields from a v2 record (or adding them
+	// to a v1 one) changes the version and breaks the signature.
+	if c.PublicExit == nil && c.PublicExitUp == nil && c.PublicExitDown == nil &&
+		c.PublicExitQuota == nil && c.PublicExitMaxClients == nil {
+		return v1
+	}
+	return strings.Join([]string{"OVLYNODECFG2",
+		c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
+		trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+		str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
+		i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
+		i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
+		b(c.PublicExit), i(c.PublicExitUp), i(c.PublicExitDown), i(c.PublicExitQuota), i(c.PublicExitMaxClients),
+		fmt.Sprintf("%d", c.Epoch), fmt.Sprintf("%d", c.Ts),
+	}, "|")
 }
 
 var (
@@ -228,6 +260,21 @@ func effectiveNodeConfig(self string) SignedNodeConfig {
 		}
 		if mine.ExitNode != nil {
 			out.ExitNode = mine.ExitNode
+		}
+		if mine.PublicExit != nil {
+			out.PublicExit = mine.PublicExit
+		}
+		if mine.PublicExitUp != nil {
+			out.PublicExitUp = mine.PublicExitUp
+		}
+		if mine.PublicExitDown != nil {
+			out.PublicExitDown = mine.PublicExitDown
+		}
+		if mine.PublicExitQuota != nil {
+			out.PublicExitQuota = mine.PublicExitQuota
+		}
+		if mine.PublicExitMaxClients != nil {
+			out.PublicExitMaxClients = mine.PublicExitMaxClients
 		}
 		if mine.Trackers != nil {
 			out.Trackers = mine.Trackers
@@ -392,6 +439,14 @@ func nodeConfigSnapshot(pubB64 string) map[string]any {
 		"exit_up_bps":       derefI(eff.ExitUp),
 		"exit_down_bps":     derefI(eff.ExitDown),
 		"exit_quota_bytes":  derefI(eff.ExitQuota),
+		// Public exit node: the effective setting, plus the live state for
+		// this node (a request can be refused — prerequisites, NAT).
+		"public_exit":              deref(eff.PublicExit),
+		"public_exit_up_bps":       derefI(eff.PublicExitUp),
+		"public_exit_down_bps":     derefI(eff.PublicExitDown),
+		"public_exit_quota_bytes":  derefI(eff.PublicExitQuota),
+		"public_exit_max_clients":  derefI(eff.PublicExitMaxClients),
+		"public_exit_live":         publicExitLiveFor(pubB64),
 	}
 }
 
@@ -542,6 +597,33 @@ func applyNodeConfigLive(c SignedNodeConfig, source string) {
 		}
 	}
 
+	// Public exit last: it depends on the DHT and the public relay above.
+	if gPubExit != nil && (c.PublicExit != nil || c.PublicExitUp != nil || c.PublicExitDown != nil ||
+		c.PublicExitQuota != nil || c.PublicExitMaxClients != nil) {
+		req := publicExitRequest{Enabled: c.PublicExit}
+		st := gPubExit.limits.Status()
+		fmtp := func(p *int64, cur int64) *string {
+			v := cur
+			if p != nil {
+				v = *p
+			}
+			s := fmt.Sprintf("%d", v)
+			return &s
+		}
+		req.Up = fmtp(c.PublicExitUp, st.UpLimitBps)
+		req.Down = fmtp(c.PublicExitDown, st.DownLimitBps)
+		req.Quota = fmtp(c.PublicExitQuota, st.QuotaBytes)
+		if c.PublicExitMaxClients != nil {
+			n := int(*c.PublicExitMaxClients)
+			req.MaxClients = &n
+		}
+		if err := applyPublicExitRequest(req); err != nil {
+			log.Printf("[nodecfg] public exit node not changed: %v", err)
+		} else if c.PublicExit != nil {
+			changed = append(changed, fmt.Sprintf("public_exit=%v", *c.PublicExit))
+		}
+	}
+
 	if len(changed) > 0 {
 		log.Printf("[nodecfg] applied (%s, epoch %d): %s", source, c.Epoch, strings.Join(changed, " "))
 	}
@@ -554,4 +636,15 @@ func relayHasAnyLimit() bool {
 	}
 	s := gBandwidth.Status()
 	return s.UpLimitBps > 0 || s.DownLimitBps > 0 || s.QuotaBytes > 0
+}
+
+// publicExitLiveFor reports this node's live public-exit state for the
+// dashboard (only meaningful for this node's own key).
+func publicExitLiveFor(pubB64 string) map[string]any {
+	if pubB64 != selfPubB64() {
+		return nil
+	}
+	st := publicExitStatus()
+	return map[string]any{"enabled": st.Enabled, "error": st.Error, "prerequisite": st.Prerequisite,
+		"clients": st.Clients}
 }

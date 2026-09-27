@@ -21,6 +21,7 @@ package main
 import (
 	"errors"
 	"net"
+	"strings"
 )
 
 // physIfIndex caches the physical default interface's index, captured by
@@ -56,4 +57,35 @@ func physicalDefaultInterface() (*net.Interface, error) {
 		}
 	}
 	return nil, errors.New("could not match the default-route source address to an interface")
+}
+
+// parseDefaultRoute picks the unscoped default route (no "I" flag) on a
+// non-tunnel interface from `netstat -rn` output, falling back to a scoped one.
+func parseDefaultRoute(out string) (gw, ifname string) {
+	var scopedGW, scopedIf string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[0] != "default" {
+			continue
+		}
+		g, flags, nif := f[1], f[2], f[3]
+		if strings.HasPrefix(nif, "utun") || strings.HasPrefix(nif, "ipsec") || !strings.Contains(flags, "G") {
+			continue
+		}
+		host := g
+		if i := strings.IndexByte(host, '%'); i >= 0 {
+			host = host[:i]
+		}
+		if net.ParseIP(host) == nil {
+			continue // "link#N" and the like
+		}
+		if strings.Contains(flags, "I") {
+			if scopedGW == "" {
+				scopedGW, scopedIf = g, nif
+			}
+			continue
+		}
+		return g, nif
+	}
+	return scopedGW, scopedIf
 }

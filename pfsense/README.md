@@ -53,7 +53,7 @@ device + ifconfig/route), added alongside the Linux/macOS/Windows ones.
   APGO interface rules, and add an Outbound NAT rule on LAN for the overlay
   subnet so replies return (or add a matching static route on LAN hosts).
 
-## Exit node (full-VPN outproxy)
+## Internal exit node (full-VPN outproxy for your network)
 
 `exit_node: true` works, but unlike Linux the NAT isn't set up automatically
 (that path uses iptables). Add it in the GUI once: Firewall → NAT → Outbound
@@ -61,6 +61,32 @@ device + ifconfig/route), added alongside the Linux/macOS/Windows ones.
 your `overlay_cidr` (e.g. `10.22.55.0/24`) → WAN address. Devices that enable
 "Route all traffic via an exit node" will then egress through your pfSense
 WAN.
+
+## Public exit node
+
+A public exit shares your WAN with **any APGO user** (public internet only).
+pfSense manages pf itself, so the client cannot install the rules; add them
+once, then set `public_exit_manual_nat: true` (plus `dht: true`,
+`public_relay: true`, `public_exit: true`). The client refuses to start the
+service until you confirm this.
+
+The client pool is `198.18.0.0/15` (or `100.127.0.0/16` if 198.18/15 is
+already used on this box — the log line `[public-exit]` names the one chosen).
+
+1. **Firewall → NAT → Outbound** (Hybrid mode): add a rule translating source
+   = the client pool → WAN address.
+2. **Firewall → Rules**, on the interface the overlay tun is assigned to (or
+   *Floating*, direction *in*, quick), **in this order**:
+   - block, source = client pool, destination = *This Firewall (self)*;
+   - block, source = client pool, destination = an alias containing
+     `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16
+     127.0.0.0/8 224.0.0.0/4 240.0.0.0/4 0.0.0.0/8 198.18.0.0/15` and your
+     overlay subnet;
+   - block, source = client pool, destination port 25 (TCP);
+   - pass, source = client pool, destination = any.
+
+The client also filters every packet itself (public destinations only, TCP /
+UDP / ICMP echo, rate and bandwidth limits); these rules are the second layer.
 
 ## Updates & pfSense upgrades
 

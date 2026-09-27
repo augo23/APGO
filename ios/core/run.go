@@ -49,6 +49,7 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	overlayCIDR = cfg.OverlayCIDR
 	pqEnabled = cfg.PostQuantum
 	pqAuth = cfg.PQAuth
+	applyIPBindingConfig(cfg.IPBinding)
 	ipv6Enabled = cfg.IPv6
 	applyPolicyFile() // admin-signed network policy overrides the PQ default
 	gConfigTrackers = cfg.Trackers
@@ -59,6 +60,9 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 
 	// Trust the admin public key (from ADMIN_PUBLIC_KEY env, set by the bridge)
 	// and load any persisted revocations before traffic starts.
+	// Pin the admin key first (ADMIN_KEY_FP, set by the bridge from the join
+	// QR), so a peer can't seed a different one (adminpin.go).
+	applyAdminKeyPin("")
 	loadAdminPublicKey()
 
 	if pf := os.Getenv("PROVISIONS_FILE"); pf != "" {
@@ -161,6 +165,19 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				handleRelayPacket(append([]byte(nil), buf[:n]...), raddr)
 				continue
 			}
+			// Public exit nodes (pubexit_client.go): never reaches the overlay.
+			if buf[0] == PktPubExit {
+				handlePubExitPacket(append([]byte(nil), buf[:n]...), raddr)
+				continue
+			}
+			// NAT-spray probes/replies (natspray.go): plaintext frames from a
+			// peer we have no session with yet, so they are demuxed here and
+			// not through the control-frame path, which only sees decrypted
+			// session payloads. PSK-keyed MAC checked before we answer.
+			if isNATSprayDatagram(buf[:n]) {
+				handleNATSprayDatagram(append([]byte(nil), buf[:n]...), raddr)
+				continue
+			}
 			if !isOverlayPacket(buf[0]) {
 				continue
 			}
@@ -197,6 +214,8 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			if useExit && isInternetDst(dst) {
 				if ea, es := currentExit(); ea != nil {
 					_ = sendPacket(udpConn, ea, es, ip)
+				} else if pxClientSend(ip) {
+					// carried by a public exit node
 				} else {
 					// Dropping here is correct — never leak traffic the user
 					// asked to be tunnelled straight out the physical
@@ -214,14 +233,22 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 					// trust every writer. Mirrors client/main.go.
 					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "egress") {
 						// PQ wrapping (if enabled + ready) happens inside sendPacket.
-						_ = sendPacket(udpConn, a, s, ip)
-						continue
+						// A relay next hop gets the packet sealed end-to-end
+						// for the destination (e2erelay.go).
+						if sent, _ := sendOverlayViaSession(udpConn, a, s, ip, dst); sent {
+							continue
+						}
+					} else {
+						ipLearning.ForgetAddr(a)
 					}
-					ipLearning.ForgetAddr(a)
 				}
 			}
 
-			relayFrame := append(append(append([]byte{}, ctlMagic...), 'R'), ip...)
+			// End-to-end sealed copy for every direct peer; only the
+			// destination can open it. No verifiable destination key: nothing
+			// is flooded (the raw copy and the plaintext 'R' frame this
+			// replaced exposed the payload to every peer).
+			relayFrame, sealed := buildE2EFrame(ip)
 
 			var connectReq []byte
 			if dst != "" && dst != myOverlayIP {
@@ -234,8 +261,9 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				// Broadcast of real payload to every direct peer — the easiest
 				// place to leak data to a pending device. Admitted peers only.
 				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && admissionOK(s.peerStatic, "egress-flood") {
-					_ = sendPacket(udpConn, addr, s, ip)
-					_ = sendPacket(udpConn, addr, s, relayFrame)
+					if sealed {
+						_ = sendPacket(udpConn, addr, s, relayFrame)
+					}
 					if connectReq != nil {
 						_ = sendPacket(udpConn, addr, s, connectReq)
 					}
@@ -266,6 +294,14 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 	gTransportDeliver = func(p []byte, ra *net.UDPAddr) {
 		handleTransportPacket(p, ra, kp, psk)
 	}
+	// Public exit nodes: used for full VPN when allowed and no exit on this
+	// network is reachable.
+	pxUsePublic.Store(cfg.UsePublicExits)
+	pxc := startPubExitClient()
+	for _, ep := range cfg.StaticPublicExits {
+		pxc.AddCandidate(ep)
+	}
+
 	rc := startRelayClient(udpConn, relayGroupKey(cfg.NetworkName, psk), port, kp, psk)
 	rc.SetEnabled(cfg.UseRelays == nil || *cfg.UseRelays)
 	for _, ep := range cfg.StaticRelays {
@@ -341,6 +377,7 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			// address. Check on the tick as well as on gossip arrival, so the
 			// state is re-evaluated even on a quiet network (see ipclaim.go).
 			resolveOverlayIPCollision("tick")
+			checkSelfAddressVerifiable()
 			// Rebuild the keepalive payload each tick (matches the desktop
 			// client) so a live overlay-address change is reflected
 			// immediately instead of advertising the stale IP forever.
@@ -363,7 +400,7 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 				if seed != nil {
 					_ = sendPacket(GlobalConn, addr, s, seed)
 				}
-				if sealed != nil {
+				if sealed != nil && mayReceiveAdminSecrets(s.peerStatic) {
 					_ = sendPacket(GlobalConn, addr, s, sealed)
 				}
 				if exitAd != nil {

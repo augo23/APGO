@@ -37,8 +37,15 @@ NETWORK_NAME=apgo-$(rand 6 | tr -dc 'a-z0-9' | cut -c1-8)
 PSK=base64:$(rand 32)
 OVERLAY_CIDR=10.22.55.0/24
 FRIENDLY_NAME=$(hostname)
-# Set EXIT_NODE=1 to make this host an internet exit / outproxy.
+# Set EXIT_NODE=1 to make this host an INTERNAL exit node (this network only).
 EXIT_NODE=
+# Set PUBLIC_EXIT=1 (with DHT=1 and PUBLIC_RELAY=1) to share this host's
+# internet with ANY APGO user — public internet only, from this host's IP.
+PUBLIC_EXIT=
+DHT=
+PUBLIC_RELAY=
+PUBLIC_EXIT_UP_LIMIT=
+PUBLIC_EXIT_DOWN_LIMIT=
 # Optional HTTPS discovery servers for BitTorrent-blocked networks (comma list).
 RENDEZVOUS_SERVERS=
 # Admin dashboard login (blank = create one on first visit).

@@ -248,7 +248,8 @@ func getIPConflict() *ipConflictRecord {
 // our address any more (the other node moved, or its provision was reissued).
 func clearIPConflictIfSettled() {
 	ipConflictMu.Lock()
-	stale := ipConflictLast != nil && !ipConflictLast.Resolved
+	// The ip-binding warning is not a collision; ipbinding.go clears it.
+	stale := ipConflictLast != nil && !ipConflictLast.Resolved && ipConflictLast.Source != ipBindingSelfSource
 	ipConflictMu.Unlock()
 	if !stale {
 		return
@@ -318,6 +319,15 @@ func resolveOverlayIPCollision(trigger string) {
 		who = best.name + " (" + best.fp + ")"
 	}
 	selfFP := peerKeyFingerprint(gKP.pub[:])
+	// An admin assignment of this address to another key is the operator's
+	// latest word — the provision store keeps only the newest assignment per
+	// address, so if one names someone else, this node's claim (derived,
+	// pinned, or an older assignment) is over. Give the address up and move to
+	// a free derived one, whether or not the other node is online right now.
+	if best.provisoned {
+		moveOffAssignedAddress(mine, who, selfFP, best, trigger)
+		return
+	}
 	if !best.live {
 		// GHOST CLAIM. Nothing has heard from the claiming key — no session, no
 		// roster entry — so there is no second device to collide with. This is
@@ -427,4 +437,42 @@ func haveEstablishedSession() bool {
 		}
 	}
 	return false
+}
+
+// moveOffAssignedAddress moves this node off mine, which an admin has assigned
+// to another key, onto the next free derived address — live.
+func moveOffAssignedAddress(mine, who, selfFP string, best ipClaim, trigger string) {
+	newCIDR, ok := nextFreeDerivedAddress()
+	if !ok {
+		log.Printf("[conflict] overlay address %s is assigned by the admin to %s, and no free derived "+
+			"alternative was found — assign this node an address in the admin panel.", mine, who)
+		setIPConflict(ipConflictRecord{
+			OldIP: mine, PeerFP: best.fp, PeerName: best.name, Resolved: false,
+			SelfFP: selfFP, Source: best.source,
+			Reason: "Overlay address " + mine + " is assigned by the admin to " + who +
+				", and no free alternative could be derived. Assign this device an address in the admin panel.",
+		})
+		return
+	}
+	log.Printf("[conflict] overlay address %s is assigned by the admin to %s — moving this node to %s "+
+		"[trigger=%s]. To keep %s on this node instead, assign it to this node's key %s in the admin panel.",
+		mine, who, newCIDR, trigger, mine, selfFP)
+	if !applyAddressLive(newCIDR) {
+		setIPConflict(ipConflictRecord{
+			OldIP: mine, PeerFP: best.fp, PeerName: best.name, Resolved: false,
+			SelfFP: selfFP, Source: best.source,
+			Reason: "Overlay address " + mine + " is assigned by the admin to " + who +
+				", but this device could not switch its tunnel to " + stripMask(newCIDR) +
+				". Restart the client, or assign this device an address in the admin panel.",
+		})
+		return
+	}
+	addrAutoDerived = true // now on a derived address; later collisions may hop again
+	setIPConflict(ipConflictRecord{
+		OldIP: mine, NewIP: stripMask(newCIDR), PeerFP: best.fp, PeerName: best.name,
+		Resolved: true, SelfFP: selfFP, Source: best.source,
+		Reason: "Overlay address " + mine + " is assigned by the admin to " + who +
+			", so this device moved to " + stripMask(newCIDR) + ". To keep " + mine +
+			" here instead, assign it to this device's key (" + selfFP + ") in the admin panel.",
+	})
 }

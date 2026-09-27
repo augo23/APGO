@@ -55,6 +55,14 @@ func setupExitNAT() error {
 	}
 	tmp.Close()
 	const anchor = "com.apple/250.ApgoExit"
+	// Our anchor only runs if the MAIN ruleset evaluates "com.apple/*" (the
+	// stock /etc/pf.conf does). pf can be enabled with an empty main ruleset —
+	// `pfctl -E` does not load pf.conf — and then the rule below loads, reads
+	// back fine, and never translates anything: clients select this exit and
+	// every reply is lost. Load the system's own pf.conf when that is the case.
+	if err := ensurePFMainAnchors(); err != nil {
+		return err
+	}
 	if out, err := runCmd("pfctl", "-a", anchor, "-f", tmp.Name()); err != nil {
 		return fmt.Errorf("pfctl load NAT rule: %v (%s)", err, out)
 	}
@@ -77,6 +85,38 @@ func setupExitNAT() error {
 		return fmt.Errorf("pf NAT rule did not take (anchor %s shows: %q)", anchor, out)
 	}
 
+	if !pfMainHasAppleNATAnchor() {
+		return fmt.Errorf("pf is running without the com.apple NAT anchor in its main ruleset, so the exit NAT rule would never apply — check /etc/pf.conf contains: nat-anchor \"com.apple/*\"")
+	}
+
 	log.Printf("[exit] macOS NAT ready — masquerading %s out %s via pf", cidr, ifi.Name)
+	return nil
+}
+
+func pfMainHasAppleNATAnchor() bool {
+	out, _ := runCmd("pfctl", "-s", "nat")
+	return strings.Contains(out, `nat-anchor "com.apple/*"`)
+}
+
+// ensurePFMainAnchors loads the stock /etc/pf.conf when pf's main ruleset
+// does not reference the com.apple anchors. That file is the system's own
+// configuration (it is what macOS itself loads), so this changes nothing a
+// default Mac does not already have.
+func ensurePFMainAnchors() error {
+	if pfMainHasAppleNATAnchor() {
+		return nil
+	}
+	conf, err := os.ReadFile("/etc/pf.conf")
+	if err != nil {
+		return fmt.Errorf("pf main ruleset has no com.apple anchors and /etc/pf.conf is unreadable: %v", err)
+	}
+	if !strings.Contains(string(conf), `nat-anchor "com.apple/*"`) {
+		return fmt.Errorf("pf main ruleset has no com.apple anchors and /etc/pf.conf does not add them " +
+			`(expected the line: nat-anchor "com.apple/*") — the exit NAT rule could never apply`)
+	}
+	if out, err := runCmd("pfctl", "-f", "/etc/pf.conf"); err != nil && !pfMainHasAppleNATAnchor() {
+		return fmt.Errorf("pfctl -f /etc/pf.conf: %v (%s)", err, strings.TrimSpace(out))
+	}
+	log.Printf("[exit] loaded /etc/pf.conf so pf evaluates the com.apple anchors (it was running without them)")
 	return nil
 }

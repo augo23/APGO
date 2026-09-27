@@ -52,13 +52,18 @@ func serveSettingsForm(initial mConfig) {
 		}
 		if r.Method == http.MethodPost {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if err := saveSettingsForm(r); err != nil {
+			note, err := saveSettingsForm(r)
+			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintf(w, "<p>Save failed: %s</p>", html.EscapeString(err.Error()))
 				return
 			}
 			fmt.Fprint(w, savedPage)
-			notify("Settings saved. Click Connect to join.")
+			if note != "" {
+				notify(note)
+			} else {
+				notify("Settings saved. Click Connect to join.")
+			}
 			go func() { time.Sleep(400 * time.Millisecond); finish() }()
 			return
 		}
@@ -85,9 +90,17 @@ func serveSettingsForm(initial mConfig) {
 
 // saveSettingsForm reads the settings form and persists the config. Shared by
 // the standalone Settings window and the "/settings" route in the admin panel.
-func saveSettingsForm(r *http.Request) error {
+//
+// It returns a note for the user about Full VPN, which (unlike the other
+// settings) is applied to the running client immediately.
+func saveSettingsForm(r *http.Request) (string, error) {
 	_ = r.ParseForm()
 	c := loadConfig()
+	prevUseExit, prevExitPeer, prevNet := c.UseExit, c.ExitPeer, c.NetworkName
+	prevExitNode := c.ExitNode
+	prevPublicExit, prevUsePublic := c.PublicExit, c.UsePublicExits
+	prevPXLimits := [5]string{c.PublicExitUpLimit, c.PublicExitDownLimit, c.PublicExitQuota,
+		strconv.Itoa(c.PublicExitMaxClients), c.PublicExitPerClientLimit}
 	c.NetworkName = strings.TrimSpace(r.FormValue("network_name"))
 	c.PSK = strings.TrimSpace(r.FormValue("psk"))
 	c.FriendlyName = strings.TrimSpace(r.FormValue("friendly_name"))
@@ -96,6 +109,20 @@ func saveSettingsForm(r *http.Request) error {
 	c.IPv6 = r.FormValue("ipv6") == "on"
 	c.ExitNode = r.FormValue("exit_node") == "on"
 	c.UseExit = r.FormValue("use_exit") == "on"
+	c.UsePublicExits = r.FormValue("use_public_exits") == "on"
+	c.PublicExit = r.FormValue("public_exit") == "on"
+	c.PublicExitUpLimit = strings.TrimSpace(r.FormValue("public_exit_up"))
+	c.PublicExitDownLimit = strings.TrimSpace(r.FormValue("public_exit_down"))
+	c.PublicExitQuota = strings.TrimSpace(r.FormValue("public_exit_quota"))
+	c.PublicExitPerClientLimit = strings.TrimSpace(r.FormValue("public_exit_per_client"))
+	c.PublicExitMaxClients = 0
+	if v := strings.TrimSpace(r.FormValue("public_exit_max_clients")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1024 {
+			return "", fmt.Errorf("public exit node: max clients must be a number from 1 to 1024")
+		}
+		c.PublicExitMaxClients = n
+	}
 	// Discovery + relay switches. Written as explicit true/false (not left nil)
 	// because they are presented here as checkboxes: an unticked box is a
 	// decision, and treating it as "unset" would let a stale node-config record
@@ -105,6 +132,9 @@ func saveSettingsForm(r *http.Request) error {
 	c.DHT = &dht
 	c.UseRelays = &useRelays
 	c.PublicRelay = r.FormValue("public_relay") == "on"
+	if c.PublicExit && (!dht || !c.PublicRelay) {
+		return "", fmt.Errorf("a public exit node must also find peers through the DHT and be a public relay — tick both, or untick Public exit node")
+	}
 	c.ExitPeer = strings.TrimSpace(r.FormValue("exit_peer"))
 	c.OverlayCIDR = strings.TrimSpace(r.FormValue("overlay_cidr"))
 	if c.OverlayCIDR == "" {
@@ -141,21 +171,21 @@ func saveSettingsForm(r *http.Request) error {
 	if !adminKeyAvailable() {
 		if pw := strings.TrimSpace(r.FormValue("admin_key_password")); pw != "" {
 			if pw != strings.TrimSpace(r.FormValue("admin_key_password_confirm")) {
-				return fmt.Errorf("the network admin passwords don't match — type the same one in both boxes")
+				return "", fmt.Errorf("the network admin passwords don't match — type the same one in both boxes")
 			}
 			pub, err := genAdminKey(pw)
 			if err != nil {
-				return err
+				return "", err
 			}
 			c.AdminPublicKey = pub
 			notify("Admin key created — distributing it to your devices.")
 		}
 	} else if np := r.FormValue("admin_new_password"); np != "" {
 		if np != r.FormValue("admin_new_password_confirm") {
-			return fmt.Errorf("the new network admin passwords don't match — type the same one in both boxes")
+			return "", fmt.Errorf("the new network admin passwords don't match — type the same one in both boxes")
 		}
 		if err := changeAdminPassword(r.FormValue("admin_current_password"), np); err != nil {
-			return err
+			return "", err
 		}
 		notify("Network admin password changed — redistributing the key.")
 	}
@@ -165,35 +195,78 @@ func saveSettingsForm(r *http.Request) error {
 	// password verified, so a typo can't lock the user out.
 	if np := r.FormValue("dash_new_password"); np != "" {
 		if np != r.FormValue("dash_new_password_confirm") {
-			return fmt.Errorf("the new dashboard passwords don't match — type the same one in both boxes")
+			return "", fmt.Errorf("the new dashboard passwords don't match — type the same one in both boxes")
 		}
 		u := strings.TrimSpace(r.FormValue("dash_username"))
 		if u == "" || len(np) < 6 {
-			return fmt.Errorf("dashboard username is required and the new password must be at least 6 characters")
+			return "", fmt.Errorf("dashboard username is required and the new password must be at least 6 characters")
 		}
 		if !verifyCurrentPassword(r.FormValue("dash_current_password")) {
-			return fmt.Errorf("current dashboard password is incorrect")
+			return "", fmt.Errorf("current dashboard password is incorrect")
 		}
 		nc, err := newCreds(u, np)
 		if err == nil {
 			err = saveCreds(nc)
 		}
 		if err != nil {
-			return err
+			return "", err
 		}
 		notify("Dashboard login updated.")
 	}
 
 	applyDefaults(&c)
 	if err := saveConfig(c); err != nil {
-		return err
+		return "", err
 	}
 	// Every settings save with a network name registers/updates that network's
 	// switchable profile — this is how new networks are added: just enter the
 	// new name + PSK and Save, then switch between them in the tray's
 	// "Networks" submenu.
 	registerCurrentProfileUI()
-	return nil
+	// Full VPN and exit-node mode apply live — but only to the network the
+	// client is running, and only when the running client isn't already
+	// doing what was saved.
+	if c.NetworkName != prevNet {
+		return "", nil
+	}
+	var notes []string
+	// Exit mode first when turning Full VPN off, last when turning it on, so
+	// the two are never both active in between.
+	pushExit := func() {
+		if exitNodeDiffers(c.ExitNode, prevExitNode) {
+			if n := applyExitNodeLive(c.ExitNode); n != "" {
+				notes = append(notes, n)
+			}
+		}
+	}
+	if !c.UseExit {
+		pushExit()
+	}
+	if fullVPNDiffers(c.UseExit, c.ExitPeer, prevUseExit, prevExitPeer) {
+		if n := applyFullVPNLive(c.UseExit, c.ExitPeer); n != "" {
+			notes = append(notes, n)
+		}
+	}
+	if c.UseExit {
+		pushExit()
+	}
+	if c.UsePublicExits != prevUsePublic || usePublicDiffers(c.UsePublicExits) {
+		if n := applyUsePublicExitsLive(c.UsePublicExits); n != "" {
+			notes = append(notes, n)
+		}
+	}
+	pxLimits := [5]string{c.PublicExitUpLimit, c.PublicExitDownLimit, c.PublicExitQuota,
+		strconv.Itoa(c.PublicExitMaxClients), c.PublicExitPerClientLimit}
+	if c.PublicExit != prevPublicExit || pxLimits != prevPXLimits || publicExitDiffers(c.PublicExit) {
+		if n := applyPublicExitLive(c); n != "" {
+			notes = append(notes, n)
+		}
+	}
+	if c.UseExit && (c.ExitNode || c.PublicExit) {
+		notes = append(notes, "Note: while Full VPN is on, this computer's own traffic goes through another exit, "+
+			"so it can't reliably be an exit for other devices — turn Full VPN off on this computer to share its connection.")
+	}
+	return strings.Join(notes, " "), nil
 }
 
 func settingsPage(c mConfig) string {
@@ -227,6 +300,10 @@ func settingsPage(c mConfig) string {
 	if c.ExitNode {
 		exitNodeChecked = "checked"
 	}
+	maxClients := ""
+	if c.PublicExitMaxClients > 0 {
+		maxClients = strconv.Itoa(c.PublicExitMaxClients)
+	}
 	// All three default to OFF in the client when the key is absent, so an
 	// unset pointer must render unticked — showing them ticked would claim a
 	// node is on the DHT when it is not.
@@ -252,6 +329,13 @@ func settingsPage(c mConfig) string {
 		"{{IPV6CHECK}}", ipv6Checked,
 		"{{USEEXITCHECK}}", useExitChecked,
 		"{{EXITNODECHECK}}", exitNodeChecked,
+		"{{USEPUBLICEXITSCHECK}}", checkedIf(c.UsePublicExits),
+		"{{PUBLICEXITCHECK}}", checkedIf(c.PublicExit),
+		"{{PXUP}}", html.EscapeString(c.PublicExitUpLimit),
+		"{{PXDOWN}}", html.EscapeString(c.PublicExitDownLimit),
+		"{{PXQUOTA}}", html.EscapeString(c.PublicExitQuota),
+		"{{PXMAX}}", html.EscapeString(maxClients),
+		"{{PXPER}}", html.EscapeString(c.PublicExitPerClientLimit),
 		"{{DHTCHECK}}", dhtChecked,
 		"{{USERELAYSCHECK}}", useRelaysChecked,
 		"{{PUBLICRELAYCHECK}}", publicRelayChecked,
@@ -371,21 +455,26 @@ const settingsTmpl = `<!DOCTYPE html>
       <span id="ipprefix" style="color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:nowrap">10.22.55.</span>
       <input id="last_octet" name="last_octet" type="text" inputmode="numeric" maxlength="3" value="{{LASTOCTET}}" style="max-width:96px" spellcheck="false">
     </div>
-    <div class="hint">Type just the last number (1–254). Blank = auto-assign. The prefix follows the subnet above.</div>
+    <div class="hint">Type just the last number (1–254). Blank = auto-assign (recommended). The prefix follows the subnet above. Other devices give a manual address to the first device that uses it; assign it to this device in the admin panel to make it permanent.</div>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="exit_node" {{EXITNODECHECK}} style="width:auto"> Be an exit node — share this device's internet with the mesh
+      <input type="checkbox" name="exit_node" {{EXITNODECHECK}} style="width:auto"> Internal exit node — share this device's internet with devices on my network
     </label>
-    <div class="hint">Other devices in full-VPN mode can egress their internet traffic through this one (shown to them with a green <b style="color:#3fb950">E</b>). Works on Linux, macOS, and Windows; needs the client to run privileged. Applies on reconnect.</div>
+    <div class="hint">Devices on your own network in Full VPN mode can send their internet traffic out through this one (shown to them with a green <b style="color:#3fb950">E</b>). Works on Linux, macOS, and Windows. Applies immediately.</div>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
       <input type="checkbox" name="use_exit" {{USEEXITCHECK}} style="width:auto"> Full VPN — route all traffic via an exit node
     </label>
-    <div class="hint">Sends ALL of this device's internet traffic through an exit node on your mesh (any Linux, macOS, or Windows node with exit-node mode on). Encrypted device→exit; traffic leaves the internet from the exit's IP. Applies on reconnect.</div>
+    <div class="hint">Sends ALL of this device's internet traffic through an internal exit node on your network (any Linux, macOS, or Windows device with internal exit node on). Encrypted device→exit; traffic reaches the internet from the exit's IP. Applies immediately.</div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" name="use_public_exits" {{USEPUBLICEXITSCHECK}} style="width:auto"> Use public exit nodes when my network has none
+    </label>
+    <div class="hint">When Full VPN is on and no internal exit node is reachable, send internet traffic through a <b>public exit node</b> — another APGO user sharing their connection. It is encrypted to that node, which then sees your traffic's destinations like any VPN provider would (use HTTPS). It never reaches your network or your LAN. Applies immediately.</div>
 
     <label for="exit_peer">Exit node (blank = fastest)</label>
     <input id="exit_peer" name="exit_peer" type="text" value="{{EXITPEER}}" spellcheck="false" autocapitalize="off" placeholder="auto — fastest exit">
-    <div class="hint">Leave blank to auto-pick the fastest reachable exit (re-probed every ~5 min, switches if it goes down). Or pin ONE node — by overlay IP (e.g. 10.22.55.7), device name, or key fingerprint — to always egress there; traffic pauses rather than re-routing if it's offline.</div>
+    <div class="hint">Leave blank to auto-pick the fastest reachable internal exit (re-probed every ~5 min, switches if it goes down). Or pin ONE node — by overlay IP (e.g. 10.22.55.7), device name, or key fingerprint — to always go out there; traffic pauses rather than re-routing if it's offline. Type <b>public</b> to use public exit nodes only.</div>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
       <input type="checkbox" name="ipv6" {{IPV6CHECK}} style="width:auto"> IPv6 dual-stack transport
@@ -406,6 +495,38 @@ const settingsTmpl = `<!DOCTYPE html>
       <input type="checkbox" name="public_relay" {{PUBLICRELAYCHECK}} style="width:auto"> Be a public relay for others
     </label>
     <div class="hint">Offers this device as one of those volunteer relays, for anyone — not just your own network. It carries opaque encrypted traffic for strangers and uses your bandwidth; the dashboard's node settings can cap the rate and set a monthly quota. Worth enabling only on a machine with a good connection that stays online. Applies on reconnect.</div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
+      <input type="checkbox" id="public_exit" name="public_exit" {{PUBLICEXITCHECK}} style="width:auto"> Public exit node — share this device's internet with any APGO user
+    </label>
+    <div class="hint" id="public_exit_hint">Lets <b>anyone</b> running APGO use this connection for their internet traffic (Full VPN). They reach the <b>internet only</b>: your network, your LAN and this device itself stay blocked, outbound mail (port 25) is blocked, and every client is rate-limited. <b>Their traffic leaves from your IP address</b> — only enable this if you accept that. Requires <i>Find peers through the BitTorrent DHT</i> and <i>Be a public relay for others</i>.</div>
+    <div id="public_exit_limits" style="margin-left:24px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <div style="flex:1;min-width:120px"><label for="public_exit_up">Upload limit</label><input id="public_exit_up" name="public_exit_up" type="text" value="{{PXUP}}" placeholder="e.g. 20mbit" spellcheck="false"></div>
+        <div style="flex:1;min-width:120px"><label for="public_exit_down">Download limit</label><input id="public_exit_down" name="public_exit_down" type="text" value="{{PXDOWN}}" placeholder="e.g. 50mbit" spellcheck="false"></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <div style="flex:1;min-width:120px"><label for="public_exit_quota">Monthly quota</label><input id="public_exit_quota" name="public_exit_quota" type="text" value="{{PXQUOTA}}" placeholder="e.g. 200GB" spellcheck="false"></div>
+        <div style="flex:1;min-width:120px"><label for="public_exit_max_clients">Max people at once</label><input id="public_exit_max_clients" name="public_exit_max_clients" type="number" min="1" max="1024" value="{{PXMAX}}" placeholder="16"></div>
+        <div style="flex:1;min-width:120px"><label for="public_exit_per_client">Per person</label><input id="public_exit_per_client" name="public_exit_per_client" type="text" value="{{PXPER}}" placeholder="10mbit" spellcheck="false"></div>
+      </div>
+      <div class="hint">Separate from the relay and internal exit budgets. Blank = unlimited (per person defaults to 10 Mbit/s). Applies immediately once the DHT and public relay are running.</div>
+    </div>
+    <script>
+    (function(){
+      var px=document.getElementById('public_exit'), lim=document.getElementById('public_exit_limits'), hint=document.getElementById('public_exit_hint');
+      var dht=document.querySelector('input[name=dht]'), pr=document.querySelector('input[name=public_relay]');
+      function sync(){
+        var ok = dht.checked && pr.checked;
+        px.disabled = !ok;
+        if (!ok) px.checked = false;
+        lim.style.display = px.checked ? '' : 'none';
+        hint.style.opacity = ok ? '1' : '.6';
+      }
+      [px,dht,pr].forEach(function(e){ e.addEventListener('change', sync); });
+      sync();
+    })();
+    </script>
 
     <label for="port">UDP listen port</label>
     <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535" placeholder="automatic">

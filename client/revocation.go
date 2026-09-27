@@ -53,19 +53,34 @@ func loadAdminPublicKey() {
 	// Explicit config always wins and is never overridden by a seed.
 	if v := os.Getenv("ADMIN_PUBLIC_KEY"); v != "" {
 		if raw, err := base64.StdEncoding.DecodeString(v); err == nil && setAdminPubBytes(raw) {
-			log.Printf("[revocation] admin public key loaded from env — signed records enabled")
+			log.Printf("[revocation] admin public key loaded from env — signed records enabled (fingerprint %s)", adminKeyFingerprint(raw))
+			if pin := adminKeyPinned(); pin != "" && adminKeyFingerprint(raw) != pin {
+				log.Printf("[revocation] WARNING: ADMIN_PUBLIC_KEY does not match admin_key_fp %s — the explicit key wins; fix one of them", pin)
+			}
 			return
 		}
 		log.Printf("[revocation] ADMIN_PUBLIC_KEY is not a valid base64 ML-DSA key; ignoring")
 	}
 
-	// Otherwise fall back to a previously-seeded key on disk (TOFU).
+	// Otherwise fall back to a previously-seeded key on disk (TOFU) — but only
+	// if it matches the pinned fingerprint. A node that adopted a rogue key
+	// before a pin was configured drops it here and relearns the right one.
 	if adminPubFile != "" {
 		if data, err := os.ReadFile(adminPubFile); err == nil {
-			if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil && setAdminPubBytes(raw) {
-				log.Printf("[revocation] admin public key loaded (previously seeded)")
+			if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil && adminPubValid(raw) {
+				if pin := adminKeyPinned(); pin != "" && adminKeyFingerprint(raw) != pin {
+					log.Printf("[revocation] DISCARDING previously seeded admin key %s: it does not match the pinned fingerprint %s",
+						adminKeyFingerprint(raw), pin)
+					_ = os.Remove(adminPubFile)
+				} else if setAdminPubBytes(raw) {
+					log.Printf("[revocation] admin public key loaded (previously seeded) — fingerprint %s", adminKeyFingerprint(raw))
+				}
 			}
 		}
+	}
+	if adminKeyPinned() == "" && !adminKeySet() && adminTOFUAllowed() {
+		log.Printf("[revocation] WARNING: no admin key and no admin_key_fp pin — this node will trust the FIRST admin key a peer offers. " +
+			"Join by QR from an updated admin panel, or set ADMIN_KEY_FP, to pin it.")
 	}
 }
 
@@ -75,7 +90,7 @@ func setAdminPub(raw []byte, persist bool) {
 		return
 	}
 	if persist && adminPubFile != "" {
-		_ = os.WriteFile(adminPubFile, []byte(base64.StdEncoding.EncodeToString(raw)), 0o644)
+		_ = os.WriteFile(adminPubFile, []byte(base64.StdEncoding.EncodeToString(raw)), 0o644) // public; the desktop app (running as the user) reads it
 	}
 }
 
@@ -90,8 +105,16 @@ func adoptSeededAdminPub(b64, source string) {
 	if err != nil || !adminPubValid(raw) {
 		return
 	}
+	if !adminKeyPinAllows(raw) {
+		noteAdminSeedRefused(raw, source)
+		return
+	}
 	setAdminPub(raw, true)
-	log.Printf("[revocation] adopted seeded admin public key %s from peer %s (trust-on-first-use)", peerKeyFingerprint(raw), source)
+	how := "trust-on-first-use"
+	if adminKeyPinned() != "" {
+		how = "matches pinned fingerprint"
+	}
+	log.Printf("[revocation] adopted seeded admin public key %s from peer %s (%s)", adminKeyFingerprint(raw), source, how)
 	if rf := os.Getenv("REVOCATIONS_FILE"); rf != "" {
 		revocations.load(rf) // re-verify any persisted records now that we trust a key
 	}

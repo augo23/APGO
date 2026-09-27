@@ -96,13 +96,18 @@ func startAdminServer() {
 	}))
 	mux.HandleFunc("/settings", requirePage(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			if err := saveSettingsForm(r); err != nil {
+			note, err := saveSettingsForm(r)
+			if err != nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintf(w, "<p>Save failed: %s</p>", htmlEsc(err.Error()))
 				return
 			}
-			notify("Settings saved. Reconnect to apply.")
+			if note != "" {
+				notify("Settings saved. " + note + " Other changes apply after Disconnect and Connect.")
+			} else {
+				notify("Settings saved. Reconnect to apply.")
+			}
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
@@ -617,7 +622,12 @@ func adminKeyPageHTML() string {
 		body = `<p>Put this on <b>every</b> node (same value everywhere, like the PSK)
 		as <code>ADMIN_PUBLIC_KEY</code>, then reconnect, to enable network-wide
 		signed revocations:</p>
-		<textarea readonly onclick="this.select()" style="width:100%;height:70px">ADMIN_PUBLIC_KEY=` + htmlEsc(pub) + `</textarea>`
+		<textarea readonly onclick="this.select()" style="width:100%;height:70px">ADMIN_PUBLIC_KEY=` + htmlEsc(pub) + `</textarea>
+		<p>Its fingerprint. Devices that join with the join QR pin it automatically;
+		on nodes configured by hand set it as <code>ADMIN_KEY_FP</code> (or
+		<code>admin_key_fp</code> in the config) so they refuse any other admin
+		key a peer offers:</p>
+		<textarea readonly onclick="this.select()" style="width:100%;height:48px">ADMIN_KEY_FP=` + htmlEsc(adminKeyFingerprintB64(pub)) + `</textarea>`
 	}
 	return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>APGO admin key</title>
 <style>body{background:#000;color:#fff;font:15px/1.6 -apple-system,system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 20px}

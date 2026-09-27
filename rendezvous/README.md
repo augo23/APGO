@@ -102,3 +102,21 @@ and is a cheap way to verify one is correct.
 **Always run this behind TLS.** Both schemes send the secret in a header; the
 auth protects the *service* from abuse and endpoint enumeration, not the
 overlay itself — network membership stays gated by the Noise handshake + PSK.
+
+## Abuse protection
+
+- **Endpoints are bound to the caller's address.** A node may only announce an
+  endpoint whose IP is the address its request came from (the port is its own
+  NAT mapping). Announcements the server can't check — a dual-stack node
+  reaching it over IPv6 while announcing IPv4, or a node on the server's own
+  LAN — are accepted but capped at 4 per client per network, so nobody can
+  point a network at a victim's address or fill it with fake peers.
+- **Rate limit:** 2 requests/second per client IP, burst 30 (`RATE_PER_SECOND`,
+  `RATE_BURST`). Nodes announce about once a minute, so a large site behind one
+  NAT fits easily.
+- **Behind a reverse proxy / Cloudflare Tunnel:** when the direct peer is a
+  local proxy (loopback or private address), the client IP is read from
+  `CF-Connecting-IP`, `X-Real-IP` or the last hop of `X-Forwarded-For`.
+  `TRUST_PROXY_HEADERS=0` disables that; `=1` trusts the headers from any peer
+  (only if the server is reachable solely through the proxy).
+

@@ -105,9 +105,11 @@ func ExitsJSON() string {
 	}
 
 	b, err := json.Marshal(map[string]any{
-		"use_exit": useExitNow,
-		"pin":      pin,
-		"exits":    out,
+		"use_exit":         useExitNow,
+		"pin":              pin,
+		"exits":            out,
+		"use_public_exits": pxUsePublic.Load(),
+		"public_exit":      pubExitClientStatus(),
 		// Why full-VPN traffic is not moving, in one sentence, or "" when an
 		// exit is selected and usable. The exits array alone cannot express
 		// this: an EMPTY array is the most common failure and says nothing

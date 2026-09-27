@@ -200,7 +200,8 @@ func registerMultinetPanel(mux *http.ServeMux) {
 		name := strings.ReplaceAll(r.URL.Query().Get("name"), "&", "")
 		proxyCtl(w, "GET", "/api/network-profile?name="+name, nil)
 	}))
-	for _, ep := range []string{"/api/network-add", "/api/network-remove", "/api/network-set"} {
+	mux.HandleFunc("/api/network-set", apiAuth(handlePanelNetworkSet))
+	for _, ep := range []string{"/api/network-add", "/api/network-remove"} {
 		ep := ep
 		mux.HandleFunc(ep, apiAuth(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {

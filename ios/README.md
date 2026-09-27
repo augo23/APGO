@@ -92,10 +92,12 @@ peers still connect via trackers/relay like any remote node.
 
 ## Full VPN (exit node) checklist
 
-"Route all traffic via an exit node" needs **at least one node on the mesh
-running with `exit_node: true`** (a Linux server or desktop — phones can't be
-exits). Without one, there is nowhere to send internet traffic and the phone
-will appear offline while connected. Toggling it while connected now restarts
+"Route all traffic via an exit node" needs **at least one internal exit node
+on your network** (`exit_node: true` / "Internal exit node" — a Linux server or
+desktop; phones can't be exits), or **"Use public exit nodes"** turned on so
+the phone can fall back to a public exit run by another APGO user. Without
+either, there is nowhere to send internet traffic and the phone will appear
+offline while connected. Toggling it while connected now restarts
 the tunnel automatically (the extension only reads config at start).
 
 ## How the core is wired

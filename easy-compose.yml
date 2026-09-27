@@ -24,8 +24,25 @@ services:
       # --- optional ---
       - OVERLAY_CIDR=${OVERLAY_CIDR:-10.22.55.0/24}
       - FRIENDLY_NAME=${FRIENDLY_NAME:-}
-      # Set EXIT_NODE=1 to make this host an internet exit / outproxy.
+      # Set EXIT_NODE=1 to make this host an INTERNAL exit node (devices on
+      # this network can route their internet through it).
       - EXIT_NODE=${EXIT_NODE:-}
+      # An exit only forwards to the public internet. Set EXIT_ALLOW_LAN=1 to
+      # also let overlay devices reach this host's private networks (LAN,
+      # link-local, cloud metadata) through it.
+      - EXIT_ALLOW_LAN=${EXIT_ALLOW_LAN:-}
+      # Set PUBLIC_EXIT=1 to share this host's internet with ANY APGO user
+      # (public internet only; needs DHT=1 and PUBLIC_RELAY=1). Their traffic
+      # leaves from this host's IP address.
+      - PUBLIC_EXIT=${PUBLIC_EXIT:-}
+      - DHT=${DHT:-}
+      - PUBLIC_RELAY=${PUBLIC_RELAY:-}
+      - PUBLIC_EXIT_UP_LIMIT=${PUBLIC_EXIT_UP_LIMIT:-}
+      - PUBLIC_EXIT_DOWN_LIMIT=${PUBLIC_EXIT_DOWN_LIMIT:-}
+      - PUBLIC_EXIT_QUOTA=${PUBLIC_EXIT_QUOTA:-}
+      - PUBLIC_EXIT_MAX_CLIENTS=${PUBLIC_EXIT_MAX_CLIENTS:-}
+      # Set USE_PUBLIC_EXITS=1 to let full VPN fall back to public exit nodes.
+      - USE_PUBLIC_EXITS=${USE_PUBLIC_EXITS:-}
       # Optional HTTPS discovery servers for BitTorrent-blocked networks.
       - RENDEZVOUS_SERVERS=${RENDEZVOUS_SERVERS:-}
       # Post-quantum layer + quantum-resistant handshake auth: ON by default.
@@ -38,8 +55,14 @@ services:
       - IPV6=${IPV6:-1}
       # One-shot wipe of the network admin key/password on this node. Set to 1
       # for a single boot to start fresh, then set back to blank. Reset every
-      # node together or a peer re-seeds the old key via trust-on-first-use.
+      # node together (and clear/replace ADMIN_KEY_FP) or a peer re-seeds the
+      # old key.
       - APGO_RESET_ADMIN=${APGO_RESET_ADMIN:-}
+      # Pin the network admin key: paste ADMIN_KEY_FP from the admin panel's
+      # "Admin key" page. A pinned node refuses any other admin key a peer
+      # offers (without it, the first key heard wins). Leave blank on the node
+      # that creates the admin key.
+      - ADMIN_KEY_FP=${ADMIN_KEY_FP:-}
       # --- fixed paths (persist on the volumes below) ---
       - NODE_KEY_FILE=/state/node.key
       - CONTROL_SOCKET=/shared/control.sock

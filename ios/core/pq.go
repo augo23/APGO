@@ -179,6 +179,7 @@ func handlePQOffer(peer [32]byte, pkb []byte) []byte {
 	pqMu.Lock()
 	pqPeers[peer] = &pqPeer{aead: aead, offerHash: h, replyCT: append([]byte(nil), ct...)}
 	pqMu.Unlock()
+	pqHealEstablished(peer)
 	log.Printf("[pq] post-quantum layer established with %s (responder)", peerKeyFingerprint(peer[:]))
 
 	out := append([]byte(nil), ctlMagic...)
@@ -206,6 +207,7 @@ func handlePQReply(peer [32]byte, ct []byte) {
 	pqMu.Lock()
 	pqPeers[peer] = &pqPeer{aead: aead}
 	pqMu.Unlock()
+	pqHealEstablished(peer)
 	log.Printf("[pq] post-quantum layer established with %s (initiator)", peerKeyFingerprint(peer[:]))
 }
 
@@ -261,9 +263,10 @@ func pqForget(peer [32]byte) {
 func isPQPacket(pt []byte) bool { return bytes.HasPrefix(pt, pqMagic) }
 
 // isPQNegotiation reports whether payload is a PQ key-exchange control frame
-// ('M' offer or 'm' reply). These must NEVER be PQ-wrapped — they bootstrap the
-// layer, so they have to travel classically inside the Noise tunnel.
+// ('M' offer, 'm' reply, or the 'j' renegotiate request — pqheal.go). These
+// must NEVER be PQ-wrapped — they bootstrap (or repair) the layer, so they
+// have to travel classically inside the Noise tunnel.
 func isPQNegotiation(payload []byte) bool {
 	n := len(ctlMagic)
-	return len(payload) > n && bytes.HasPrefix(payload, ctlMagic) && (payload[n] == 'M' || payload[n] == 'm')
+	return len(payload) > n && bytes.HasPrefix(payload, ctlMagic) && (payload[n] == 'M' || payload[n] == 'm' || payload[n] == pqResetFrame)
 }

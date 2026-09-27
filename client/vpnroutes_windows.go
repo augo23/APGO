@@ -101,3 +101,31 @@ func pinAuxUDPSocket(conn *net.UDPConn) {
 		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, sockoptIPv6UnicastIF, idx)
 	})
 }
+
+// disableFullTunnelRoutes removes the two half-default routes (full VPN
+// switched off while running). Missing routes are not an error.
+func disableFullTunnelRoutes() error {
+	if tunName == "" {
+		return nil
+	}
+	for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
+		_, _ = runCmd("netsh", "interface", "ipv4", "delete", "route",
+			"prefix="+half, "interface="+tunName)
+	}
+	log.Printf("[exit] full-tunnel routes removed")
+	return nil
+}
+
+// unpinTransport releases the interface binding set by
+// pinTransportToPhysicalInterface (0 = no binding).
+func unpinTransport(conn *net.UDPConn) {
+	physIfIndex = 0
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, sockoptIPUnicastIF, 0)
+		_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, sockoptIPv6UnicastIF, 0)
+	})
+}

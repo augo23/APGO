@@ -56,12 +56,17 @@ func handleTransportPacket(pkt []byte, raddr *net.UDPAddr, kp keypair, psk []byt
 		if s := GlobalSessions.GetByAddr(raddr); s != nil {
 			if inner, ok := pqUnwrap(s.peerStatic, pt); ok {
 				pt = inner
+				pqHealOpened(s.peerStatic)
 			} else {
+				// A run of these renegotiates the layer (pqheal.go).
+				pqHealUnopenable(s.peerStatic, raddr)
 				return
 			}
 		} else {
 			return
 		}
+	} else if s := GlobalSessions.GetByAddr(raddr); s != nil {
+		pqHealClassical(s.peerStatic, raddr, pt)
 	}
 	if bytes.HasPrefix(pt, ctlMagic) {
 		handleControl(pt[len(ctlMagic):], raddr)
@@ -74,7 +79,8 @@ func handleTransportPacket(pkt []byte, raddr *net.UDPAddr, kp keypair, psk []byt
 	// peer that is not admitted gets nothing: no TUN delivery, no relay
 	// transit, no ipLearning entry. Mirrors client/main.go.
 	// No-op when no admin key is set (admissionRequired() == false).
-	if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "ingress") {
+	s = GlobalSessions.GetByAddr(raddr)
+	if s == nil || !admissionOK(s.peerStatic, "ingress") {
 		return
 	}
 
@@ -82,50 +88,53 @@ func handleTransportPacket(pkt []byte, raddr *net.UDPAddr, kp keypair, psk []byt
 		srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
 		if srcIP == myOverlayIP {
 			// A peer keepalive carrying OUR address: record the claim
-			// against its key and let the resolver decide who moves.
-			if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
+			// against its key and let the resolver decide who moves — only
+			// if the claim is provable (ipbinding.go).
+			if s.Established() {
+				if !ipBindings.OwnedBy(s.peerStatic, srcIP, false) {
+					statRxDropIPBinding.Add(1)
+					ipBindings.noteRejected(s.peerStatic, srcIP)
+					return
+				}
 				setPeerOverlayIP(s.peerStatic, srcIP)
 				resolveOverlayIPCollision("keepalive")
 			}
 			return
 		}
-		ipLearning.Learn(srcIP, raddr)
-		if s := GlobalSessions.GetByAddr(raddr); s != nil {
-			setPeerOverlayIP(s.peerStatic, srcIP)
+		if !ipBindings.OwnedBy(s.peerStatic, srcIP, true) {
+			statRxDropIPBinding.Add(1)
+			return
 		}
+		ipLearning.Learn(srcIP, raddr)
+		notePeerAddress(s.peerStatic, srcIP)
 		return
 	}
 	if !isIPv4Packet(pt) {
 		return
 	}
-	if ifIP := extractIPv4Src(pt); ifIP != "" {
+	// SOURCE-ADDRESS BINDING: a peer may only send from an overlay address
+	// its key owns (or, as our exit, from internet addresses).
+	ifIP := extractIPv4Src(pt)
+	if !sourceAllowedFrom(s.peerStatic, ifIP) {
+		statRxDropIPBinding.Add(1)
+		return
+	}
+	if inOverlaySubnet(ifIP) {
 		ipLearning.Learn(ifIP, raddr)
 	}
 	if myOverlayIP != "" {
 		if dst := extractIPv4Dst(pt); dst != "" && dst != myOverlayIP {
 			if amExit && isInternetDst(dst) {
-				tunIF.Write(pt)
+				// Internet only — never into this exit's private networks
+				// unless EXIT_ALLOW_LAN (exit.go).
+				if exitForwardAllowed(dst) {
+					tunIF.Write(pt)
+				}
 				return
 			}
-			// Relay transit for the RETURN path. When we relay an 'R'
-			// frame, the destination learns "reach the sender via us"
-			// and sends its replies back here as ORDINARY data frames
-			// — but this branch used to just drop them, so relayed
-			// connections passed exactly one packet and then went
-			// dark. Forward one hop over a direct established
-			// session, same rules as the 'R' handler: never to/from a
-			// revoked node, and never back out the session it arrived
-			// on (split horizon — no loops).
-			if !isInternetDst(dst) &&
-				!isOverlayIPRevoked(dst) && !isOverlayIPRevoked(extractIPv4Src(pt)) {
-				if a := ipLearning.Lookup(dst); a != nil && a.String() != raddr.String() {
-					// …and admitted: never relay onward into a pending
-					// device. Mirrors client/main.go.
-					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-return") {
-						_ = sendPacket(GlobalConn, a, s, pt)
-					}
-				}
-			}
+			// Plaintext data addressed to another overlay node is never
+			// forwarded: relayed traffic travels only as end-to-end sealed
+			// 'Z' frames (e2erelay.go). Mirrors client/main.go.
 			return
 		}
 	}

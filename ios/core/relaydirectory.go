@@ -59,10 +59,15 @@ const (
 // relay, or 0 to look up without publishing. That mirrors the port argument of
 // dht.lookupPeers, so the two directory transports stay interchangeable.
 func relayDirectoryPeers(trackers []string, port int) []string {
+	return directoryPeers("relay", relayDirectoryKey(), trackers, port)
+}
+
+// directoryPeers is relayDirectoryPeers for any public directory key (the
+// public relay and public exit directories). kind only labels the log line.
+func directoryPeers(kind string, key []byte, trackers []string, port int) []string {
 	if len(trackers) == 0 {
 		return nil
 	}
-	key := relayDirectoryKey()
 	peerID := buildPeerID()
 
 	var (
@@ -138,7 +143,7 @@ func relayDirectoryPeers(trackers []string, port int) []string {
 		out = append(out, ep)
 	}
 	if len(out) > 0 {
-		log.Printf("[relay] tracker directory returned %d relay endpoint(s)", len(out))
+		log.Printf("[%s] tracker directory returned %d %s endpoint(s)", kind, len(out), kind)
 	}
 	return out
 }

@@ -202,6 +202,14 @@ type ClientConfig struct {
 	// wire format, so every node must match — disable network-wide (pq_auth:
 	// false / PQ_AUTH=0) only if the fleet still runs builds that predate it.
 	PQAuth bool `yaml:"pq_auth"`
+	// IPBinding selects how peers' overlay-address claims are verified:
+	// "strict", "tofu", or "" (auto). IP_BINDING overrides it. See ipbinding.go.
+	IPBinding string `yaml:"ip_binding"`
+	// AdminKeyFP pins the network admin key: "sha256:<base64url>" of the
+	// admin public key (shown on the admin panel and carried in the join QR).
+	// A seeded admin key that doesn't match is refused. ADMIN_KEY_FP
+	// overrides it. See adminpin.go.
+	AdminKeyFP string `yaml:"admin_key_fp"`
 	// PortPrediction enables symmetric-NAT hole punching: this node probes
 	// its NAT's port-allocation pattern and advertises a spread of predicted
 	// ports in connect signaling. Off by default (it emits a small burst of
@@ -209,6 +217,13 @@ type ClientConfig struct {
 	// PORT_PREDICTION environment variable. Only takes effect behind a
 	// symmetric NAT; port-stable NATs ignore it.
 	PortPrediction bool `yaml:"port_prediction"`
+
+	// NATSpray enables the last-resort traversal in natspray.go for the
+	// symmetric/port-restricted pairing that cannot be punched by address:
+	// the unaddressable side opens many mappings, the other probes many
+	// ports, and a hit becomes the session's path. Default ON; set false (or
+	// NAT_SPRAY=0) to keep such peers on the relay instead.
+	NATSpray *bool `yaml:"nat_spray"`
 
 	// SOCKS5 proxy (socks5.go). "host:port" enables it; empty disables.
 	// Env: SOCKS5_LISTEN / SOCKS5_USER / SOCKS5_PASS.
@@ -245,11 +260,45 @@ type ClientConfig struct {
 	// save (tiny amounts of) bandwidth; clamped to 5..120. Also settable via
 	// KEEPALIVE_SECONDS.
 	KeepaliveSeconds int `yaml:"keepalive_seconds"`
-	// ExitNode makes this node an internet exit ("outproxy"): it forwards and
-	// NATs internet-bound traffic for overlay clients (Linux only). UseExit makes
-	// this node route its OWN internet traffic through an exit (full VPN).
+	// ExitNode makes this node an INTERNAL exit node: it forwards and NATs
+	// internet-bound traffic for devices admitted to its own network(s).
+	// UseExit makes this node route its OWN internet traffic through an exit
+	// (full VPN).
 	ExitNode bool `yaml:"exit_node"`
-	UseExit  bool `yaml:"use_exit"`
+	// ExitAllowLAN lets this exit forward overlay clients into its private
+	// networks (LAN, link-local, cloud metadata). Off by default; see exit.go.
+	// EXIT_ALLOW_LAN overrides it.
+	ExitAllowLAN bool `yaml:"exit_allow_lan"`
+	UseExit      bool `yaml:"use_exit"`
+	// UsePublicExits lets full VPN fall back to PUBLIC exit nodes (other APGO
+	// users sharing their connection, pubexit_client.go) when no internal exit
+	// is reachable. exit_peer "public" uses public exits only.
+	// Env: USE_PUBLIC_EXITS (1/0).
+	UsePublicExits bool `yaml:"use_public_exits"`
+	// StaticPublicExits are public exit endpoints ("host:port") to try in
+	// addition to the ones found in the DHT and on trackers.
+	// Env: STATIC_PUBLIC_EXITS (comma-separated).
+	StaticPublicExits []string `yaml:"static_public_exits"`
+	// PublicExit makes this node a PUBLIC exit node: it shares its internet
+	// connection — internet only, nothing else — with any APGO user
+	// (pubexit_server.go). Requires dht and public_relay. OFF by default.
+	// Env: PUBLIC_EXIT (1/0), PUBLIC_EXIT_UP_LIMIT, PUBLIC_EXIT_DOWN_LIMIT,
+	// PUBLIC_EXIT_QUOTA, PUBLIC_EXIT_MAX_CLIENTS, PUBLIC_EXIT_PER_CLIENT_LIMIT.
+	PublicExit               bool   `yaml:"public_exit"`
+	PublicExitUpLimit        string `yaml:"public_exit_up_limit"`
+	PublicExitDownLimit      string `yaml:"public_exit_down_limit"`
+	PublicExitQuota          string `yaml:"public_exit_quota"`
+	PublicExitQuotaDays      int    `yaml:"public_exit_quota_days"`
+	PublicExitMaxClients     int    `yaml:"public_exit_max_clients"`
+	PublicExitPerClientLimit string `yaml:"public_exit_per_client_limit"`
+	// PublicExitBlockPorts are destination ports public-exit clients may not
+	// use. Unset = [25] (outbound SMTP, the classic spam vector).
+	PublicExitBlockPorts []int `yaml:"public_exit_block_ports"`
+	// PublicExitManualNAT confirms, on pfSense/FreeBSD, that the operator has
+	// added the public exit's NAT and block rules in the firewall GUI (this
+	// process cannot manage pf there). Ignored elsewhere.
+	// Env: PUBLIC_EXIT_MANUAL_NAT (1/0).
+	PublicExitManualNAT bool `yaml:"public_exit_manual_nat"`
 	// ExitPeer pins WHICH exit carries this node's internet traffic when
 	// use_exit is on. Blank (default) = automatic: the fastest reachable exit,
 	// re-probed every ~5 minutes. Set it to a specific node's overlay IP,
@@ -608,6 +657,42 @@ func loadConfig() (*ClientConfig, error) {
 	if v := strings.TrimSpace(os.Getenv("PUBLIC_RELAY")); v == "1" || strings.EqualFold(v, "true") {
 		cfg.PublicRelay = true
 	}
+	if v := strings.TrimSpace(os.Getenv("PUBLIC_EXIT")); v != "" {
+		cfg.PublicExit = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	if v := strings.TrimSpace(os.Getenv("NAT_SPRAY")); v != "" {
+		b := v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		cfg.NATSpray = &b
+	}
+	if v := strings.TrimSpace(os.Getenv("PUBLIC_EXIT_MANUAL_NAT")); v != "" {
+		cfg.PublicExitManualNAT = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	if v := strings.TrimSpace(os.Getenv("USE_PUBLIC_EXITS")); v != "" {
+		cfg.UsePublicExits = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	for env, dst := range map[string]*string{
+		"PUBLIC_EXIT_UP_LIMIT":         &cfg.PublicExitUpLimit,
+		"PUBLIC_EXIT_DOWN_LIMIT":       &cfg.PublicExitDownLimit,
+		"PUBLIC_EXIT_QUOTA":            &cfg.PublicExitQuota,
+		"PUBLIC_EXIT_PER_CLIENT_LIMIT": &cfg.PublicExitPerClientLimit,
+	} {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			*dst = v
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("STATIC_PUBLIC_EXITS")); v != "" {
+		cfg.StaticPublicExits = nil
+		for _, ep := range strings.Split(v, ",") {
+			if ep = strings.TrimSpace(ep); ep != "" {
+				cfg.StaticPublicExits = append(cfg.StaticPublicExits, ep)
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("PUBLIC_EXIT_MAX_CLIENTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.PublicExitMaxClients = n
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("RELAY_UP_LIMIT")); v != "" {
 		cfg.RelayUpLimit = v
 	}
@@ -908,11 +993,11 @@ func handleAddrConflict(raddr *net.UDPAddr, ip string) {
 // admin-assigned CIDR, updates this node's overlay IP, clears the pending flag,
 // and re-announces so peers relearn the mapping. Runs entirely in-process with
 // the privileges the client already holds — no restart or prompt.
-func applyAddressLive(newCIDR string) {
+func applyAddressLive(newCIDR string) bool {
 	oldIP := myOverlayIP()
 	if err := reAddressTUN(oldIP, newCIDR); err != nil {
 		log.Printf("[provision] live re-address to %s failed: %v (applies on next restart)", newCIDR, err)
-		return
+		return false
 	}
 	if ip, _, err := net.ParseCIDR(newCIDR); err == nil && ip.To4() != nil {
 		setMyOverlayIP(ip.To4().String())
@@ -929,6 +1014,7 @@ func applyAddressLive(newCIDR string) {
 			}
 		}
 	}
+	return true
 }
 
 func deriveInfoHash(networkName string) []byte {
@@ -2074,7 +2160,14 @@ func loadOrCreateKey(path string) (keypair, error) {
 		if err != nil {
 			return kp, err
 		}
-		b = bytes.TrimSpace(b)
+		// The key is written as 32 RAW random bytes. Only a file that is not
+		// exactly that is treated as text (hex, possibly with a trailing
+		// newline): trimming a raw key first stripped any leading or trailing
+		// byte that happens to be whitespace (~1 key in 20) and left the node
+		// unable to start after its first restart.
+		if len(b) != 32 {
+			b = bytes.TrimSpace(b)
+		}
 		if len(b) == 64 {
 			decoded, hexErr := hex.DecodeString(string(b))
 			if hexErr != nil {
@@ -2477,7 +2570,7 @@ func sendPacket(conn *net.UDPConn, addr *net.UDPAddr, s *session, payload []byte
 	// Post-quantum: once the ML-KEM layer is established for this peer, wrap EVERY
 	// frame in the ML-KEM AEAD — data, relayed packets, exit traffic, and the
 	// control frames that gossip the admin key — so nothing on a direct session is
-	// classical-only. The PQ negotiation frames themselves ('M'/'m') are excluded,
+	// classical-only. The PQ negotiation frames themselves ('M'/'m'/'j') are excluded,
 	// since they bootstrap the layer and must travel classically. pqWrap is a
 	// no-op (returns !ok) until the layer is ready, so pre-PQ traffic is unchanged.
 	if pqEnabled && s != nil && !isPQNegotiation(payload) {
@@ -2718,7 +2811,10 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			log.Printf("[control] recovered from panic handling a frame from %s: %v", raddr, r)
 		}
 	}()
-	if len(body) < 2 {
+	// Every frame carries at least one payload byte — except the exit
+	// announce/withdraw ('E'/'U') sent by earlier builds, which are one byte
+	// long and were silently dropped here, so no device ever saw an exit.
+	if len(body) < 2 && !(len(body) == 1 && (body[0] == 'E' || body[0] == 'U')) {
 		return
 	}
 	switch body[0] {
@@ -2792,6 +2888,10 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			handlePQReply(s.peerStatic, body[1:])
 		}
 		return
+	case pqResetFrame:
+		// The peer lost our shared ML-KEM key and asks for a fresh exchange.
+		handlePQResetRequest(raddr)
+		return
 	case 'X':
 		// Peer exchange: dial any public peers we're told about.
 		//
@@ -2853,13 +2953,25 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		handleExitPong(raddr, body[1:])
 		return
 	case 'A':
-		// Peer announces its overlay IP.
+		// Peer announces its overlay IP. The claim is only believed if the
+		// announcing KEY owns the address (ipbinding.go) — otherwise any
+		// admitted node could announce someone else's IP and have their
+		// traffic routed to it.
 		ip := string(body[1:])
 		if net.ParseIP(ip) == nil {
 			return
 		}
+		s := GlobalSessions.GetByAddr(raddr)
 		if ip == myOverlayIP() {
-			handleAddrConflict(raddr, ip)
+			// A collision is only real if the claimant can prove the address
+			// (a derived collision or a provision); an unprovable claim to our
+			// address must never make us hop.
+			if s != nil && ipBindings.OwnedBy(s.peerStatic, ip, false) {
+				handleAddrConflict(raddr, ip)
+			} else if s != nil {
+				statRxDropIPBinding.Add(1)
+				ipBindings.noteRejected(s.peerStatic, ip)
+			}
 			return
 		}
 		// Only LEARN a route to an ADMITTED peer. approvals.go promises an
@@ -2868,11 +2980,15 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// willing to send to that peer. The identity binding below still runs
 		// either way, so a pending device shows up correctly in the dashboard
 		// with its announced address — it just isn't routable yet.
-		if s := GlobalSessions.GetByAddr(raddr); s != nil {
-			if admissionOK(s.peerStatic, "announce") {
-				ipLearning.Learn(ip, raddr)
+		if s != nil {
+			if ipBindings.OwnedBy(s.peerStatic, ip, true) {
+				if admissionOK(s.peerStatic, "announce") {
+					ipLearning.Learn(ip, raddr)
+				}
+				notePeerAddress(s.peerStatic, ip) // + roster push if new
+			} else {
+				statRxDropIPBinding.Add(1)
 			}
-			setPeerOverlayIP(s.peerStatic, ip)
 		}
 		// A peer just announced itself (right after a handshake) — hand it our
 		// peer list AND the node roster so a node with fewer connections
@@ -2888,65 +3004,17 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		handleExitWithdraw(raddr)
 		return
 	case 'R':
-		// ADMISSION CONTROL for the relay path. Control frames bypass the
-		// ingress admission gate by design (an unapproved peer needs them to
-		// learn the admin key), and 'R' is a control frame carrying DATA — so
-		// without this check an unapproved node reaches the entire mesh simply
-		// by wrapping every packet in a relay frame. That is the bypass that
-		// let pending devices talk to other nodes through this one.
-		if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "relay-in") {
-			return
-		}
-
-		// Relay request: forward the inner IPv4 packet ONE hop, and only
-		// over a direct established session (never relay-of-relay, so a
-		// routing loop is impossible).
-		pkt := body[1:]
-		if !isIPv4Packet(pkt) {
-			return
-		}
-		dst := extractIPv4Dst(pkt)
-		// Never relay to OR from a revoked peer — a revoked node must not be
-		// reachable through us as an intermediary.
-		if isOverlayIPRevoked(dst) || isOverlayIPRevoked(extractIPv4Src(pkt)) {
-			return
-		}
-		if dst == myOverlayIP() {
-			// We were the destination all along (sender had no direct
-			// mapping yet). Deliver locally — and LEARN THE RETURN ROUTE.
-			//
-			// The learn step is load-bearing. A raw data frame teaches it in
-			// the decrypt loop (ipLearning.Learn on the source IP), and the
-			// discovery flood used to send BOTH a raw copy and this relay
-			// frame, so the route was always learned by whichever arrived.
-			// Dropping the raw copy to halve flood bandwidth removed the only
-			// path that taught it: this branch delivered the payload but left
-			// us with no route back, so every reply fell into the flood again.
-			// Symptom: peers visible and "connected", traffic crawling or
-			// dropping, and a direct path that never establishes.
-			if src := extractIPv4Src(pkt); src != "" && src != myOverlayIP() {
-				ipLearning.Learn(src, raddr)
-				if s := GlobalSessions.GetByAddr(raddr); s != nil {
-					setPeerOverlayIP(s.peerStatic, src)
-				}
-			}
-			statRxRelayed.Add(1)
-			statRxDelivered.Add(1)
-			tunIF.Write(pkt)
-			return
-		}
-		if a := ipLearning.Lookup(dst); a != nil {
-			// admitted() on the OUTBOUND session too: we relay only between
-			// nodes that are both admitted, so this node can never be used as
-			// a bridge into or out of a pending device.
-			if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-out") {
-				// Forward as a NORMAL data frame. The destination sees the
-				// original src IP arriving from our endpoint and learns
-				// "reach that src via this relay" — return traffic then
-				// flows back through us automatically.
-				_ = sendPacket(GlobalConn, a, s, pkt)
-			}
-		}
+		// Legacy PLAINTEXT relay frame. It carried the raw packet, so every
+		// relay could read it. Refused: relayed traffic must use the
+		// end-to-end sealed 'Z' frame (e2erelay.go).
+		refuseLegacyRelay(raddr)
+		return
+	case e2eFrameType:
+		// End-to-end sealed relay frame: deliver if it is for us (after
+		// authenticating the original sender), otherwise forward the
+		// ciphertext one hop to the destination's own session.
+		handleE2EFrame(body, raddr)
+		return
 
 	case 'C', 'K':
 		// Coordinated-connect signaling. Either destined for us (punch!) or
@@ -2997,6 +3065,32 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			}
 		}
 	}
+}
+
+// udpDispatchMu serializes dispatchUDPDatagram. The overlay's anti-replay
+// windows are written without a lock because there was exactly one reader
+// goroutine; a punched auxiliary socket (natspray.go) is a second one, so the
+// invariant is restored here rather than by adding a lock to every window.
+// Uncontended in the steady state: auxiliary sockets are rare and idle.
+var udpDispatchMu sync.Mutex
+
+// gUDPDemux is the receive path installed by the transport reader. It is a
+// closure because the overlay handler it ends in closes over the reader's
+// state (the TUN, the keypair, the session table), and hoisting all of that
+// to package scope to publish one function would be a worse trade.
+var gUDPDemux func(pkt []byte, raddr *net.UDPAddr)
+
+// dispatchUDPDatagram is the receive path for EVERY socket this node reads
+// overlay traffic on: the main one, and any auxiliary socket promoted by
+// natspray.go.
+func dispatchUDPDatagram(pkt []byte, raddr *net.UDPAddr) {
+	f := gUDPDemux
+	if f == nil || len(pkt) < 1 {
+		return
+	}
+	udpDispatchMu.Lock()
+	defer udpDispatchMu.Unlock()
+	f(pkt, raddr)
 }
 
 func extractIPv4Src(pkt []byte) string {
@@ -3341,6 +3435,10 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 		// (and act as our relay) without waiting for the first keepalive.
 		if s != nil && s.Established() && myOverlayIP() != "" {
 			_ = sendPacket(GlobalConn, addr, s, buildAddrAnnounce())
+			// The roster too: it is how the peer learns the keys of nodes it can
+			// only reach through us, and relayed traffic cannot be sealed without
+			// them. Sent by both ends, so it arrives even if one announce is lost.
+			sendRosterTo(addr)
 		}
 		// Kick off the post-quantum handshake right away so the PQ layer is up
 		// within one round-trip (not waiting for the 20s keepalive tick).
@@ -4001,6 +4099,8 @@ func main() {
 	if pqAuth {
 		log.Printf("[handshake] quantum-resistant PSK authentication ENABLED (XXpsk0) — all nodes must match")
 	}
+	applyIPBindingConfig(cfg.IPBinding)
+	applyAdminKeyPin(cfg.AdminKeyFP)
 	// Dual-stack IPv6 transport (on by default). Must be set BEFORE udpListener.
 	ipv6Enabled = cfg.IPv6
 	if v := os.Getenv("IPV6"); v != "" {
@@ -4194,13 +4294,9 @@ func main() {
 	// interface (so encrypted UDP to peers never loops back into the TUN), then
 	// steer all internet-bound traffic into the TUN with two half-default
 	// routes. On Linux this is a no-op (container/host routing handles it).
-	if useExit {
-		if err := pinTransportToPhysicalInterface(udpConn); err != nil {
-			log.Printf("[exit] could not pin transport to the physical interface: %v", err)
-		}
-		if err := enableFullTunnelRoutes(); err != nil {
-			log.Printf("[exit] could not install full-tunnel routes: %v", err)
-		}
+	// (fulltunnel.go — the same path the control API uses to switch it live.)
+	if usingExit() {
+		_ = applyUseExit(true, udpConn)
 	}
 
 	// Overlay/LAN subnet collision: a mesh whose overlay CIDR equals the
@@ -4222,7 +4318,7 @@ func main() {
 	// When an admin assigns this node a new overlay IP, apply it live and
 	// silently — the client already holds the interface, so no restart, prompt,
 	// or privilege re-elevation is needed.
-	onPendingAddress = applyAddressLive
+	onPendingAddress = func(a string) { applyAddressLive(a) }
 
 	log.Printf("[config] compression=%v", compressionCfg.Enabled)
 
@@ -4309,18 +4405,25 @@ func main() {
 				if s := GlobalSessions.GetByAddr(raddr); s != nil {
 					if inner, ok := pqUnwrap(s.peerStatic, pt); ok {
 						pt = inner
+						pqHealOpened(s.peerStatic)
 					} else {
 						// COUNTED. This drop used to be completely silent — no log,
 						// no counter — so a node whose ML-KEM layer was keyed to a
 						// superseded session generation discarded every frame while
-						// still reporting a perfectly healthy peer list.
+						// still reporting a perfectly healthy peer list. A run of
+						// these now renegotiates the layer (pqheal.go).
 						statRxDropPQ.Add(1)
+						pqHealUnopenable(s.peerStatic, raddr)
 						return
 					}
 				} else {
 					statRxDropNoSess.Add(1)
 					return
 				}
+			} else if s != nil {
+				// Unwrapped frame: from a peer that should be wrapping, a sign
+				// it lost the shared ML-KEM key (pqheal.go).
+				pqHealClassical(s.peerStatic, raddr, pt)
 			}
 			// Control frames (addr announces, relay requests, key gossip) ride
 			// inside the tunnel with a magic prefix no IPv4 packet can have.
@@ -4350,7 +4453,8 @@ func main() {
 			// Safe by construction on networks that never opted in: admitted()
 			// returns true whenever admissionRequired() is false (no admin key
 			// set), so this cannot lock anyone out of such a deployment.
-			if s := GlobalSessions.GetByAddr(raddr); s == nil {
+			s = GlobalSessions.GetByAddr(raddr)
+			if s == nil {
 				statRxDropNoSess.Add(1)
 				return
 			} else if !admissionOK(s.peerStatic, "ingress") {
@@ -4361,18 +4465,26 @@ func main() {
 			// Keepalive carrying the sender's overlay IP: [0x00][4-byte IPv4].
 			// Learn the mapping so overlay-IP routing stays current even when
 			// no data traffic flows (bare 1-byte noops from old versions fall
-			// through to the non-IPv4 drop below).
+			// through to the non-IPv4 drop below). The address is only
+			// believed if this session's key owns it (ipbinding.go).
 			if len(pt) == 5 && pt[0] == 0x00 {
 				statRxKeepalive.Add(1)
 				srcIP := net.IPv4(pt[1], pt[2], pt[3], pt[4]).String()
 				if srcIP == myOverlayIP() {
-					handleAddrConflict(raddr, srcIP)
+					if ipBindings.OwnedBy(s.peerStatic, srcIP, false) {
+						handleAddrConflict(raddr, srcIP)
+					} else {
+						statRxDropIPBinding.Add(1)
+						ipBindings.noteRejected(s.peerStatic, srcIP)
+					}
+					return
+				}
+				if !ipBindings.OwnedBy(s.peerStatic, srcIP, true) {
+					statRxDropIPBinding.Add(1)
 					return
 				}
 				ipLearning.Learn(srcIP, raddr)
-				if s := GlobalSessions.GetByAddr(raddr); s != nil {
-					setPeerOverlayIP(s.peerStatic, srcIP)
-				}
+				notePeerAddress(s.peerStatic, srcIP)
 				return
 			}
 			if !isIPv4Packet(pt) {
@@ -4382,7 +4494,16 @@ func main() {
 				statRxDropNotIPv4.Add(1)
 				return
 			}
-			if ifIP := extractIPv4Src(pt); ifIP != "" {
+			// SOURCE-ADDRESS BINDING. A peer may only send packets from an
+			// overlay address its key owns (or, as our exit node, from internet
+			// addresses). Without this any admitted node could forge another
+			// node's source address and hijack its return route.
+			ifIP := extractIPv4Src(pt)
+			if !sourceAllowedFrom(s.peerStatic, ifIP) {
+				statRxDropIPBinding.Add(1)
+				return
+			}
+			if inOverlaySubnet(ifIP) {
 				ipLearning.Learn(ifIP, raddr)
 			}
 			// We are an endpoint, not a router. When the sender doesn't yet
@@ -4398,6 +4519,12 @@ func main() {
 					// the kernel routes + NATs them out (return traffic comes back
 					// via the overlay). Otherwise it's not for us — drop it.
 					if amExit && isInternetDst(dst) {
+						// Internet only: an exit never forwards into its own
+						// private networks unless exit_allow_lan (exit.go).
+						if !exitForwardAllowed(dst) {
+							statRxDropExitPolicy.Add(1)
+							return
+						}
 						// Meter it. This is the outbound half of exit traffic:
 						// a client's packet heading for the internet on our
 						// link and our IP. Over budget, it is dropped here --
@@ -4412,41 +4539,12 @@ func main() {
 						tunIF.Write(pt)
 						return
 					}
-					// Relay transit for the RETURN path. When we relay an 'R'
-					// frame, the destination learns "reach the sender via us"
-					// and sends its replies back here as ORDINARY data frames
-					// — but this branch used to just drop them, so relayed
-					// connections passed exactly one packet and then went
-					// dark. Forward one hop over a direct established
-					// session, same rules as the 'R' handler: never to/from a
-					// revoked node, and never back out the session it arrived
-					// on (split horizon — no loops).
-					if isOverlayIPRevoked(dst) || isOverlayIPRevoked(extractIPv4Src(pt)) {
-						statRxDropRevoked.Add(1)
-						return
-					}
-					forwarded := false
-					if !isInternetDst(dst) {
-						if a := ipLearning.Lookup(dst); a != nil && a.String() != raddr.String() {
-							// …and admitted, matching the 'R' handler: an
-							// unapproved destination is never reachable
-							// through us, on the return path either.
-							if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-return") {
-								_ = sendPacket(GlobalConn, a, s, pt)
-								statRxRelayOut.Add(1)
-								forwarded = true
-							}
-						}
-					}
-					if !forwarded {
-						// Arrived addressed to somebody else and we had nowhere to
-						// send it. In bulk this means the node is being used as a
-						// transit path while nothing is addressed to it — which
-						// reads identically to "the tunnel is dead" without a
-						// counter to tell them apart.
-						statRxDropNotForUs.Add(1)
-						noteNotForUs(dst)
-					}
+					// Plaintext data addressed to another overlay node is never
+					// forwarded. Relayed traffic travels only as end-to-end sealed
+					// 'Z' frames (e2erelay.go), so a relay never holds a readable
+					// copy; the old raw "return path" forwarding is gone.
+					statRxDropNotForUs.Add(1)
+					noteNotForUs(dst)
 					return
 				}
 			}
@@ -4482,6 +4580,50 @@ func main() {
 		// Relay-delivered frames re-enter through the same handler.
 		gTransportDeliver = handleTransportPacket
 
+		// Demux for every socket that carries overlay traffic. Run dispatchSTUN
+		// first — byte[0] overlaps with overlay types (0x01 is both PktMsg1 and
+		// the high byte of STUN 0x0101), and dispatchSTUN verifies the magic
+		// cookie at bytes 4-7 before claiming a packet.
+		//
+		// The DHT (dht.go) and the public relay (publicrelay.go) share this
+		// socket with the overlay transport. All three demux on the first byte
+		// with no ambiguity: overlay frames are 0x01-0x05, relay frames are
+		// 0x10, and a KRPC message is always a bencode dict ('d'). Sharing one
+		// socket is not a space optimisation — it is what makes the NAT mapping
+		// the DHT keeps warm the SAME mapping peers hole-punch to.
+		gUDPDemux = func(pkt []byte, raddr *net.UDPAddr) {
+			if dispatchSTUN(pkt) {
+				return
+			}
+			if pkt[0] == 'd' {
+				dhtHandlePacket(pkt, raddr)
+				return
+			}
+			if pkt[0] == PktRelay {
+				handleRelayPacket(pkt, raddr)
+				return
+			}
+			// Public exit nodes (pubexit_*.go): a separate protocol for
+			// strangers. It never reaches the overlay handlers below.
+			if pkt[0] == PktPubExit {
+				handlePubExitPacket(pkt, raddr)
+				return
+			}
+			// NAT-spray probes and replies (natspray.go) are plaintext frames
+			// from a peer we have no session with yet — that is the point of
+			// them — so they are demuxed here rather than in handleControl,
+			// which only sees decrypted session payloads. The PSK-keyed MAC is
+			// checked before this node answers anything.
+			if isNATSprayDatagram(pkt) {
+				handleNATSprayDatagram(pkt, raddr, GlobalConn)
+				return
+			}
+			if !IsOverlayPacket(pkt[0]) {
+				return
+			}
+			handleTransportPacket(pkt, raddr)
+		}
+
 		for {
 			n, raddr, err := udpConn.ReadFromUDP(buf)
 			if err != nil {
@@ -4510,34 +4652,7 @@ func main() {
 				continue
 			}
 
-			// Demux: run dispatchSTUN on every packet first — even if
-			// byte[0] overlaps with overlay types (0x01 is both PktMsg1
-			// and the high byte of STUN 0x0101), dispatchSTUN verifies
-			// the magic cookie at bytes 4-7 before claiming a packet.
-			// If dispatchSTUN says "not STUN", fall through to overlay
-			// type check.
-			if dispatchSTUN(buf[:n]) {
-				continue
-			}
-			// DHT (dht.go) and the public relay (publicrelay.go) share this
-			// socket with the overlay transport. All three demux on the first
-			// byte with no ambiguity: overlay frames are 0x01-0x05, relay
-			// frames are 0x10, and a KRPC message is always a bencode dict
-			// ('d'). Sharing one socket is not a space optimisation — it is
-			// what makes the NAT mapping the DHT keeps warm the SAME mapping
-			// peers hole-punch to.
-			if buf[0] == 'd' {
-				dhtHandlePacket(buf[:n], raddr)
-				continue
-			}
-			if buf[0] == PktRelay {
-				handleRelayPacket(buf[:n], raddr)
-				continue
-			}
-			if !IsOverlayPacket(buf[0]) {
-				continue
-			}
-			handleTransportPacket(buf[:n], raddr)
+			dispatchUDPDatagram(buf[:n], raddr)
 		}
 	}()
 
@@ -4571,6 +4686,11 @@ func main() {
 			if n > 0 && ip[0]>>4 == 6 {
 				continue
 			}
+			// Replies for public-exit clients (their private pool addresses)
+			// belong to pubexit_server.go and never touch overlay routing.
+			if pubExitFromTUN(ip) {
+				continue
+			}
 			dst := extractIPv4Dst(ip)
 
 			// Revoked peer: drop everything destined for its overlay IP so a
@@ -4595,10 +4715,14 @@ func main() {
 				}
 			}
 
-			// Full-VPN mode: internet-bound packets go to the selected exit node.
-			if useExit && isInternetDst(dst) {
+			// Full-VPN mode: internet-bound packets go to the selected exit node
+			// — an internal exit when one is available, otherwise a public exit
+			// if this device allows them (pubexit_client.go).
+			if usingExit() && isInternetDst(dst) {
 				if ea, es := currentExit(); ea != nil {
 					_ = sendPacket(udpConn, ea, es, ip)
+				} else {
+					_ = pxClientSend(ip)
 				}
 				// No exit available (or still selecting) — drop rather than leak
 				// onto the overlay broadcast path.
@@ -4627,12 +4751,18 @@ func main() {
 					// every writer of the table.
 					if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "egress") {
 						// PQ wrapping (if enabled + ready) happens inside sendPacket.
-						if err := sendPacket(udpConn, a, s, ip); err != nil {
+						// If the next hop is a RELAY rather than the destination
+						// itself, the packet is sealed end-to-end for the
+						// destination first (e2erelay.go).
+						sent, err := sendOverlayViaSession(udpConn, a, s, ip, dst)
+						if err != nil {
 							noteSendError("direct", a, err)
 						}
-						statTxDirect.Add(1)
-						noteNodeBytes(len(ip))
-						if GlobalSessions.RouteIsLive(a) {
+						if sent {
+							statTxDirect.Add(1)
+							noteNodeBytes(len(ip))
+						}
+						if sent && GlobalSessions.RouteIsLive(a) {
 							continue
 						}
 						// Unproven: fall through to the relay fallback, but
@@ -4652,20 +4782,19 @@ func main() {
 				}
 			}
 
-			// Unknown or unreachable destination: RELAY-wrapped copy to every
-			// direct peer. The 'R' handler covers BOTH discovery roles in one
-			// frame — a peer that IS the destination delivers it locally, and
-			// a peer with a direct session to the destination forwards it ONE
-			// hop. (A raw copy used to be flooded alongside, doubling the
-			// bandwidth of every discovery flood for zero additional
-			// coverage.) Whichever copy arrives first teaches the destination
+			// Unknown or unreachable destination: an END-TO-END SEALED copy to
+			// every direct peer (e2erelay.go). A peer that IS the destination
+			// opens it; a peer with a direct session to the destination forwards
+			// the ciphertext ONE hop; every other peer sees only ciphertext it
+			// cannot open. Whichever copy arrives first teaches the destination
 			// our return path, and its reply teaches us the forward path — so
 			// the mesh converges on the fastest working route automatically.
-			// Pooled: this is built for EVERY packet with no learned route —
-			// exactly the state a struggling client is stuck in — and the old
-			// triple append allocated (and grew) a fresh buffer each time.
-			rfp := relayFramePool.Get().(*[]byte)
-			relayFrame := append(append(append((*rfp)[:0], ctlMagic...), 'R'), ip...)
+			//
+			// No verifiable key for the destination means nothing is flooded:
+			// sending the packet readable to every peer is exactly what this
+			// replaced. The connect request below still goes out, and roster
+			// gossip supplies the key within a gossip tick.
+			relayFrame, sealed := buildE2EFrame(ip)
 
 			// Coordinated-connect: while relaying keeps traffic flowing,
 			// also try to UPGRADE to a direct path. Emit a connect-request
@@ -4693,19 +4822,17 @@ func main() {
 				// it is the easiest place to leak data to a pending device.
 				// Admitted peers only.
 				if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && admissionOK(s.peerStatic, "egress-flood") {
-					if err := sendPacket(udpConn, addr, s, relayFrame); err != nil {
-						noteSendError("flood", addr, err)
+					if sealed {
+						if err := sendPacket(udpConn, addr, s, relayFrame); err != nil {
+							noteSendError("flood", addr, err)
+						}
+						statTxFlood.Add(1)
 					}
-					statTxFlood.Add(1)
 					if connectReq != nil {
 						_ = sendPacket(udpConn, addr, s, connectReq)
 					}
 				}
 			}
-			// Explicit Put, not defer: this is a per-iteration buffer inside
-			// the TUN read loop, and a defer here would hold every buffer
-			// until the goroutine exits — i.e. forever.
-			relayFramePool.Put(rfp)
 		}
 	}()
 
@@ -4949,6 +5076,7 @@ func main() {
 			// A stale provision from a previous install of THIS machine silently
 			// black-holes everything addressed to it — see overlayIPClaimants.
 			resolveOverlayIPCollision("tick")
+			checkSelfAddressVerifiable()
 			if heavy {
 				rosterFrame = buildRosterFrame()
 				pqStatus = buildPQStatus()
@@ -4965,7 +5093,9 @@ func main() {
 				if seed != nil {
 					_ = sendPacket(GlobalConn, addr, s, seed)
 				}
-				if sealed != nil {
+				// The sealed admin key only goes to ADMITTED peers — never
+				// hand a pending device an offline guess at the password.
+				if sealed != nil && mayReceiveAdminSecrets(s.peerStatic) {
 					_ = sendPacket(GlobalConn, addr, s, sealed)
 				}
 				if exitAd != nil {
@@ -5058,6 +5188,23 @@ func main() {
 	// few seconds to walk the swarm. Started on the SAME socket, so the NAT
 	// mapping all three keep warm is the one peers actually punch to.
 	startDiscoveryAndRelay(cfg, udpConn, port, kp, psk)
+	// Public exit nodes: using them (any device) and serving as one (only when
+	// configured; requires the DHT and the public relay started just above).
+	pxUsePublic.Store(cfg.UsePublicExits)
+	pxManualNAT.Store(cfg.PublicExitManualNAT)
+	if cfg.NATSpray != nil {
+		natSprayEnabled.Store(*cfg.NATSpray)
+	}
+	startNATSprayJanitor()
+	pxc := startPubExitClient()
+	for _, ep := range cfg.StaticPublicExits {
+		pxc.AddCandidate(ep)
+	}
+	if px := startPublicExit(udpConn, cfg); cfg.PublicExit {
+		if err := px.SetEnabled(true); err != nil {
+			log.Printf("[public-exit] public exit node NOT started: %v", err)
+		}
+	}
 	mu.Lock()
 	lastAnnounceTime = time.Now()
 	mu.Unlock()

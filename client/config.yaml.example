@@ -36,9 +36,28 @@ min_announce_interval_seconds: 30
 #   - "203.0.113.7:6969"
 # tracker_mode: "bootstrap"      # or "passive" (announce port 0, poll fast)
 # compression: true
-# exit_node: true                # BE an internet exit for the mesh (Linux only)
+# exit_node: true                # INTERNAL exit node: share this host's internet with devices on THIS network
 # use_exit: true                 # route ALL internet traffic via an exit (full VPN)
-# exit_peer: "10.22.55.7"        # pin ONE exit (overlay IP / name / key); blank = fastest
+# exit_peer: "10.22.55.7"        # pin ONE internal exit (overlay IP / name / key); "public" = public exits only; blank = fastest
+# use_public_exits: true         # full VPN may fall back to a PUBLIC exit node when this network has none
+# nat_spray: true                # opt in: punch peers whose NAT randomises its port (default off — relay)
+
+# PUBLIC exit node: share this host's internet with ANY APGO user (not just
+# your network). Requires dht: true and public_relay: true. Users can reach
+# public internet addresses only — this host, its LAN, the overlay and private
+# ranges are blocked, and SMTP (25) is refused. Their traffic leaves from THIS
+# host's IP address: only enable it on a connection you are allowed to share.
+# Env: PUBLIC_EXIT, PUBLIC_EXIT_UP_LIMIT, PUBLIC_EXIT_DOWN_LIMIT,
+#      PUBLIC_EXIT_QUOTA, PUBLIC_EXIT_MAX_CLIENTS, PUBLIC_EXIT_PER_CLIENT_LIMIT.
+# public_exit: true
+# public_exit_up_limit: "50mbit"        # total for all public users; blank = unlimited
+# public_exit_down_limit: "50mbit"
+# public_exit_quota: "200GB"            # per period; blank = none
+# public_exit_quota_days: 30
+# public_exit_max_clients: 16           # 1..1024
+# public_exit_per_client_limit: "10mbit"
+# public_exit_block_ports: [25]         # destination ports refused ([] = none)
+# static_public_exits: ["203.0.113.7:6970"]   # extra public exits to try (host:port)
 
 # Rendezvous (HTTPS discovery) credential, for servers that require one.
 # ONE field, two schemes, auto-detected:

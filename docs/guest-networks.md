@@ -22,8 +22,8 @@ and its own `overlay_cidr` (its own virtual subnet):
 - **Revocable.** Kick one guest with the existing signed revocation; revoke
   the whole guest PSK by removing the network (or rotating name + PSK
   together, which also changes the tracker infohash).
-- **Guest exits.** A guest-network device can serve as a VPN exit node
-  ("exit" checkbox when sharing), and any device can route its internet
+- **Guest exits.** A guest-network device can serve as an internal exit node
+  there ("internal exit" checkbox when sharing), and any device can route its internet
   traffic through an exit on a guest network ("Use as VPN exit" on the
   network). That's the untrusted-datacenter-VPS pattern: the VPS joins ONLY
   the guest network, sees ONLY the devices you shared, yet can still carry
@@ -121,8 +121,8 @@ revocations, exits — the panels pass `?net=<id>` / `"net"` in the body).
   initiator** (name/PSK generated; invite details shown for QR/copy). Subnet
   defaults to the next free `10.22.x.0/24`.
 - **Editing a node** (when secondary networks exist) shows a checkbox per
-  network — share/unshare that device — plus a per-network **“exit”**
-  checkbox to offer the device as a VPN exit there. Changes are signed with
+  network — share/unshare that device — plus a per-network **“internal exit”**
+  checkbox to make the device an internal exit node there. Changes are signed with
   the admin password and gossiped; the target applies them itself.
 - Each network row has **“Use as VPN exit”** to route this device's internet
   traffic through that network's exit (full VPN), enforced one-network-only.

@@ -124,7 +124,8 @@ NETWORK_NAME=apgo-xxxxxxxx     # same on every node — defines the swarm
 PSK=base64:...                 # same on every node — the membership secret
 OVERLAY_CIDR=10.22.55.0/24     # private subnet for the overlay
 FRIENDLY_NAME=<hostname>
-EXIT_NODE=                      # set to 1 to make this host an internet exit
+EXIT_NODE=                      # set to 1 to make this host an internal exit node
+PUBLIC_EXIT=                    # set to 1 (with DHT=1, PUBLIC_RELAY=1) to be a public exit node
 RENDEZVOUS_SERVERS=            # optional HTTPS discovery (BitTorrent-blocked nets)
 ADMIN_USER=admin
 ADMIN_PASSWORD=...             # dashboard login (local to this node)
@@ -141,6 +142,15 @@ Every node picks the best path to its peers on its own, in this order:
 - **IPv6 (best).** The transport binds dual-stack. Where a node has a routable IPv6 address (many home ISPs and phone hotspots), peers connect **directly over v6 with no NAT** — this is what fixes CGNAT/hotspot reachability. The overlay itself stays IPv4 (`10.22.55.x`), so nothing changes for you.
 - **NAT-PMP / PCP auto port-mapping.** On IPv4, a home node asks its own router to open its listen port automatically — no port-forward, no static IP. Watch for `[portmap] SUCCESS` in the log.
 - **Symmetric-NAT port prediction** (on by default) + **STUN hole punching**.
+- **Sprayed punching** for the one pairing that cannot be punched by address: a
+  peer whose NAT allocates a *random* external port per destination (a
+  Kubernetes pod behind kube-proxy's `--random-fully` masquerade is the common
+  case) is unreachable by prediction, so that side opens many mappings at once
+  — with TTL-limited probes, so they never reach and disturb the far NAT — and
+  the other side probes many ports until one lands. The winning socket becomes
+  that peer's path. **Off by default** — the relay already carries these peers,
+  so this is a latency optimisation you opt into with `nat_spray: true` /
+  `NAT_SPRAY=1`, and it never runs toward a peer behind your own NAT.
 - **Relay through a connected peer** as the final fallback.
 
 The only case that can't self-heal is when *every* node is behind NAT with no IPv6 anywhere — then make one node reachable (IPv6, the auto port-map, or one forwarded port) and the rest connect through it.
@@ -150,7 +160,8 @@ The only case that can't self-heal is when *every* node is behind NAT with no IP
 Set machine-local values in `.env` (or the environment). Common ones:
 
 - `OVERLAY_ADDRESS=10.22.55.2` — pin this node's overlay IP (otherwise auto-derived from its key).
-- `EXIT_NODE=1` — make this host a full-VPN exit / outproxy.
+- `EXIT_NODE=1` — make this host an **internal exit node** (full-VPN outproxy for this network). It forwards to the **public internet only**; add `EXIT_ALLOW_LAN=1` (`exit_allow_lan: true`) if devices should also reach this host's LAN, link-local or cloud-metadata addresses through it.
+- `PUBLIC_EXIT=1` — make this host a **public exit node** for any APGO user (see below).
 - `POST_QUANTUM=0`, `PQ_AUTH=0`, `PORT_PREDICTION=0` — opt out of a default (keep the fleet consistent).
 - `RENDEZVOUS_SERVERS=https://rv.example.com` — HTTPS discovery for BitTorrent-blocked networks.
 
@@ -182,7 +193,7 @@ podman rm -f overlay-client overlay-admin 2>/dev/null
 podman volume rm -f overlay-state overlay-shared overlay-adminkey 2>/dev/null
 ```
 
-Two things make a fleet-wide reset actually stick: wipe **every** node in the same sitting (a single un-wiped node re-seeds the old admin key to the others via trust-on-first-use), or simpler — **rotate `NETWORK_NAME` and `PSK`** so any straggler is on a different swarm entirely and physically can't seed to the new one. As a one-shot alternative to deleting volumes, set `APGO_RESET_ADMIN=1` for a single boot to wipe just the admin key/password on that node.
+Two things make a fleet-wide reset actually stick: wipe **every** node in the same sitting (a single un-wiped node re-seeds the old admin key to any unpinned node via trust-on-first-use — and change `ADMIN_KEY_FP` on pinned ones), or simpler — **rotate `NETWORK_NAME` and `PSK`** so any straggler is on a different swarm entirely and physically can't seed to the new one. As a one-shot alternative to deleting volumes, set `APGO_RESET_ADMIN=1` for a single boot to wipe just the admin key/password on that node.
 
 ### Discovery on networks that block BitTorrent
 
@@ -217,10 +228,16 @@ Trackers still run alongside it, so a mixed fleet (some blocked, some not) conve
 
 By default APGO only carries traffic **between** overlay nodes. You can also use
 it as a full VPN: route *all* your internet traffic out through one of your nodes.
+There are two kinds of exit:
 
-- **Make a node an exit.** On a Linux, macOS, or Windows node set `EXIT_NODE=1`
+- an **internal exit node** serves only the devices on its own network;
+- a **public exit node** serves any APGO user, for public internet access only
+  (see [Public exit nodes](#public-exit-nodes)).
+
+- **Make a node an internal exit.** On a Linux, macOS, or Windows node set `EXIT_NODE=1`
   (compose env, or `exit_node: true` in config; on the desktop apps it's the
-  **"Be an exit node"** checkbox in Settings). It enables IP forwarding + NAT
+  **"Internal exit node"** checkbox in Settings, and in the dashboard it's in the
+  node's Settings sheet). It enables IP forwarding + NAT
   (`iptables` on Linux, `pf` on macOS, WinNAT on Windows) and advertises
   itself as an exit to the mesh — shown to every device as a small green **E**
   next to the node. Linux exits need `NET_ADMIN` (the compose stack already
@@ -258,6 +275,44 @@ Traffic is Noise-encrypted from your device to the exit, then exits to the
 internet from the exit node's IP — so pick an exit you trust, since it sees your
 cleartext internet traffic just like any VPN provider would.
 
+### Public exit nodes
+
+A desktop or server node that is already a **public relay** (DHT on, public relay
+on) can also offer itself as a **public exit node**: any APGO user whose own
+network has no internal exit online can send internet traffic out through it.
+Phones can use public exits but cannot be one.
+
+- **Turn it on.** Desktop apps: Settings → *Public exit node*. Dashboard: a
+  node's Settings sheet, or Settings → *Exit node* for the server itself. Raw
+  client: `public_exit: true` / `PUBLIC_EXIT=1` together with `dht: true` and
+  `public_relay: true`. It has its own budget, separate from the relay's and the
+  internal exit's: `public_exit_up_limit`, `public_exit_down_limit`,
+  `public_exit_quota` (+ `_days`), `public_exit_max_clients` (default 16), and a
+  per-user cap `public_exit_per_client_limit` (default 10 Mbit/s).
+- **Use one.** Turn on *Use public exit nodes* next to Full VPN (raw client:
+  `use_public_exits: true` / `USE_PUBLIC_EXITS=1`). Full VPN still prefers your
+  own network's internal exits; a public exit is used only when none is online
+  for a few seconds, or when the exit field is set to `public`.
+- **What users can reach.** Public internet addresses only. The exit refuses
+  (in its own packet filter, and again in the kernel firewall) anything aimed at
+  itself, its LAN, the overlay, private/reserved/multicast ranges, and IPv6;
+  only TCP, UDP and ICMP echo are carried, outgoing SMTP (port 25) is refused
+  (`public_exit_block_ports`), and every user's source address is rewritten to a
+  pool address (198.18.0.0/15, or 100.127.0.0/16 if that is in use) so nobody
+  can spoof another user or the host.
+- **How it is protected.** Each user gets a fresh Noise XX session with an
+  ML-KEM-768 hybrid key, replay protection, and its own identity key that is not
+  the node key (the exit never learns which network a user belongs to, and users
+  never touch the exit's own overlay). Handshakes are rate-limited and padded
+  against amplification; users, flows, new flows per second and bandwidth are all
+  capped; idle sessions end after 3 minutes and every session after 6 hours.
+  The service stops by itself if the DHT or the public relay is turned off.
+- **Think before enabling it.** Everything public users do online appears to
+  come from **your IP address**. Only enable it on a connection you are allowed
+  to share. A user of a public exit should likewise assume the exit's operator
+  can see which sites they visit (the traffic itself is still end-to-end TLS
+  wherever the site uses it).
+
 ### 5. Admin dashboard (optional)
 
 A separate **`overlay-admin`** container ships in the same compose stack. It serves a small web dashboard — protected by a username and password — that shows this node's connected peers and a live tail of the client log, and lets you **revoke** (kick) a peer with one click.
@@ -286,11 +341,13 @@ Then browse to `http://<node-ip>:8088` and sign in. The page auto-refreshes ever
 
 Revocations and node changes (assigning a node a new overlay IP or friendly name) are **signed by the admin key** that every node verifies, so no single node can forge one. The admin key is Ed25519, encrypted at rest with the network admin password (PBKDF2 + AES-256-GCM). The plaintext key is never written to disk and never crosses the wire — it's decrypted only in memory, for the instant it signs, then wiped.
 
-**The encrypted key is distributed to every node.** When you create it, the password-encrypted blob is gossiped across the overlay (only ciphertext ever leaves a node) and superseded by an epoch. That means you can manage the network from **any** node's admin panel: enter the network admin password there and that node decrypts the blob locally to sign — you never have to be on the machine that created the key.
+**The encrypted key is distributed to every approved node.** When you create it, the password-encrypted blob is gossiped across the overlay (only ciphertext ever leaves a node) and superseded by an epoch. That means you can manage the network from **any** node's admin panel: enter the network admin password there and that node decrypts the blob locally to sign — you never have to be on the machine that created the key. The blob is **signed by the admin key itself**; a node only lets a signed blob replace the one it holds, so no peer can flood a fake one that locks the password out. It is only sent to **approved** devices (pending devices never get a copy to attack offline), and the network admin password must be at least 12 characters.
 
-**Trust-on-first-use — first come, first served.** A node that holds **no** admin key adopts the first one it hears over the tunnel and starts trusting it (and, being connected, grandfathers its current peers so nobody is dropped). So if you set the network admin password on one node as the network is coming up, every node that doesn't yet have a key accepts it automatically. Once a node holds a key, **gossip can only update that same key** — e.g. a **password change** (which re-encrypts the *same* signing key under the new password, bumps the epoch, and floods the mesh so every node's copy updates). A *different* key arriving by gossip is refused, so no peer can silently swap in another admin key. To deliberately **reset** the key to a different one on a node that already holds a stale key, do it locally on that node (create/enter the key in its own admin panel — a local, authenticated action can replace it), or wipe that node's state and let it re-adopt via TOFU.
+**Pin the admin key (recommended).** Every node can be pinned to the admin key's fingerprint (`admin_key_fp` in the config, or `ADMIN_KEY_FP`), shown on the *Admin key* page as `ADMIN_KEY_FP=sha256:…`. A pinned node refuses any other admin key a peer offers, and drops a previously adopted key that doesn't match. **Devices that join by scanning the join QR are pinned automatically** — the QR carries the fingerprint. For nodes configured by hand (containers, the desktop config file), paste the fingerprint in.
 
-**Every admin action is seeded continuously.** Approvals, revocations, node IP/name changes, network-name/PSK rotation, the post-quantum policy, and the encrypted admin key itself are all re-flooded to peers on every keepalive as well as immediately when you make them — so any node that reconnects or joins later converges on the current state, and **any node holding the key can approve every other node**. The security boundary is the PSK: only devices already inside the network can gossip anything at all — keep it secret and rotate it (Network → rotate) if it's ever exposed.
+**Unpinned nodes: trust-on-first-use.** A node with **no** pin and **no** admin key adopts the first one it hears over the tunnel (and, being connected, grandfathers its current peers so nobody is dropped). This is kept for compatibility, but any device that knows the PSK — including one you haven't approved — could win that race, so pin nodes wherever you can; `ADMIN_TOFU=0` turns first-use trust off entirely. Once a node holds a key, **gossip can only update that same key** — e.g. a **password change** (which re-encrypts the *same* signing key under the new password, bumps the epoch, and floods the mesh so every node's copy updates). A *different* key arriving by gossip is refused. The local control socket can replace a *stale* bare public key (one with no encrypted key behind it), but never a live admin key: to change a node's admin key, factory-reset it (`APGO_RESET_ADMIN=1` for one boot) and let it re-adopt (matching its pin, if set).
+
+**Every admin action is seeded continuously.** Approvals, revocations, node IP/name changes, network-name/PSK rotation, the post-quantum policy, and the encrypted admin key itself are all re-flooded to peers on every keepalive as well as immediately when you make them — so any node that reconnects or joins later converges on the current state, and **any node holding the key can approve every other node**. The encrypted admin key and PSK rotations only go to **approved** devices, so a rotation really does shut out anyone you haven't approved. The security boundary is still the PSK: only devices already inside the network can gossip anything at all — keep it secret and rotate it (Network → rotate) if it's ever exposed.
 
 Create it once, any of these ways:
 

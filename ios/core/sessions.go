@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flynn/noise"
@@ -968,6 +969,15 @@ func (t *SessionTable) deliverPacket(raddr *net.UDPAddr, typ byte, body []byte, 
 			t.mu.Unlock()
 			return true
 		}
+		// msg1 is unauthenticated and its source address is spoofable, so
+		// every new one would otherwise cost a map entry and a goroutine with
+		// no upper bound. Real meshes never have more than a handful of
+		// handshakes in flight; past the cap, drop — a genuine peer retries.
+		if len(t.pendingByAddr) >= maxPendingHandshakes {
+			t.mu.Unlock()
+			noteHandshakeFlood()
+			return true
+		}
 		p = &pendingHandshake{
 			peer:             raddr,
 			msgs:             make(chan []byte, 8),
@@ -1222,7 +1232,24 @@ waitForS:
 	// act as our relay) without waiting for the first keepalive.
 	if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && myOverlayIP != "" {
 		_ = sendPacket(conn, addr, s, buildAddrAnnounce())
+		// The roster too: it is how the peer learns the keys of nodes it can
+		// only reach through us, and relayed traffic cannot be sealed without
+		// them. Sent by both ends, so it arrives even if one announce is lost.
+		sendRosterTo(addr)
 	}
 
 	cleanupPending()
+}
+
+// maxPendingHandshakes caps half-open handshakes (see Deliver).
+const maxPendingHandshakes = 2048
+
+var handshakeFloodLast atomic.Int64
+
+// noteHandshakeFlood logs, at most once a minute, that msg1s are being shed.
+func noteHandshakeFlood() {
+	now := time.Now().Unix()
+	if last := handshakeFloodLast.Load(); now-last >= 60 && handshakeFloodLast.CompareAndSwap(last, now) {
+		log.Printf("[handshake] %d handshakes already in flight — dropping new msg1s (possible spoofed-source flood)", maxPendingHandshakes)
+	}
 }

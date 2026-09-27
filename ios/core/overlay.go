@@ -83,6 +83,7 @@ type ClientConfig struct {
 	Cipher      string `yaml:"cipher"`
 	PostQuantum bool   `yaml:"post_quantum"`
 	PQAuth      bool   `yaml:"pq_auth"`
+	IPBinding   string `yaml:"ip_binding"` // "strict" | "tofu" | "" (auto); see ipbinding.go
 	// IPv6 enables the dual-stack transport (on by default). Overlay stays IPv4.
 	IPv6 bool `yaml:"ipv6"`
 	// PortPrediction enables symmetric-NAT hole punching: this node probes
@@ -109,6 +110,11 @@ type ClientConfig struct {
 	KeepaliveSeconds int  `yaml:"keepalive_seconds"`
 	ExitNode         bool `yaml:"exit_node"`
 	UseExit          bool `yaml:"use_exit"`
+	// UsePublicExits lets full VPN fall back to PUBLIC exit nodes (other APGO
+	// users sharing their connection) when no exit on this network is
+	// reachable; exit_peer "public" uses public exits only.
+	UsePublicExits    bool     `yaml:"use_public_exits"`
+	StaticPublicExits []string `yaml:"static_public_exits"`
 	// ExitPeer pins WHICH exit carries this node's internet traffic when
 	// use_exit is on. Blank (default) = automatic: the fastest reachable exit.
 	// Set it to a node's overlay IP, friendly name, base64 public key, or
@@ -1396,7 +1402,14 @@ func loadOrCreateKey(path string) (keypair, error) {
 		if err != nil {
 			return kp, err
 		}
-		b = bytes.TrimSpace(b)
+		// The key is written as 32 RAW random bytes. Only a file that is not
+		// exactly that is treated as text (hex, possibly with a trailing
+		// newline): trimming a raw key first stripped any leading or trailing
+		// byte that happens to be whitespace (~1 key in 20) and left the node
+		// unable to start after its first restart.
+		if len(b) != 32 {
+			b = bytes.TrimSpace(b)
+		}
 		if len(b) == 64 {
 			decoded, hexErr := hex.DecodeString(string(b))
 			if hexErr != nil {
@@ -1721,7 +1734,10 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			log.Printf("[control] recovered from panic handling a frame from %s: %v", raddr, r)
 		}
 	}()
-	if len(body) < 2 {
+	// Every frame carries at least one payload byte — except the exit
+	// announce/withdraw ('E'/'U') sent by earlier builds, which are one byte
+	// long and were silently dropped here, so no device ever saw an exit.
+	if len(body) < 2 && !(len(body) == 1 && (body[0] == 'E' || body[0] == 'U')) {
 		return
 	}
 	switch body[0] {
@@ -1779,6 +1795,10 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 			handlePQReply(s.peerStatic, body[1:])
 		}
 		return
+	case pqResetFrame:
+		// Peer lost our shared ML-KEM key (pqheal.go).
+		handlePQResetRequest(raddr)
+		return
 	case 'X':
 		handlePeerExchange(body[1:], gKP, gPSK)
 		return
@@ -1796,18 +1816,24 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		handleExitPong(raddr, body[1:])
 		return
 	case 'A':
-		// Peer announces its overlay IP.
+		// Peer announces its overlay IP. Only believed if the announcing KEY
+		// owns the address (ipbinding.go). Mirrors client/main.go.
 		ip := string(body[1:])
 		if net.ParseIP(ip) == nil {
 			return
 		}
+		s := GlobalSessions.GetByAddr(raddr)
 		if ip == myOverlayIP {
 			// Record the claim against the peer's KEY and let the resolver
-			// decide which side moves — an approved or admin-provisioned
-			// incumbent keeps the address, and a claim from a key nothing has
-			// heard from is a stale record rather than a collision. Falls back
-			// to the old warning when the claimant cannot be identified.
-			if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() {
+			// decide which side moves — but only for a claim the peer can
+			// prove (a genuine derived collision or a provision). An
+			// unprovable claim to our address must never make us move.
+			if s != nil && s.Established() {
+				if !ipBindings.OwnedBy(s.peerStatic, ip, false) {
+					statRxDropIPBinding.Add(1)
+					ipBindings.noteRejected(s.peerStatic, ip)
+					return
+				}
 				setPeerOverlayIP(s.peerStatic, ip)
 				resolveOverlayIPCollision("announce")
 				return
@@ -1821,11 +1847,15 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// makes this node willing to send to it. Identity binding still runs,
 		// so a pending device displays correctly; it just isn't routable.
 		// Mirrors client/main.go.
-		if s := GlobalSessions.GetByAddr(raddr); s != nil {
-			if admissionOK(s.peerStatic, "announce") {
-				ipLearning.Learn(ip, raddr)
+		if s != nil {
+			if ipBindings.OwnedBy(s.peerStatic, ip, true) {
+				if admissionOK(s.peerStatic, "announce") {
+					ipLearning.Learn(ip, raddr)
+				}
+				notePeerAddress(s.peerStatic, ip) // + roster push if new
+			} else {
+				statRxDropIPBinding.Add(1)
 			}
-			setPeerOverlayIP(s.peerStatic, ip)
 		}
 		// Hand the peer our PEX list, the node roster, and the full
 		// admin/network state so it converges immediately (the slow keepalive
@@ -1834,44 +1864,13 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		sendRosterTo(raddr)
 		syncAdminStateTo(raddr)
 	case 'R':
-		// ADMISSION CONTROL for the relay path. 'R' is a control frame that
-		// carries DATA, and control frames bypass the ingress admission gate by
-		// design — so without this an unapproved node reaches the whole mesh
-		// just by wrapping its packets in relay frames. Mirrors client/main.go.
-		if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "relay-in") {
-			return
-		}
-
-		// Relay request: forward the inner IPv4 packet ONE hop, and only
-		// over a direct established session (never relay-of-relay, so a
-		// routing loop is impossible).
-		pkt := body[1:]
-		if !isIPv4Packet(pkt) {
-			return
-		}
-		dst := extractIPv4Dst(pkt)
-		// Never relay to OR from a revoked peer.
-		if isOverlayIPRevoked(dst) || isOverlayIPRevoked(extractIPv4Src(pkt)) {
-			return
-		}
-		if dst == myOverlayIP {
-			// We were the destination all along (sender had no direct
-			// mapping yet). Deliver locally.
-			tunIF.Write(pkt)
-			return
-		}
-		if a := ipLearning.Lookup(dst); a != nil {
-			// admitted() on the OUTBOUND session too: relay only between nodes
-			// that are both admitted, so this node is never a bridge into or
-			// out of a pending device.
-			if s := GlobalSessions.GetByAddr(a); s != nil && s.Established() && admissionOK(s.peerStatic, "relay-out") {
-				// Forward as a NORMAL data frame. The destination sees the
-				// original src IP arriving from our endpoint and learns
-				// "reach that src via this relay" — return traffic then
-				// flows back through us automatically.
-				_ = sendPacket(GlobalConn, a, s, pkt)
-			}
-		}
+		// Legacy PLAINTEXT relay frame — refused; relayed traffic must use the
+		// end-to-end sealed 'Z' frame (e2erelay.go). Mirrors client/main.go.
+		refuseLegacyRelay(raddr)
+		return
+	case e2eFrameType:
+		handleE2EFrame(body, raddr)
+		return
 
 	case 'C', 'K':
 		// Coordinated-connect signaling. Either destined for us (punch!) or
@@ -2223,6 +2222,10 @@ func connectToPeer(annPeer string, kp keypair, psk []byte) {
 		// (and act as our relay) without waiting for the first keepalive.
 		if s != nil && s.Established() && myOverlayIP != "" {
 			_ = sendPacket(GlobalConn, addr, s, buildAddrAnnounce())
+			// The roster too: it is how the peer learns the keys of nodes it can
+			// only reach through us, and relayed traffic cannot be sealed without
+			// them. Sent by both ends, so it arrives even if one announce is lost.
+			sendRosterTo(addr)
 		}
 		// Kick off the post-quantum handshake right away so the PQ layer is up
 		// within one round-trip (not waiting for the 20s keepalive tick).

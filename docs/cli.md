@@ -56,7 +56,8 @@ interface and routes.
 | Variable | Default | Meaning |
 |---|---|---|
 | `NODE_KEY_FILE` | `/state/node.key` | This node's X25519 private key. **Its overlay identity.** Lose it and the node rejoins as a stranger — a new fingerprint, and on a network with admission control it lands back in "pending". Back this file up. |
-| `OVERLAY_ADDRESS` | derived | Pin this node's overlay IP (`10.22.55.5/24`). Blank derives it from the node key. A pinned address is never moved automatically. |
+| `OVERLAY_ADDRESS` | derived | Pin this node's overlay IP (`10.22.55.5/24`). Blank derives it from the node key. A pinned address is never moved automatically. Peers hold a pinned address for the first node that uses it; a node's own key-derived address or an admin assignment always wins over it. Assign important addresses in the admin panel — that is the only binding nothing can contest. |
+| `IP_BINDING` (`ip_binding`) | default | How peers decide which node owns an overlay address. Always: an admin assignment decides; otherwise a node's primary key-derived address beats a collision-hop address, which beats a device-set address; a live node keeps its address against any weaker or equal claim; and a node can only send from an address it holds. `strict` additionally refuses device-set addresses entirely (assign them in the admin panel), and such a node warns on its dashboard. |
 | `FRIENDLY_NAME` | hostname | The name shown next to this node in dashboards. |
 | `ADVERTISE_PORT` | — | The port to publish to peers when it differs from the local listen port (Kubernetes `hostPort`, manual port-forward). |
 | `KEEPALIVE_SECONDS` | `10` | Keepalive interval; clamped to 5–120. |
@@ -91,8 +92,11 @@ Cipher (`chacha` default, or `aesgcm`), MTU, compression and the UDP listen port
 
 ### Relaying and exits
 
+Traffic relayed through another mesh node is **sealed end-to-end** for the destination node (`OVLYCTL1 Z` frames): the relay sees only the two overlay addresses, the sender's public key and ciphertext. Each relayed packet's key combines X25519 (ephemeral-static and static-static), an ML-KEM-768 secret that the two end nodes agree on through the relay, and the network PSK, so relayed traffic is post-quantum protected end to end. There is no classical fallback: the first packet to a newly relayed destination is held back (dropped) for the one round trip the ML-KEM exchange takes; TCP retransmits it. The old plaintext relay frame (`R`) is refused, so relaying only works between nodes that all run this build — upgrade the whole fleet together. A packet is only relayed once the sender can verify the destination's key; until then it is dropped rather than sent readable. A relayed packet is 115 bytes larger than a direct one; with the default MTU of 1280 a full-size relayed packet can exceed 1500 bytes on an IPv6 underlay and be fragmented — use `mtu: 1260` if relays are reached over IPv6.
+
 | Variable | Default | Meaning |
 |---|---|---|
+| `NAT_SPRAY` | **off** | Opt in to punching a peer whose NAT allocates a random port per destination (a Kubernetes pod behind kube-proxy's `--random-fully` masquerade, most often): the unaddressable side opens many mappings with TTL-limited probes, the other probes many ports, and a hit becomes the session's path. Set 0 to leave such peers on the relay. |
 | `USE_PUBLIC_RELAYS` | on | Use volunteer public relays when a direct path fails. |
 | `PUBLIC_RELAY` | off | Offer THIS node as a public relay. |
 | `STATIC_RELAYS` | — | Explicit relay endpoints. |
@@ -100,10 +104,17 @@ Cipher (`chacha` default, or `aesgcm`), MTU, compression and the UDP listen port
 | `RELAY_QUOTA` / `RELAY_QUOTA_DAYS` | — | Volume cap over a rolling window. |
 | `RELAY_MAX_CIRCUITS` / `RELAY_MAX_PER_IP` / `RELAY_PER_CIRCUIT_LIMIT` | — | Relay fairness limits. |
 | `RELAY_STATE_FILE` | beside the node state | Relay accounting. Derived from `NODE_SETTINGS_FILE` when unset. |
-| `EXIT_NODE` | off | Make this node an internet exit (needs NAT/firewall setup — see the README). |
-| `USE_EXIT` | off | Send *this* node's internet traffic out through a mesh exit. |
-| `EXIT_PEER` | — | Pin a specific exit instead of the fastest. |
-| `EXIT_STATE_FILE` | beside the relay state | Exit bandwidth accounting. |
+| `EXIT_NODE` | off | Make this node an **internal** exit node for its own network (needs NAT/firewall setup — see the README). |
+| `USE_EXIT` | off | Send *this* node's internet traffic out through an exit (full VPN). |
+| `EXIT_PEER` | — | Pin a specific internal exit instead of the fastest; `public` = public exits only. |
+| `EXIT_STATE_FILE` | beside the relay state | Internal exit bandwidth accounting. |
+| `USE_PUBLIC_EXITS` | off | Let full VPN fall back to a **public** exit node when no internal exit is online. |
+| `STATIC_PUBLIC_EXITS` | — | Extra public exits to try, `host:port,…`. |
+| `PUBLIC_EXIT` | off | Offer THIS node as a public exit node to any APGO user (public internet only). Requires `DHT=1` and `PUBLIC_RELAY=1`. |
+| `PUBLIC_EXIT_UP_LIMIT` / `PUBLIC_EXIT_DOWN_LIMIT` | unlimited | Total bandwidth for all public exit users. |
+| `PUBLIC_EXIT_QUOTA` | — | Volume cap per period (`public_exit_quota_days`, default 30). |
+| `PUBLIC_EXIT_MAX_CLIENTS` | 16 | Concurrent public exit users (1–1024). |
+| `PUBLIC_EXIT_PER_CLIENT_LIMIT` | 10mbit | Per-user rate. |
 | `SOCKS5_LISTEN` | — | Serve a SOCKS5 proxy on this address. |
 | `SOCKS5_USER` / `SOCKS5_PASS` | — | Credentials for it. |
 | `SOCKS5_OVERLAY_ONLY` | — | Restrict the proxy to overlay destinations. |
@@ -120,7 +131,7 @@ Cipher (`chacha` default, or `aesgcm`), MTU, compression and the UDP listen port
 | `APPROVALS_FILE` | `/state/approvals.json` | Signed admission records. |
 | `REVOCATIONS_FILE` | `/state/revocations.json` | Signed revocations. |
 | `REVOCATION_TTL_SECONDS` | — | How long a revocation is re-gossiped. |
-| `PROVISIONS_FILE` | `/state/provisions.json` | Admin address/name assignments. |
+| `PROVISIONS_FILE` | `/state/provisions.json` | Admin address/name assignments. The newest assignment of an address wins for good: older assignments of it (e.g. from a reinstalled machine's previous key) are dropped and never accepted again — `<file>.addrseq.json` remembers the newest assignment per address. A node whose address the admin gives to another key moves to a free automatic address on its own and says so on its dashboard; to put it back, assign the address to that node's key. |
 | `POLICY_FILE` | `/state/policy.json` | Signed network policy. |
 | `NETCONFIG_FILE` | `/state/netconfig.json` | Admin-pushed network config. |
 | `NETSHARES_FILE` | `/state/netshares.json` | Shared-subnet records. |
@@ -147,7 +158,8 @@ SOCK=~/.apgo/control.sock                  # macOS / Windows desktop
 
 curl --unix-socket $SOCK http://x/api/info      | jq   # this node: IP, key, NAT, PQ, conflicts
 curl --unix-socket $SOCK http://x/api/sessions  | jq   # peers, paths, traffic
-curl --unix-socket $SOCK http://x/api/exits     | jq   # known exit nodes + RTT
+curl --unix-socket $SOCK http://x/api/exits     | jq   # known exit nodes + RTT, public-exit client state
+curl --unix-socket $SOCK http://x/api/public-exit | jq  # this node as a public exit
 curl --unix-socket $SOCK http://x/api/revocations | jq
 ```
 
@@ -159,6 +171,8 @@ Write endpoints take JSON POSTs and, where they change network-wide state,
 require an admin signature: `/api/revoke`, `/api/revoke-signed`,
 `/api/approve-signed`, `/api/provision-signed`, `/api/policy-signed`,
 `/api/network-config-signed`, `/api/netshare-signed`, `/api/exit-pin`,
+`/api/use-exit`, `/api/exit-node`, `/api/use-public-exits`, `/api/public-exit`
+(local node settings, no signature: `{"enabled":true,"up":"50mbit",…}`),
 `/api/set-ipv6`, `/api/set-admin-pubkey`, `/api/admin-key-sealed`,
 `/api/local-restore`.
 
@@ -310,7 +324,9 @@ uci commit apgo && /etc/init.d/apgo restart
 
 UCI options mirror §1: `friendly_name`, `overlay_cidr`, `overlay_address`,
 `udp_listen_port`, `mtu`, `post_quantum`, `pq_auth`, `ipv6`, `cipher`,
-`use_exit`, `exit_peer`, `exit_node`, `rendezvous_servers`.
+`use_exit`, `exit_peer`, `exit_node` (internal exit), `use_public_exits`,
+`public_exit` (+ `public_exit_up_limit`, `public_exit_down_limit`,
+`public_exit_quota`, `public_exit_max_clients`), `rendezvous_servers`.
 
 ### Android
 

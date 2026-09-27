@@ -13,8 +13,9 @@ RUN_DIR=/var/etc/apgo        # rendered config (rebuilt every start)
 CONF=$RUN_DIR/client.yaml
 
 render_config() {
-	local network_name psk friendly overlay_cidr overlay_address
+	local network_name psk friendly overlay_cidr overlay_address ip_binding
 	local port mtu pq pq_auth ipv6 cipher use_exit exit_peer exit_node rendezvous
+	local use_public_exits public_exit px_up px_down px_quota px_max
 
 	config_load apgo
 	config_get network_name main network_name
@@ -22,6 +23,7 @@ render_config() {
 	config_get friendly main friendly_name 'openwrt-router'
 	config_get overlay_cidr main overlay_cidr '10.22.55.0/24'
 	config_get overlay_address main overlay_address
+	config_get ip_binding main ip_binding
 	config_get port main udp_listen_port '6969'
 	config_get mtu main mtu '1280'
 	config_get_bool pq main post_quantum 1
@@ -31,6 +33,12 @@ render_config() {
 	config_get_bool use_exit main use_exit 0
 	config_get exit_peer main exit_peer
 	config_get_bool exit_node main exit_node 0
+	config_get_bool use_public_exits main use_public_exits 0
+	config_get_bool public_exit main public_exit 0
+	config_get px_up main public_exit_up_limit
+	config_get px_down main public_exit_down_limit
+	config_get px_quota main public_exit_quota
+	config_get px_max main public_exit_max_clients
 	config_get rendezvous main rendezvous_servers
 
 	[ -n "$network_name" ] && [ -n "$psk" ] || {
@@ -55,9 +63,21 @@ render_config() {
 		[ "$pq_auth" = 1 ] && echo "pq_auth: true" || echo "pq_auth: false"
 		[ "$ipv6" = 1 ] && echo "ipv6: true" || echo "ipv6: false"
 		echo "cipher: \"$cipher\""
+		[ -n "$ip_binding" ] && echo "ip_binding: \"$ip_binding\""
 		[ "$use_exit" = 1 ] && echo "use_exit: true"
 		[ -n "$exit_peer" ] && echo "exit_peer: \"$exit_peer\""
 		[ "$exit_node" = 1 ] && echo "exit_node: true"
+		[ "$use_public_exits" = 1 ] && echo "use_public_exits: true"
+		if [ "$public_exit" = 1 ]; then
+			# A public exit is only served by a discoverable public relay.
+			echo "dht: true"
+			echo "public_relay: true"
+			echo "public_exit: true"
+			[ -n "$px_up" ] && echo "public_exit_up_limit: \"$px_up\""
+			[ -n "$px_down" ] && echo "public_exit_down_limit: \"$px_down\""
+			[ -n "$px_quota" ] && echo "public_exit_quota: \"$px_quota\""
+			case "$px_max" in ''|*[!0-9]*) ;; *) echo "public_exit_max_clients: $px_max" ;; esac
+		fi
 		if [ -n "$rendezvous" ]; then
 			echo "rendezvous_servers:"
 			for r in $rendezvous; do echo "  - \"$r\""; done

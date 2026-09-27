@@ -168,6 +168,24 @@
   #cfgScope{width:100%; padding:9px 11px; background:var(--panel-2); color:var(--fg);
             border:1px solid var(--line); border-radius:8px; font-size:13px}
   .cfgseed{display:flex; align-items:center; gap:10px; margin:6px 0 4px; flex-wrap:wrap}
+  /* Membership is the first row of a node's settings: approved rows offer
+     Revoke, pending rows offer Approve / Deny. */
+  .cfgaccess{display:flex; gap:10px; align-items:center; padding:10px 0 12px; margin-top:6px;
+             border-top:1px solid var(--line); flex-wrap:wrap}
+  .cfgaccess[hidden]{display:none}
+  .cfgaccess .txt{flex:1 1 180px}
+  .cfgaccess strong{display:block; font-size:13px; font-weight:600}
+  .cfgaccess em{display:block; margin-top:2px; color:var(--muted); font-size:11px; font-style:normal; line-height:1.4}
+  .cfgaccess .acts{display:flex; gap:8px}
+  .cfgaccess.waiting strong{color:#e6b400}
+  .cfgaccess.ok strong{color:var(--ok)}
+  .cfgrow.disabled{opacity:.55; cursor:not-allowed}
+  .pubwarn{color:#e6b400}
+  /* The admin-password dialog opens ON TOP of whichever sheet asked for it. */
+  #pwModal{z-index:40}
+  .modal .primary.danger{background:var(--danger); color:#fff}
+  .modal .primary:disabled{opacity:.6; cursor:progress}
+  .exit-pub{font-size:10px;font-weight:700;color:#c792ea;border:1px solid #c792ea;border-radius:6px;padding:1px 5px;margin-left:6px}
 </style>
 </head>
 <body>
@@ -195,6 +213,7 @@
     <div id="selfApproval" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="dataPath" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div id="exitStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
+    <div id="pubExitStatus" style="display:none;margin-bottom:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:13px"></div>
     <div class="cards">
       <div class="card">
         <div class="k">This node</div><div class="v mono" id="cOverlay">—</div>
@@ -294,6 +313,22 @@
       <h3 id="cfgTitle">Node settings</h3>
       <p class="who" id="cfgWho">&mdash;</p>
 
+      <!-- MEMBERSHIP FIRST. Approve / revoke used to be buttons in the footer,
+           below every other setting; it is the most consequential thing on the
+           sheet, so it is the first row. Approved: Revoke. Pending: Approve or
+           Deny. Each asks for the network admin password in its own dialog. -->
+      <div class="cfgaccess" id="cfgAccess" hidden>
+        <div class="txt">
+          <strong id="cfgAccessTitle">Network access</strong>
+          <em id="cfgAccessNote">&mdash;</em>
+        </div>
+        <div class="acts">
+          <button class="edit-btn" id="cfgDeny" type="button" style="display:none">Deny</button>
+          <button class="accept" id="cfgApprove" type="button" style="display:none">Approve</button>
+          <button class="revoke" id="cfgRevoke" type="button" style="display:none">Revoke</button>
+        </div>
+      </div>
+
       <!-- Identity, folded in from the old separate Edit dialog. Editing a
            node's name and having two dialogs to do it in was the confusing
            part, not the fields themselves. -->
@@ -342,17 +377,47 @@
 
       <label class="cfgrow">
         <input type="checkbox" id="cfgExit">
-        <span><strong>Be a VPN exit node</strong>
-        <em>Forward full-VPN clients' internet traffic out of this node's own
-        connection and IP address. More expensive than relaying &mdash; set a budget.</em></span>
+        <span><strong>Internal exit node</strong>
+        <em>Devices on THIS network that turn on Full VPN can send their internet
+        traffic out through this node's connection and IP address. Nobody outside
+        your network can use it. More expensive than relaying &mdash; set a budget.</em></span>
       </label>
       <div id="cfgExitLimits" class="cfglimits">
-        <div><label for="cfgExitUp">Exit upload (Mbps)</label>
+        <div><label for="cfgExitUp">Internal exit upload (Mbps)</label>
           <input id="cfgExitUp" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
-        <div><label for="cfgExitDown">Exit download (Mbps)</label>
+        <div><label for="cfgExitDown">Internal exit download (Mbps)</label>
           <input id="cfgExitDown" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
-        <div><label for="cfgExitQuota">Exit quota (GB)</label>
+        <div><label for="cfgExitQuota">Internal exit quota (GB)</label>
           <input id="cfgExitQuota" type="number" min="0" step="1" placeholder="e.g. 500"></div>
+      </div>
+
+      <!-- PUBLIC EXIT. A separate service from the internal exit: any APGO user
+           can use it, but only to reach the public internet. The node refuses
+           it unless the DHT and the public relay are on, so the control is
+           disabled until both are ticked. Desktop and server nodes only. -->
+      <label class="cfgrow" id="cfgPubExitRow">
+        <input type="checkbox" id="cfgPubExit">
+        <span><strong>Public exit node</strong>
+        <em>Share this node's internet with <b>any APGO user</b>, not just your network.
+        Their traffic leaves from this node's IP address. They can reach the public
+        internet only &mdash; your LAN, your network's devices and this node itself stay
+        blocked, and outgoing mail (port 25) is refused.
+        <span id="cfgPubExitGate" class="pubwarn"></span></em></span>
+      </label>
+      <div id="cfgPubExitLimits" class="cfglimits">
+        <div><label for="cfgPubExitUp">Public exit upload (Mbps)</label>
+          <input id="cfgPubExitUp" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
+        <div><label for="cfgPubExitDown">Public exit download (Mbps)</label>
+          <input id="cfgPubExitDown" type="number" min="0" step="0.1" placeholder="blank = unlimited"></div>
+        <div><label for="cfgPubExitQuota">Public exit quota (GB)</label>
+          <input id="cfgPubExitQuota" type="number" min="0" step="1" placeholder="e.g. 200"></div>
+        <div><label for="cfgPubExitMax">Max users at once</label>
+          <input id="cfgPubExitMax" type="number" min="1" max="1024" step="1" placeholder="blank = 16"></div>
+        <p class="lc pubwarn" style="grid-column:1/-1; margin:0; font-size:11.5px; line-height:1.4">Each user is also held to
+        10&nbsp;Mbps. Anything they do online appears to come from this node's IP address &mdash;
+        only turn this on for a connection you are allowed to share. The target node must run
+        this APGO version or newer.</p>
+        <p class="lc" id="cfgPubExitLive" style="grid-column:1/-1; margin:0; font-size:11.5px"></p>
       </div>
 
       <label class="cfgrow">
@@ -405,29 +470,10 @@
         <option value="network">Every node on the network (default for all)</option>
       </select>
 
-      <label for="cfgPass">Network admin password</label>
-      <input id="cfgPass" type="password">
-
       <div class="msg" id="cfgMsg"></div>
       <div class="modal-actions wrapact">
         <button class="ghost" id="cfgCancel" type="button">Cancel</button>
-        <button class="edit-btn" id="cfgApprove" type="button" style="display:none">Approve&hellip;</button>
-        <button class="revoke" id="cfgRevoke" type="button">Revoke</button>
-        <button class="primary" id="cfgApply" type="button">Apply</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="modal-backdrop" id="pqModal">
-    <div class="modal">
-      <h3 id="pqTitle">Post-quantum encryption</h3>
-      <p class="who" id="pqWho">—</p>
-      <label for="pqPass">Network admin password</label>
-      <input id="pqPass" type="password">
-      <div class="msg" id="pqMsg"></div>
-      <div class="modal-actions">
-        <button class="ghost" id="pqCancel" type="button">Cancel</button>
-        <button class="primary" id="pqApply" type="button">Apply</button>
+        <button class="primary" id="cfgApply" type="button">Apply&hellip;</button>
       </div>
     </div>
   </div>
@@ -436,29 +482,10 @@
     <div class="modal">
       <h3 id="revokeTitle">Revoke device</h3>
       <p class="who" id="revokeWho">—</p>
-      <div id="revokePassWrap">
-        <label for="revokePass">Network admin password</label>
-        <input id="revokePass" type="password">
-      </div>
       <div class="msg" id="revokeMsg"></div>
       <div class="modal-actions">
         <button class="ghost" id="revokeCancel" type="button">Cancel</button>
         <button class="revoke" id="revokeApply" type="button">Revoke</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="modal-backdrop" id="approveModal">
-    <div class="modal">
-      <h3 id="approveTitle">Approve device</h3>
-      <p class="who" id="approveWho">—</p>
-      <label for="approvePass">Network admin password</label>
-      <input id="approvePass" type="password">
-      <div class="msg" id="approveMsg"></div>
-      <div class="modal-actions">
-        <button class="ghost" id="approveCancel" type="button">Cancel</button>
-        <button class="revoke" id="approveDeny" type="button" style="margin-left:auto">Deny</button>
-        <button class="primary" id="approveApply" type="button">Approve</button>
       </div>
     </div>
   </div>
@@ -475,17 +502,14 @@
       <input id="editIp" type="text" spellcheck="false" autocapitalize="off">
 
       <div id="editShareWrap" style="display:none">
-        <label>Shared networks <span class="lc">— this device also joins the checked networks; “exit” offers it as a VPN exit there</span></label>
+        <label>Shared networks <span class="lc">— this device also joins the checked networks; “internal exit” makes it an internal exit node there</span></label>
         <div class="sharelist" id="editShareList"></div>
       </div>
-
-      <label for="editPass">Network admin password</label>
-      <input id="editPass" type="password">
 
       <div class="msg" id="editMsg"></div>
       <div class="modal-actions">
         <button class="ghost" id="editCancel" type="button">Cancel</button>
-        <button class="primary" id="editApply" type="button">Apply</button>
+        <button class="primary" id="editApply" type="button">Apply&hellip;</button>
       </div>
     </div>
   </div>
@@ -515,6 +539,27 @@
       <div class="modal-actions">
         <button class="ghost" id="netCancel" type="button">Close</button>
         <button class="primary" id="netApply" type="button">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- NETWORK ADMIN PASSWORD. One dialog for every admin-signed action,
+       opened on top of whatever asked for it, instead of a password field at
+       the bottom of each sheet. The password is used for that one request and
+       never stored by the page. -->
+  <div class="modal-backdrop" id="pwModal" role="dialog" aria-modal="true" aria-labelledby="pwTitle">
+    <div class="modal" style="max-width:380px">
+      <h3 id="pwTitle">Network admin password</h3>
+      <p class="who" id="pwWho"></p>
+      <form id="pwForm" autocomplete="off" onsubmit="return false">
+        <input type="text" name="username" value="network-admin" autocomplete="username" hidden>
+        <label for="pwInput">Network admin password</label>
+        <input id="pwInput" type="password" autocomplete="current-password" spellcheck="false">
+      </form>
+      <div class="msg" id="pwMsg"></div>
+      <div class="modal-actions">
+        <button class="ghost" id="pwCancel" type="button">Cancel</button>
+        <button class="primary" id="pwOk" type="button">Continue</button>
       </div>
     </div>
   </div>
@@ -731,7 +776,8 @@ async function loadInfo(){
   // Green E on the device card when THIS node is an exit — the sessions table
   // below only badges peers, so an exit node's own dashboard needs this.
   document.getElementById("cName").innerHTML = esc(j.friendly_name || "—") +
-    (j.exit_node ? ' <span class="exit-avail" title="This device can be an exit node for the VPN relay">E</span>' : '');
+    (j.exit_node ? ' <span class="exit-avail" title="Internal exit node — devices on this network can route their internet through this device">E</span>' : '') +
+    (j.public_exit && j.public_exit.enabled ? ' <span class="exit-pub" title="Public exit node — any APGO user can reach the internet through this device">P</span>' : '');
   document.getElementById("cKey").textContent = j.key_fp || "—";
   document.getElementById("cCount").textContent = j.sessions ?? "—";
   document.getElementById("cUptime").textContent = dur(j.uptime_seconds);
@@ -885,19 +931,55 @@ async function loadInfo(){
       // "why is there no E anywhere".
       exSt.style.display = "";
       exSt.style.color = "#ff6b6b"; exSt.style.borderColor = "#ff6b6b";
-      exSt.textContent = "⚠ Exit-node mode is enabled on this device but FAILED to start (so it is not advertising a green E): " + j.exit_node_error;
+      exSt.textContent = "⚠ Internal exit node is enabled on this device but FAILED to start (so it is not advertising a green E): " + j.exit_node_error;
     } else if (j.use_exit && j.current_exit) {
       const c = j.current_exit;
       exSt.style.display = "";
       exSt.style.color = "#3fb950"; exSt.style.borderColor = "#3fb950";
       exSt.textContent = "Full VPN active — internet traffic egresses via " +
         (c.name || c.overlay_ip || "an exit") + (c.rtt_ms >= 0 ? " · " + c.rtt_ms + " ms" : "");
+    } else if (j.use_exit && j.public_exit_client && j.public_exit_client.active) {
+      const pc = j.public_exit_client;
+      exSt.style.display = "";
+      exSt.style.color = "#c792ea"; exSt.style.borderColor = "#c792ea";
+      exSt.textContent = "Full VPN active through a PUBLIC exit node (" + (pc.endpoint || "?") + ")" +
+        (pc.rtt_ms > 0 ? " · " + pc.rtt_ms + " ms" : "") +
+        " — your network has no internal exit online. The public exit is run by another APGO user: " +
+        "traffic is encrypted to it, but like any VPN provider it can see which sites you reach.";
     } else if (j.use_exit) {
       exSt.style.display = "";
       exSt.style.color = "#e6b400"; exSt.style.borderColor = "#e6b400";
-      exSt.textContent = "⚠ Full VPN is on but no exit node is reachable — this device's internet is paused. Enable exit-node mode on a Linux, macOS, or Windows node (it shows a green E), or turn Full VPN off in Settings.";
+      const pc = j.public_exit_client || {};
+      exSt.textContent = "⚠ Full VPN is on but no exit node is reachable — this device's internet is paused. " +
+        "Turn on \"Internal exit node\" on a Linux, macOS, or Windows node of this network (it shows a green E)" +
+        (pc.allowed ? (pc.searching ? ", or wait — looking for a public exit node now." : ".")
+                    : ", allow public exit nodes in Settings, or turn Full VPN off.");
     } else {
       exSt.style.display = "none";
+    }
+  }
+  // This device AS a public exit: who it is serving, or why it is not.
+  const pxSt = document.getElementById("pubExitStatus");
+  if (pxSt) {
+    const px = j.public_exit || {};
+    if (px.enabled && px.error) {
+      pxSt.style.display = "";
+      pxSt.style.color = "#ff6b6b"; pxSt.style.borderColor = "#ff6b6b";
+      pxSt.textContent = "⚠ Public exit node is enabled but its firewall/NAT setup failed, so it is not serving anyone: " + px.error;
+    } else if (px.enabled && px.prerequisite) {
+      pxSt.style.display = "";
+      pxSt.style.color = "#e6b400"; pxSt.style.borderColor = "#e6b400";
+      pxSt.textContent = "⚠ Public exit node is paused: " + px.prerequisite;
+    } else if (px.enabled) {
+      const bw = px.bandwidth || {};
+      pxSt.style.display = "";
+      pxSt.style.color = "#c792ea"; pxSt.style.borderColor = "#c792ea";
+      pxSt.textContent = "Public exit node on — " + (px.clients||0) + " of " + (px.max_clients||0) +
+        " APGO users connected · " + fmtBytes(px.bytes_carried||0) + " carried" +
+        (bw.quota_bytes > 0 ? " · quota " + fmtBytes(bw.used_bytes||0) + " / " + fmtBytes(bw.quota_bytes) : "") +
+        ". Their traffic leaves from this device's IP address.";
+    } else {
+      pxSt.style.display = "none";
     }
   }
   document.getElementById("nodeSub").textContent = "overlay " + (j.overlay_ip||"?") + " · key " + (j.key_fp||"?");
@@ -916,6 +998,7 @@ async function loadSessions(){
   lastSessions = Array.isArray(list) ? list : [];
   // Repaint the detail sheet if one is open, so its rates keep moving.
   if(nodeSel !== null) renderNodeModal();
+  if(typeof cfgRenderAccess === "function") cfgRenderAccess();
   document.getElementById("nodesCnt").textContent = Array.isArray(list) ? "("+list.length+")" : "";
   if(!Array.isArray(list) || list.length===0){
     tb.innerHTML = '<tr><td class="empty" colspan="11">No peers connected.</td></tr>';
@@ -942,7 +1025,7 @@ async function loadSessions(){
     const tr_ = trafficOf(s);
     return `
     <tr class="rowsel${nodeSel===s.remote?' active':''}" data-remote="${esc(s.remote)}">
-      <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Can be an exit node for the VPN relay">E</span>':''}${v6Badge(s, relayed)}${s.exit_failed?' <span class="exit-fail" title="This device has exit-node mode enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active" title="This device\'s internet traffic currently egresses through this exit node">&#127760; exit</span>':''}</td>
+      <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Internal exit node — devices on this network can route their internet through it">E</span>':''}${v6Badge(s, relayed)}${s.exit_failed?' <span class="exit-fail" title="This device has internal exit node enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active" title="This device\'s internet traffic currently egresses through this exit node">&#127760; exit</span>':''}</td>
       <td>${esc(s.name||"—")}</td>
       <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge" title="Reachable through this node&#39;s relay - no direct session yet">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
@@ -972,6 +1055,50 @@ async function loadLogs(){
 }
 
 let adminConfigured = false;
+
+// withAdminPassword opens the network-admin-password dialog on top of the
+// current sheet and runs run(password). run resolves to null on success or an
+// error string, which is shown IN the dialog so a mistyped password can be
+// retried without re-filling the form behind it. Resolves true on success,
+// false on cancel. The password lives only in this call: the field is cleared
+// on close and nothing is cached, so every admin action asks again.
+function withAdminPassword(o, run){
+  return new Promise((resolve) => {
+    const m = document.getElementById("pwModal");
+    const inp = document.getElementById("pwInput");
+    const msg = document.getElementById("pwMsg");
+    const ok = document.getElementById("pwOk");
+    const cancel = document.getElementById("pwCancel");
+    document.getElementById("pwTitle").textContent = o.title || "Network admin password";
+    document.getElementById("pwWho").textContent = o.who || "";
+    ok.textContent = o.ok || "Continue";
+    ok.className = "primary" + (o.danger ? " danger" : "");
+    ok.disabled = false;
+    inp.value = ""; msg.textContent = "";
+    let busy = false;
+    function close(v){
+      m.classList.remove("show");
+      ok.onclick = null; cancel.onclick = null; m.onclick = null;
+      inp.value = "";
+      resolve(v);
+    }
+    cancel.onclick = () => { if(!busy) close(false); };
+    m.onclick = (e) => { if(e.target === m && !busy) close(false); };
+    ok.onclick = async () => {
+      if(busy) return;
+      const pw = inp.value;
+      if(!pw){ msg.textContent = "Enter the network admin password."; inp.focus(); return; }
+      busy = true; ok.disabled = true; msg.textContent = o.working || "Working…";
+      let err = null;
+      try{ err = await run(pw); }catch(e){ err = "Request failed: " + e; }
+      busy = false; ok.disabled = false;
+      if(err){ msg.textContent = err; inp.focus(); inp.select(); return; }
+      close(true);
+    };
+    m.classList.add("show");
+    setTimeout(() => inp.focus(), 0);
+  });
+}
 
 async function loadConfig(){
   try{
@@ -1003,110 +1130,99 @@ async function loadRevocations(){
 // admin password (used to sign the record); otherwise revoke is a local kick.
 // In-app revoke/restore dialog (no browser prompt/confirm). Resolves true on success.
 function doAction(kind, pubkey, remote, label){
+  const verb = kind==="revoke" ? "Revoke" : "Re-admit";
+  const net = modalNet;
+  const signed = adminConfigured;
+  // Signed (network-wide): the password dialog IS the confirmation.
+  if(signed && pubkey){
+    return withAdminPassword({
+      title: verb + " device",
+      who: (label||"this device") + (kind==="revoke"
+        ? " — removed from every node on the network (signed)."
+        : " — allowed back onto the network (signed)."),
+      ok: verb, danger: kind==="revoke",
+    }, async (password) => {
+      const r = await fetch("/api/revoke", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+        body:JSON.stringify({pubkey, action:kind, password, net})});
+      return r.ok ? null : verb+" failed: "+(await r.text());
+    });
+  }
+  // Unsigned: a local kick needs no password, only a confirmation.
   return new Promise((resolve)=>{
     const modal = document.getElementById("revokeModal");
-    const title = document.getElementById("revokeTitle");
     const who = document.getElementById("revokeWho");
-    const passWrap = document.getElementById("revokePassWrap");
-    const pass = document.getElementById("revokePass");
     const msg = document.getElementById("revokeMsg");
     const apply = document.getElementById("revokeApply");
     const cancel = document.getElementById("revokeCancel");
-    const verb = kind==="revoke" ? "Revoke" : "Re-admit";
-    title.textContent = verb + " device";
+    document.getElementById("revokeTitle").textContent = verb + " device";
     apply.textContent = verb;
-    pass.value = ""; msg.textContent = "";
-    const signed = adminConfigured;
-    if(kind==="restore" && !signed){
+    msg.textContent = "";
+    if(kind==="restore"){
       who.textContent = "Admin key not configured on this node.";
-      passWrap.style.display = "none"; apply.style.display = "none";
+      apply.style.display = "none";
     } else if(signed){
-      if(!pubkey){ who.textContent = "This peer has no key on record; cannot "+kind+" network-wide."; passWrap.style.display="none"; apply.style.display="none"; }
-      else { who.textContent = (label||"this device") + " — network-wide, signed."; passWrap.style.display=""; apply.style.display=""; }
+      who.textContent = "This peer has no key on record; cannot revoke it network-wide.";
+      apply.style.display = "none";
     } else {
       who.textContent = "Revoke and disconnect "+(label||"this device")+"? Local kick only (create a network admin key for network-wide revocation).";
-      passWrap.style.display = "none"; apply.style.display = "";
+      apply.style.display = "";
     }
     function close(v){ modal.classList.remove("show"); apply.onclick=null; cancel.onclick=null; modal.onclick=null; resolve(v); }
     cancel.onclick = ()=>close(false);
     modal.onclick = (e)=>{ if(e.target.id==="revokeModal") close(false); };
     apply.onclick = async ()=>{
-      let body;
-      if(signed){
-        if(!pubkey){ return; }
-        if(!pass.value){ msg.textContent = "Network admin password is required."; return; }
-        body = {pubkey, action:kind, password:pass.value, net:modalNet};
-      } else { body = {remote, net:modalNet}; }
       msg.textContent = "Working…";
-      const r = await fetch("/api/revoke", {method:"POST", headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      const r = await fetch("/api/revoke", {method:"POST", headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify({remote, net})});
       if(!r.ok){ msg.textContent = verb+" failed: "+(await r.text()); return; }
       close(true);
     };
     modal.classList.add("show");
-    if(signed && pubkey) pass.focus();
   });
 }
 
 // --- in-page per-node post-quantum toggle ----------------------------------
-let pqTarget = {pubkey:"", on:false};
-function openPQModal(pubkey, on, label){
-  pqTarget = {pubkey: pubkey||"", on: on};
-  document.getElementById("pqTitle").textContent = on ? "Enable post-quantum" : "Disable post-quantum";
-  document.getElementById("pqWho").textContent = (label||"this node") + " — " + (on?"turn ON":"turn OFF");
-  document.getElementById("pqPass").value = "";
-  document.getElementById("pqMsg").textContent = "";
-  document.getElementById("pqModal").classList.add("show");
-  document.getElementById("pqPass").focus();
-}
-function closePQModal(){ document.getElementById("pqModal").classList.remove("show"); loadSessions(); }
-document.getElementById("pqCancel").addEventListener("click", closePQModal);
-document.getElementById("pqModal").addEventListener("click", (e)=>{ if(e.target.id==="pqModal") closePQModal(); });
-document.getElementById("pqApply").addEventListener("click", async () => {
-  const msg = document.getElementById("pqMsg");
-  const password = document.getElementById("pqPass").value;
-  if(!pqTarget.pubkey){ msg.textContent = "No key on record for this node yet."; return; }
-  if(!password){ msg.textContent = "Network admin password is required."; return; }
-  msg.textContent = "Signing + distributing…";
-  try{
+async function openPQModal(pubkey, on, label){
+  if(!pubkey) return false;
+  const ok = await withAdminPassword({
+    title: on ? "Enable post-quantum" : "Disable post-quantum",
+    who: (label||"this node") + " — " + (on?"turn ON":"turn OFF"),
+    ok: "Apply", working: "Signing + distributing…",
+  }, async (password) => {
     const r = await fetch("/api/policy", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
-      body: JSON.stringify({pubkey: pqTarget.pubkey, post_quantum: pqTarget.on, password})});
-    if(!r.ok){ msg.textContent = (await r.text()) || "Failed."; return; }
-    document.getElementById("pqModal").classList.remove("show");
-    setTimeout(loadSessions, 800);
-  }catch(err){ msg.textContent = "Error: "+err; }
-});
+      body: JSON.stringify({pubkey, post_quantum: on, password})});
+    return r.ok ? null : ((await r.text()) || "Failed.");
+  });
+  setTimeout(loadSessions, 800);
+  return ok;
+}
 
 
 // --- in-page approve modal (admission control) -----------------------------
-let approveTarget = {pubkey:""};
-function openApproveModal(pubkey, label){
-  approveTarget = {pubkey: pubkey||""};
-  document.getElementById("approveWho").textContent = label || "device";
-  document.getElementById("approvePass").value = "";
-  document.getElementById("approveMsg").textContent = "";
-  document.getElementById("approveModal").classList.add("show");
-  document.getElementById("approvePass").focus();
-}
-function closeApproveModal(){ document.getElementById("approveModal").classList.remove("show"); }
-document.getElementById("approveCancel").addEventListener("click", closeApproveModal);
-document.getElementById("approveModal").addEventListener("click", (e)=>{ if(e.target.id==="approveModal") closeApproveModal(); });
-async function submitApprove(action){
-  const msg = document.getElementById("approveMsg");
-  const password = document.getElementById("approvePass").value;
-  if(!approveTarget.pubkey){ msg.textContent = "No key on record for this device yet."; return; }
-  if(!password){ msg.textContent = "Network admin password is required."; return; }
-  msg.textContent = action==="approve" ? "Approving…" : "Denying…";
-  try{
+// approveDevice: admit (or deny) a device that is waiting to join. The network
+// is captured at call time, so a later click elsewhere cannot redirect it.
+async function approveDevice(pubkey, label, action){
+  const net = modalNet;
+  modalNet = "main";
+  if(!pubkey) return false;
+  const approve = action !== "deny";
+  const ok = await withAdminPassword({
+    title: approve ? "Approve device" : "Deny device",
+    who: (label||"device") + (approve ? " — lets it join and reach the network."
+                                      : " — refuses its request to join."),
+    ok: approve ? "Approve" : "Deny", danger: !approve,
+    working: approve ? "Approving…" : "Denying…",
+  }, async (password) => {
     const r = await fetch("/api/approve", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
-      body: JSON.stringify({pubkey: approveTarget.pubkey, action, password, net:modalNet})});
-    if(!r.ok){ msg.textContent = (await r.text()) || "Failed."; return; }
-    closeApproveModal();
-    if(modalNet!=="main"){ await loadNetSessions(modalNet); modalNet="main"; }
+      body: JSON.stringify({pubkey, action: approve ? "approve" : "deny", password, net})});
+    return r.ok ? null : ((await r.text()) || "Failed.");
+  });
+  if(ok){
+    if(net !== "main") await loadNetSessions(net);
     await loadSessions();
-  }catch(err){ msg.textContent = "Error: "+err; }
+  }
+  return ok;
 }
-document.getElementById("approveApply").addEventListener("click", ()=>submitApprove("approve"));
-document.getElementById("approveDeny").addEventListener("click", ()=>submitApprove("deny"));
+function openApproveModal(pubkey, label){ return approveDevice(pubkey, label, "approve"); }
 
 // --- in-page edit modal (assign overlay IP + friendly name) ----------------
 let editTarget = {pubkey:"", ip:""};
@@ -1119,7 +1235,6 @@ function openEditModal(pubkey, curIp, curName, label){
   const ipIn = document.getElementById("editIp");
   ipIn.value = "";
   ipIn.placeholder = curIp || "e.g. 42";
-  document.getElementById("editPass").value = "";
   document.getElementById("editMsg").textContent = "";
   renderEditShareList(pubkey);
   document.getElementById("editModal").classList.add("show");
@@ -1142,8 +1257,8 @@ function renderEditShareList(pubkey){
     <div class="shrow">
       <input type="checkbox" class="share-box" data-name="${esc(n.network_name)}" ${shared?'checked':''} data-was="${shared?1:0}">
       <span class="shname mono">${esc(n.network_name)}</span>
-      <span class="exwrap" title="Offer this device as a VPN exit node on this network">
-        <input type="checkbox" class="share-exit" data-name="${esc(n.network_name)}" ${asExit?'checked':''} data-was="${asExit?1:0}">exit
+      <span class="exwrap" title="Make this device an internal exit node on this network">
+        <input type="checkbox" class="share-exit" data-name="${esc(n.network_name)}" ${asExit?'checked':''} data-was="${asExit?1:0}">internal exit
       </span>
     </div>`;}).join("");
 }
@@ -1153,15 +1268,11 @@ document.getElementById("editCancel").addEventListener("click", closeEditModal);
 document.getElementById("editModal").addEventListener("click", (e) => {
   if(e.target.id === "editModal") closeEditModal();
 });
-document.addEventListener("keydown", (e) => {
-  if(e.key === "Escape") closeEditModal();
-});
 
 async function submitEdit(){
   const msg = document.getElementById("editMsg");
   const name = document.getElementById("editName").value.trim();
   let ip = document.getElementById("editIp").value.trim();
-  const password = document.getElementById("editPass").value;
   // A bare last-octet is expanded against the node's current subnet prefix.
   if(ip && !ip.includes(".")){
     const base = (editTarget.ip || selfNode.ip || "10.22.55.0").split("/")[0].split(".");
@@ -1178,29 +1289,34 @@ async function submitEdit(){
   });
   if(!editTarget.pubkey){ msg.textContent = "No key on record for this node yet — wait until it's connected."; return; }
   if(!name && !ip && shareOps.length===0){ msg.textContent = "Enter a name or IP, or change a shared network."; return; }
-  if(!password){ msg.textContent = "Network admin password is required."; return; }
-
-  const btn = document.getElementById("editApply");
-  btn.disabled = true; const t = btn.textContent; btn.textContent = "Applying…";
-  try{
-    if(name || ip){
-      const r = await fetch("/api/provision", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
-        body: JSON.stringify({pubkey: editTarget.pubkey, address: ip, name, password})});
-      if(!r.ok){ msg.textContent = (await r.text()) || "Update failed."; return; }
-    }
-    for(const op of shareOps){
-      const r = await fetch("/api/share", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
-        body: JSON.stringify({pubkey: editTarget.pubkey, network_name: op.network_name,
-                              action: op.action, exit_node: !!op.exit_node, password})});
-      if(!r.ok){ msg.textContent = op.action+" of "+op.network_name+" failed: "+(await r.text()); return; }
-    }
-    closeEditModal();
-    await Promise.all([loadSessions(), loadInfo(), loadNetworks()]);
-  }catch(err){
-    msg.textContent = "Request failed — is the client running?";
-  }finally{
-    btn.disabled = false; btn.textContent = t;
-  }
+  msg.textContent = "";
+  const pubkey = editTarget.pubkey;
+  let provisioned = false;
+  const ok = await withAdminPassword({
+    title: "Apply changes", who: document.getElementById("editWho").textContent, ok: "Apply",
+    working: "Applying…",
+  }, async (password) => {
+    try{
+      if((name || ip) && !provisioned){
+        const r = await fetch("/api/provision", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+          body: JSON.stringify({pubkey, address: ip, name, password})});
+        if(!r.ok) return (await r.text()) || "Update failed.";
+        provisioned = true;
+      }
+      while(shareOps.length){
+        const op = shareOps[0];
+        const r = await fetch("/api/share", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+          body: JSON.stringify({pubkey, network_name: op.network_name,
+                                action: op.action, exit_node: !!op.exit_node, password})});
+        if(!r.ok) return op.action+" of "+op.network_name+" failed: "+(await r.text());
+        shareOps.shift();
+      }
+      return null;
+    }catch(err){ return "Request failed — is the client running?"; }
+  });
+  if(!ok) return;
+  closeEditModal();
+  await Promise.all([loadSessions(), loadInfo(), loadNetworks()]);
 }
 document.getElementById("editApply").addEventListener("click", submitEdit);
 
@@ -1314,18 +1430,17 @@ document.getElementById("nodeModal").addEventListener("click", (e)=>{ if(e.targe
 // delegated handler covers all of them, including modals added later, rather
 // than a keydown listener wired per input — the version that always misses one.
 const MODAL_PRIMARY = {
-  pqModal:      "pqApply",
+  pwModal:      "pwOk",
   revokeModal:  "revokeApply",
-  approveModal: "approveApply",
   editModal:    "editApply",
   netModal:     "netApply",
   nodeModal:    null,          // a detail sheet, not a form: Enter does nothing
 };
 const MODAL_CANCEL = {
-  pqModal:      "pqCancel",
+  pwModal:      "pwCancel",
   revokeModal:  "revokeCancel",
-  approveModal: "approveCancel",
   editModal:    "editCancel",
+  cfgModal:     "cfgCancel",
   netModal:     "netCancel",
   nodeModal:    "nodeCancel",
 };
@@ -1379,7 +1494,6 @@ function localRestore(pubkey, label){
     const modal = document.getElementById("revokeModal");
     document.getElementById("revokeTitle").textContent = "Re-admit device";
     document.getElementById("revokeWho").textContent = "Re-admit " + (label||"this device") + "?";
-    document.getElementById("revokePassWrap").style.display = "none";
     const apply = document.getElementById("revokeApply"); apply.textContent = "Re-admit"; apply.style.display = "";
     const cancel = document.getElementById("revokeCancel");
     const msg = document.getElementById("revokeMsg"); msg.textContent = "";
@@ -1452,7 +1566,7 @@ function renderNets(){
       <summary>Network ${esc(n.network_name)}<span class="cnt" id="netCnt-${esc(n.id)}"></span>
         <span class="net-badge ${n.running?'on':'off'}">${n.running?'running':(n.enabled?'starting':'disabled')}</span>
         <span class="net-badge">${esc(n.overlay_cidr||"")}</span>
-        ${n.exit_node?'<span class="net-badge exit" title="This device is an exit node on this network">exit node</span>':''}
+        ${n.exit_node?'<span class="net-badge exit" title="This device is an internal exit node on this network">internal exit node</span>':''}
         ${n.use_exit?'<span class="net-badge exit" title="This device routes its internet traffic through an exit on this network">VPN via this net</span>':''}
         ${n.origin==="shared"?'<span class="net-badge" title="Joined via an admin-signed share record">shared to me</span>':''}
       </summary>
@@ -1468,7 +1582,7 @@ function renderNets(){
         </div>
         <div class="invite" id="netInviteBox-${esc(n.id)}" style="display:none;border:0;border-bottom:1px solid var(--line);border-radius:0"></div>
         <table>
-          <thead><tr><th>Overlay IP</th><th>Name</th><th>Endpoint</th><th>Key</th><th>Connected</th><th>Last seen</th><th></th></tr></thead>
+          <thead><tr><th>Access</th><th>Overlay IP</th><th>Name</th><th>Endpoint</th><th>Key</th><th>Connected</th><th>Last seen</th></tr></thead>
           <tbody id="netRows-${esc(n.id)}"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody>
         </table>
       </div>
@@ -1501,16 +1615,16 @@ async function loadNetSessions(id){
     const pending   = (s.approved === false && canAct);
     return `
     <tr>
-      <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Can be an exit node for the VPN relay on this network">E</span>':''}${s.exit_failed?' <span class="exit-fail" title="This device has exit-node mode enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active">&#127760; exit</span>':''}</td>
+      <td>
+        ${pending?`<button class="accept approve" data-net="${esc(id)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Approve</button>`
+                 :(canRevoke?`<button class="revoke" data-net="${esc(id)}" data-remote="${esc(s.remote)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Revoke</button>`:'')}
+      </td>
+      <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Internal exit node on this network">E</span>':''}${s.exit_failed?' <span class="exit-fail" title="This device has internal exit node enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active">&#127760; exit</span>':''}</td>
       <td>${esc(s.name||"—")}</td>
       <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
       <td>${relayed?'—':rel(s.since_unix)}</td>
       <td>${rel(s.last_seen_unix)}</td>
-      <td style="text-align:right">
-        ${pending?`<button class="edit-btn approve" data-net="${esc(id)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Approve…</button>`:''}
-        ${canRevoke?`<button class="revoke" data-net="${esc(id)}" data-remote="${esc(s.remote)}" data-pubkey="${esc(s.pubkey||'')}" data-ip="${esc(s.overlay_ip||s.remote)}">Revoke</button>`:''}
-      </td>
     </tr>`;}).join("");
 }
 
@@ -1553,7 +1667,13 @@ document.getElementById("netsWrap").addEventListener("click", async (e) => {
     return;
   }
   const appr = e.target.closest(".approve");
-  if(appr){ modalNet = appr.dataset.net||"main"; openApproveModal(appr.dataset.pubkey, appr.dataset.ip || "device"); return; }
+  if(appr){
+    modalNet = appr.dataset.net||"main";
+    appr.disabled = true;
+    await approveDevice(appr.dataset.pubkey, appr.dataset.ip || "device", "approve");
+    appr.disabled = false;
+    return;
+  }
   const btn = e.target.closest(".revoke"); if(!btn || !btn.dataset.net) return;
   modalNet = btn.dataset.net;
   btn.disabled = true; const t = btn.textContent; btn.textContent = "…";
@@ -1635,6 +1755,11 @@ setInterval(tick, 3000);
    target would have to re-parse. So the round-trip is asymmetric on purpose. */
 let cfgTarget = null;   // {pubkey, label}
 let cfgPqWas = false;   // PQ state when the sheet opened, so Apply only signs a real change
+/* Whether the target already had public-exit settings when the sheet opened.
+   The public-exit fields are only sent when this is true or the box is ticked:
+   any of them makes the signed record a V2 record, which nodes running an
+   older APGO cannot verify -- so a plain Apply must not produce one. */
+let cfgPubExitWas = false;
 
 /* The API speaks BYTES PER SECOND; these fields speak Mbps, and quotas speak
    GB. Converting at the edge keeps one unit in the UI -- mixing "5mbit" and
@@ -1666,13 +1791,57 @@ function cfgGBField(id){
 function cfgSyncLimits(){
   document.getElementById("cfgRelayLimits").hidden = !document.getElementById("cfgPublicRelay").checked;
   document.getElementById("cfgExitLimits").hidden  = !document.getElementById("cfgExit").checked;
+  cfgSyncPubExit();
+}
+/* A public exit is only offered by a node that is already a discoverable
+   public relay. Enforced here as a disabled control with the reason shown;
+   the signer and the node both refuse it as well. */
+function cfgSyncPubExit(){
+  const box = document.getElementById("cfgPubExit");
+  const row = document.getElementById("cfgPubExitRow");
+  const gate = document.getElementById("cfgPubExitGate");
+  const ready = document.getElementById("cfgDht").checked && document.getElementById("cfgPublicRelay").checked;
+  if(!ready){
+    box.checked = false;
+    box.disabled = true;
+    row.classList.add("disabled");
+    gate.textContent = " Turn on \"Join the public DHT\" and \"Be a public relay for others\" first.";
+  } else {
+    box.disabled = false;
+    row.classList.remove("disabled");
+    gate.textContent = "";
+  }
+  document.getElementById("cfgPubExitLimits").hidden = !box.checked;
+}
+/* Membership row: the first thing on the sheet. */
+function cfgRenderAccess(){
+  const row = document.getElementById("cfgAccess");
+  if(!row) return;
+  if(!cfgTarget || !cfgTarget.pubkey){ row.hidden = true; return; }
+  const s = sessionByPubkey(cfgTarget.pubkey);
+  const title = document.getElementById("cfgAccessTitle");
+  const note = document.getElementById("cfgAccessNote");
+  const show = (id, on) => { document.getElementById(id).style.display = on ? "" : "none"; };
+  row.hidden = false;
+  if(s && s.approved === false){
+    row.className = "cfgaccess waiting";
+    title.textContent = "Waiting for approval";
+    note.textContent = "This device asked to join. It cannot reach anything on the network until you approve it.";
+    show("cfgApprove", true); show("cfgDeny", true); show("cfgRevoke", false);
+  } else {
+    const canRevoke = s && s.relayed ? adminConfigured : true;
+    row.className = "cfgaccess ok";
+    title.textContent = "Approved";
+    note.textContent = s ? "A member of this network. Revoke removes it from every node."
+                         : "Not connected right now. Revoke still removes it from every node.";
+    show("cfgApprove", false); show("cfgDeny", false); show("cfgRevoke", canRevoke);
+  }
 }
 
 async function openCfgModal(pubkey, label){
   cfgTarget = {pubkey: pubkey || "", label: label || "node"};
   document.getElementById("cfgWho").textContent = cfgTarget.label;
   document.getElementById("cfgMsg").textContent = "";
-  document.getElementById("cfgPass").value = "";
   document.getElementById("cfgScope").value = "node";
   document.getElementById("cfgSeedNote").textContent = "—";
 
@@ -1687,15 +1856,18 @@ async function openCfgModal(pubkey, label){
   for(const id of ["cfgName","cfgIp","cfgRv","cfgRvAuth","cfgRelayList",
                    "cfgSocksListen","cfgSocksUser","cfgSocksPass",
                    "cfgRelayUp","cfgRelayDown","cfgRelayQuota",
-                   "cfgExitUp","cfgExitDown","cfgExitQuota"]){
+                   "cfgExitUp","cfgExitDown","cfgExitQuota",
+                   "cfgPubExitUp","cfgPubExitDown","cfgPubExitQuota","cfgPubExitMax"]){
     document.getElementById(id).value = "";
   }
-  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit",
+  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit","cfgPubExit",
                    "cfgSocks","cfgSocksOverlayOnly"]){
     document.getElementById(id).checked = false;
   }
   document.getElementById("cfgTrackersOn").checked = true;
-  document.getElementById("cfgApprove").style.display = "none";
+  cfgPubExitWas = false;
+  document.getElementById("cfgPubExitLive").textContent = "";
+  cfgRenderAccess();
 
   /* Identity and PQ come from the session list, which is already in memory and
      does not depend on the request below. Set them FIRST so they are right even
@@ -1705,7 +1877,6 @@ async function openCfgModal(pubkey, label){
   document.getElementById("cfgIp").value   = sess.overlay_ip || "";
   document.getElementById("cfgPq").checked = !!sess.post_quantum;
   cfgPqWas = !!sess.post_quantum;
-  document.getElementById("cfgApprove").style.display = (sess.approved === false) ? "" : "none";
   document.getElementById("cfgExit").checked = !!sess.exit;
 
   try{
@@ -1734,6 +1905,23 @@ async function openCfgModal(pubkey, label){
     document.getElementById("cfgExitUp").value     = cfgToMbps(d.exit_up_bps);
     document.getElementById("cfgExitDown").value   = cfgToMbps(d.exit_down_bps);
     document.getElementById("cfgExitQuota").value  = cfgToGB(d.exit_quota_bytes);
+    /* Public exit: the record's value, or what the node is doing right now
+       (a node switched on through its own YAML/env has no record). */
+    const pxl = d.public_exit_live || null;
+    const pxOn = !!d.public_exit || !!(pxl && pxl.enabled);
+    cfgPubExitWas = pxOn || !!d.public_exit_up_bps || !!d.public_exit_down_bps ||
+                    !!d.public_exit_quota_bytes || !!d.public_exit_max_clients;
+    document.getElementById("cfgPubExit").checked    = pxOn;
+    document.getElementById("cfgPubExitUp").value    = cfgToMbps(d.public_exit_up_bps);
+    document.getElementById("cfgPubExitDown").value  = cfgToMbps(d.public_exit_down_bps);
+    document.getElementById("cfgPubExitQuota").value = cfgToGB(d.public_exit_quota_bytes);
+    document.getElementById("cfgPubExitMax").value   = d.public_exit_max_clients > 0 ? d.public_exit_max_clients : "";
+    if(pxl){
+      document.getElementById("cfgPubExitLive").textContent =
+        pxl.error ? ("Not running: " + pxl.error)
+        : pxl.prerequisite && pxl.enabled ? ("Paused: " + pxl.prerequisite)
+        : pxl.enabled ? ("Running now — " + (pxl.clients||0) + " user(s) connected.") : "";
+    }
     document.getElementById("cfgRelayList").value  = (d.trackers||[]).join("\n");
     document.getElementById("cfgTrackersOn").checked = d.trackers_on !== false;
     document.getElementById("cfgRv").value      = d.rendezvous || "";
@@ -1771,9 +1959,30 @@ function closeCfgModal(){ document.getElementById("cfgModal").classList.remove("
 async function applyCfg(){
   if(!cfgTarget) return;
   const msg = document.getElementById("cfgMsg"), btn = document.getElementById("cfgApply");
-  const pass = document.getElementById("cfgPass").value;
-  if(!pass){ msg.textContent = "Enter the network admin password."; return; }
+  const pxOn = document.getElementById("cfgPubExit").checked;
+  const pxMaxRaw = document.getElementById("cfgPubExitMax").value.trim();
+  const pxMax = pxMaxRaw === "" ? null : Number(pxMaxRaw);
+  if(pxMax !== null && !(Number.isInteger(pxMax) && pxMax >= 1 && pxMax <= 1024)){
+    msg.textContent = "Public exit: max users must be a whole number from 1 to 1024."; return;
+  }
+  if(pxOn && !(document.getElementById("cfgDht").checked && document.getElementById("cfgPublicRelay").checked)){
+    msg.textContent = "A public exit node needs the DHT and the public relay turned on."; return;
+  }
   msg.textContent = ""; btn.disabled = true;
+  try{
+    const ok = await withAdminPassword({
+      title: "Apply node settings", who: cfgTarget.label, ok: "Apply",
+      working: "Signing + distributing…",
+    }, async (pass) => { const e = await applyCfgSigned(pass, pxOn, pxMax); if(e) msg.textContent = e; return e; });
+    if(!ok) return;
+    msg.textContent = "Saved. It reaches that node over the mesh within a few seconds.";
+    setTimeout(closeCfgModal, 1200);
+  } finally { btn.disabled = false; }
+}
+
+/* The signed part of Apply. Returns null on success or the server's refusal,
+   which the password dialog shows (so a mistyped password can be retried). */
+async function applyCfgSigned(pass, pxOn, pxMax){
   try{
     /* Identity first, as a separate admin-signed PROVISION. Name and overlay
        address are provisioned facts about a node, not runtime settings, and
@@ -1788,7 +1997,7 @@ async function applyCfg(){
       const pr = await fetch("/api/provision", {method:"POST",
         headers:{...XRW,"Content-Type":"application/json"},
         body: JSON.stringify({pubkey: cfgTarget.pubkey, address: ipv, name: nm, password: pass})});
-      if(!pr.ok){ msg.textContent = (await pr.text()) || "Name/IP update failed."; return; }
+      if(!pr.ok) return (await pr.text()) || "Name/IP update failed.";
     }
     /* Post-quantum, as its own signed policy record. Sent only on a change:
        re-signing an unchanged policy would bump its epoch across the mesh for
@@ -1798,7 +2007,7 @@ async function applyCfg(){
       const pq = await fetch("/api/policy", {method:"POST",
         headers:{...XRW,"Content-Type":"application/json"},
         body: JSON.stringify({pubkey: cfgTarget.pubkey, post_quantum: pqNow, password: pass})});
-      if(!pq.ok){ msg.textContent = (await pq.text()) || "Post-quantum update failed."; return; }
+      if(!pq.ok) return (await pq.text()) || "Post-quantum update failed.";
       cfgPqWas = pqNow;
     }
     const relays = document.getElementById("cfgRelayList").value
@@ -1825,17 +2034,23 @@ async function applyCfg(){
       exit_quota:  cfgGBField("cfgExitQuota"),
       password: pass,
     };
+    if(pxOn || cfgPubExitWas){
+      body.public_exit       = pxOn;
+      body.public_exit_up    = cfgMbpsField("cfgPubExitUp");
+      body.public_exit_down  = cfgMbpsField("cfgPubExitDown");
+      body.public_exit_quota = cfgGBField("cfgPubExitQuota");
+      if(pxMax !== null) body.public_exit_max_clients = pxMax;
+    }
     const sp = document.getElementById("cfgSocksPass").value;
     if(sp !== "") body.socks5_pass = sp;   // blank means "leave unchanged"
     const r = await fetch("/api/node-config", {method:"POST",
       headers:{...XRW,"Content-Type":"application/json"}, body:JSON.stringify(body)});
     /* Surface the server's refusal verbatim: an unlimited public relay, a
        relay with the DHT off, a wrong password. Each needs a different fix. */
-    if(!r.ok){ msg.textContent = await r.text(); return; }
-    msg.textContent = "Saved. It reaches that node over the mesh within a few seconds.";
-    setTimeout(closeCfgModal, 1200);
-  }catch(e){ msg.textContent = "request failed: " + e;
-  } finally { btn.disabled = false; }
+    if(!r.ok) return (await r.text()) || "Failed.";
+    cfgPubExitWas = cfgPubExitWas || pxOn;
+    return null;
+  }catch(e){ return "request failed: " + e; }
 }
 
 /* "Copy this node's relay list" — the reseed. Pulls the relay list from the
@@ -1922,25 +2137,38 @@ document.getElementById("cfgApply").addEventListener("click", applyCfg);
 document.getElementById("cfgSeed").addEventListener("click", cfgSeedFromSelf);
 document.getElementById("cfgPublicRelay").addEventListener("change", cfgSyncLimits);
 document.getElementById("cfgExit").addEventListener("change", cfgSyncLimits);
+document.getElementById("cfgPubExit").addEventListener("change", cfgSyncPubExit);
 document.getElementById("cfgDht").addEventListener("change", cfgSyncTrackerGate);
+document.getElementById("cfgDht").addEventListener("change", cfgSyncPubExit);
 document.getElementById("cfgSocks").addEventListener("change", cfgSyncSocks);
 document.getElementById("cfgSocksListen").addEventListener("input", cfgSyncSocks);
 document.getElementById("cfgSocksUser").addEventListener("input", cfgSyncSocks);
 document.getElementById("cfgRv").addEventListener("input", cfgSyncTrackerGate);
-document.getElementById("cfgApprove").addEventListener("click", ()=>{
+async function cfgAdmission(action){
   if(!cfgTarget) return;
   const pk = cfgTarget.pubkey, label = cfgTarget.label;
-  closeCfgModal();
-  openApproveModal(pk, label);
-});
+  const b = document.getElementById(action === "deny" ? "cfgDeny" : "cfgApprove");
+  b.disabled = true;
+  modalNet = "main";
+  const ok = await approveDevice(pk, label, action);
+  b.disabled = false;
+  if(ok){
+    document.getElementById("cfgMsg").textContent = action === "deny" ? "Request denied." : "Approved.";
+    if(action === "deny") setTimeout(closeCfgModal, 900);
+    cfgRenderAccess();
+  }
+}
+document.getElementById("cfgApprove").addEventListener("click", ()=>cfgAdmission("approve"));
+document.getElementById("cfgDeny").addEventListener("click", ()=>cfgAdmission("deny"));
 document.getElementById("cfgRevoke").addEventListener("click", async ()=>{
   if(!cfgTarget) return;
   const sess = sessionByPubkey(cfgTarget.pubkey);
   const b = document.getElementById("cfgRevoke");
-  b.disabled = true; const label = b.textContent; b.textContent = "…";
+  b.disabled = true;
+  modalNet = "main";
   const ok = await doAction("revoke", cfgTarget.pubkey, sess && sess.remote,
                             (sess && sess.overlay_ip) || cfgTarget.label);
-  b.disabled = false; b.textContent = label;
+  b.disabled = false;
   if(ok){ closeCfgModal(); await Promise.all([loadSessions(), loadRevocations(), loadInfo()]); }
 });
 document.getElementById("nodeSettings").addEventListener("click", ()=>{

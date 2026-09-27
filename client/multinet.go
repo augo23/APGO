@@ -380,6 +380,12 @@ func buildChildCmd(parent *ClientConfig, n SecondaryNetwork) (*exec.Cmd, error) 
 	if sock := childControlSocket(id); sock != "" {
 		env = append(env, "CONTROL_SOCKET="+sock)
 	}
+	// The same admin key governs secondary networks (see below), so the
+	// child inherits this node's admin-key pin even when it came from the
+	// config file rather than the environment.
+	if pin := adminKeyPinned(); pin != "" && os.Getenv("ADMIN_KEY_FP") == "" {
+		env = append(env, "ADMIN_KEY_FP="+pin)
+	}
 	cmd.Env = env
 
 	// Seed the child's admin trust from the parent so the SAME admin key
@@ -519,7 +525,7 @@ func registerMultinetAPI(mux *http.ServeMux) {
 			out = append(out, netView{
 				ID: "main", NetworkName: parent.NetworkName, OverlayCIDR: parent.OverlayCIDR,
 				Main: true, Enabled: true, Running: true,
-				ExitNode: parent.ExitNode, UseExit: useExit, ExitPeer: parent.ExitPeer,
+				ExitNode: parent.ExitNode, UseExit: usingExit(), ExitPeer: parent.ExitPeer,
 				Tun: parent.Tun.Name, UDPListenPort: parent.UDPListenPort,
 			})
 			for _, n := range effectiveNetworks(parent) {
@@ -662,6 +668,33 @@ func registerMultinetAPI(mux *http.ServeMux) {
 		}
 		if json.NewDecoder(r.Body).Decode(&req) != nil || req.NetworkName == "" {
 			http.Error(w, "network_name required", http.StatusBadRequest)
+			return
+		}
+		// The MAIN network is not a stored profile; its exit settings are
+		// applied live (the dashboard's "Use as VPN exit" button on the
+		// main network used to get a 404 here and silently do nothing).
+		supMu.Lock()
+		isMain := supParent != nil && supParent.NetworkName == req.NetworkName
+		supMu.Unlock()
+		if isMain && (req.UseExit != nil || req.ExitPeer != nil || req.ExitNode != nil) {
+			if req.ExitNode != nil {
+				if err := setExitNodeEnabled(*req.ExitNode); err != nil {
+					http.Error(w, "exit node: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			if req.UseExit != nil || req.ExitPeer != nil {
+				on := usingExit()
+				if req.UseExit != nil {
+					on = *req.UseExit
+				}
+				if err := applyUseExitRequest(on, req.ExitPeer); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"network_name": req.NetworkName, "main": true,
+				"use_exit": usingExit(), "exit_peer": currentExitPin(), "exit_node": amExit})
 			return
 		}
 		var target *SecondaryNetwork

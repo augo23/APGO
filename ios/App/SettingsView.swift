@@ -10,6 +10,11 @@ struct SettingsView: View {
     @Binding var octet: String
     /// Deletes the current network profile (multi-network switcher).
     var onDelete: (() -> Void)? = nil
+    /// Restart a LIVE tunnel so a changed log level takes effect now. The
+    /// providerConfiguration is only read at startTunnel, so without this a
+    /// toggle flipped while connected captures nothing until the next manual
+    /// reconnect — and an empty log is indistinguishable from a broken one.
+    var onLogLevelChange: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     /// App lock (Face ID / Touch ID) — injected from APGOApp.
     @EnvironmentObject private var appLock: AppLock
@@ -17,6 +22,13 @@ struct SettingsView: View {
     @State private var showScanner = false
     @State private var scanError: String?
     @State private var confirmDelete = false
+
+    // Diagnostics. The export is a merged COPY of both log generations, built
+    // off the main actor because it can be several megabytes; the Send row
+    // appears once it's ready.
+    @State private var logBytes: Int64 = 0
+    @State private var logExportURL: URL?
+    @State private var confirmClearLog = false
 
     // Tracker editor state. Displayed/edited in the trackers.txt format: one
     // tracker per line, separated by one blank line. Parsed tolerantly (any
@@ -104,6 +116,50 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
+                Section("Diagnostics") {
+                    Picker("Log capture", selection: Binding(
+                        get: { config.logLevel ?? 0 },
+                        set: { newLevel in
+                            guard newLevel != (config.logLevel ?? 0) else { return }
+                            config.logLevel = newLevel
+                            onLogLevelChange?()
+                            refreshLogState()
+                        }
+                    )) {
+                        Text("Off").tag(0)
+                        Text("Normal").tag(1)
+                        Text("Verbose").tag(2)
+                    }
+
+                    if OverlayConfig.logDirectoryURL == nil {
+                        // The App Group in OverlayConfig.appGroupID doesn't
+                        // match this build's entitlements, so the app and the
+                        // tunnel extension have no shared folder to hand a log
+                        // through. Say so: otherwise capture looks enabled and
+                        // silently produces an empty file forever.
+                        Label("App Group \(OverlayConfig.appGroupID) is unavailable \u{2014} logging can't be stored. Check the entitlements on both targets.",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+
+                    HStack {
+                        Text("Captured")
+                        Spacer()
+                        Text(logSizeLabel).foregroundStyle(.secondary)
+                    }
+
+                    if let url = logExportURL {
+                        ShareLink(item: url) {
+                            Label("Send log\u{2026}", systemImage: "square.and.arrow.up")
+                        }
+                        Button("Clear log", role: .destructive) { confirmClearLog = true }
+                    }
+
+                    Text("Records what the overlay core is doing \u{2014} NAT classification, hole-punch attempts, and why a peer ends up relayed \u{2014} to a file you can send from here. Normal skips the repeating handshake-retry lines; Verbose keeps everything. Capture keeps up to 8 MB and discards the oldest. Changing this reconnects the tunnel.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+
                 if onDelete != nil {
                     Section {
                         Button("Delete this network", role: .destructive) {
@@ -113,6 +169,15 @@ struct SettingsView: View {
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
+            }
+            .confirmationDialog("Clear the captured log?",
+                                isPresented: $confirmClearLog,
+                                titleVisibility: .visible) {
+                Button("Clear log", role: .destructive) {
+                    OverlayConfig.clearLogs()
+                    refreshLogState()
+                }
+                Button("Cancel", role: .cancel) {}
             }
             .confirmationDialog("Delete \"\(config.displayName)\"?",
                                 isPresented: $confirmDelete,
@@ -146,8 +211,31 @@ struct SettingsView: View {
                     : config.trackers
                 trackersText = list.joined(separator: "\n\n")
                 trackersLoadedText = trackersText
+                refreshLogState()
             }
             .onDisappear { commitTrackers() }   // swipe-down dismiss too
+        }
+    }
+
+    private var logSizeLabel: String {
+        guard logBytes > 0 else { return "nothing yet" }
+        return ByteCountFormatter.string(fromByteCount: logBytes, countStyle: .file)
+    }
+
+    /// Re-read the captured size and rebuild the shareable copy. The merge
+    /// runs off the main actor: it can be several megabytes, and doing it in
+    /// the Picker's setter would hitch the toggle.
+    private func refreshLogState() {
+        logBytes = OverlayConfig.logSizeBytes()
+        guard logBytes > 0 else {
+            logExportURL = nil
+            return
+        }
+        Task {
+            let url = await Task.detached(priority: .utility) {
+                OverlayConfig.exportLog()
+            }.value
+            logExportURL = url
         }
     }
 
@@ -184,6 +272,8 @@ struct SettingsView: View {
         if let c = jc.cipher, !c.isEmpty { config.cipher = c }
         config.postQuantum = jc.post_quantum ?? true
         config.pqAuth = jc.pq_auth ?? true
+        // Pin the network's admin key (absent on QRs from older admin panels).
+        if let fp = jc.admin_key_fp, !fp.isEmpty { config.adminKeyFP = fp } else { config.adminKeyFP = nil }
         config.applyLastOctet(octet)
     }
 }

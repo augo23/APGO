@@ -226,6 +226,29 @@ func resolvePeerIP(pub [32]byte) string {
 // network config + policy. This is the primary delivery path — the keepalive
 // loop only re-floods this set on a slow (~5 min) safety cadence, so a fresh or
 // reconnecting peer converges instantly without steady per-tick bandwidth.
+// mayReceiveAdminSecrets reports whether a peer may be sent the sealed admin
+// key or a rotated network config: it is approved, or this node isn't
+// enforcing admission (same rule as the data plane — a network that has an
+// admin key but has never approved anyone keeps working as before).
+func mayReceiveAdminSecrets(pub [32]byte) bool {
+	return admitted(pub) || !admissionEnforced()
+}
+
+// sendToAdmittedPeers sends frame to every established session whose peer is
+// admitted (approved, or admission control is off). Used for material an
+// unapproved device must not receive: the sealed admin key and rotated
+// network configs.
+func sendToAdmittedPeers(frame []byte) {
+	if frame == nil || GlobalSessions == nil || GlobalConn == nil {
+		return
+	}
+	for _, addr := range GlobalSessions.EstablishedAddrs() {
+		if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && mayReceiveAdminSecrets(s.peerStatic) {
+			_ = sendPacket(GlobalConn, addr, s, frame)
+		}
+	}
+}
+
 func syncAdminStateTo(raddr *net.UDPAddr) {
 	if GlobalSessions == nil || GlobalConn == nil {
 		return
@@ -239,8 +262,16 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 			_ = sendPacket(GlobalConn, raddr, s, f)
 		}
 	}
+	// The admin PUBLIC key is public; everyone may have it. The sealed
+	// (password-encrypted) private key and the rotated network config go only
+	// to ADMITTED peers: a pending device must not get an offline shot at the
+	// admin password, and a rotation must actually shut unapproved devices
+	// out (netconfig.go).
+	peerAdmitted := mayReceiveAdminSecrets(s.peerStatic)
 	send(buildAdminSeed())
-	send(buildSealedKeyFrame())
+	if peerAdmitted {
+		send(buildSealedKeyFrame())
+	}
 	send(buildNameAnnounce())
 	// Our live post-quantum state. This belongs in the on-connect sync and
 	// was missing from it: the keepalive loop only re-sends it on the ~minute
@@ -262,7 +293,7 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 	for _, rec := range provisions.list() {
 		send(buildProvisionFrame(rec))
 	}
-	if nc, ok := persistedNetConfig(); ok {
+	if nc, ok := persistedNetConfig(); ok && peerAdmitted {
 		send(buildNetConfigFrame(nc))
 	}
 	policyMu.Lock()
@@ -1106,11 +1137,10 @@ func startControlServer(socketPath string) {
 		log.Printf("[control] cannot listen on %s: %v", socketPath, err)
 		return
 	}
-	// 0666 so a non-root client (e.g. the macOS menu-bar app running as the
-	// user, while the overlay client runs as root) can reach the socket. It's
-	// still protected by the parent directory's permissions (~/.apgo is 0700
-	// on macOS; the shared volume is private to the two containers on Linux).
-	_ = os.Chmod(socketPath, 0o666)
+	// Owned by the socket directory's owner, mode 0660 — so the macOS
+	// menu-bar app running as the user (while the client runs as root) still
+	// reaches it, but other local users do not. See ctlsock_unix.go.
+	secureControlSocket(socketPath)
 
 	mux := http.NewServeMux()
 
@@ -1135,6 +1165,12 @@ func startControlServer(socketPath string) {
 			// network HAS an admin key), even if the encrypted blob for signing
 			// hasn't synced here yet.
 			"admin_trusted": adminKeySet(),
+			// Fingerprint of the trusted admin key, and the configured pin (if
+			// any). Operators copy the fingerprint into admin_key_fp /
+			// ADMIN_KEY_FP on nodes that don't join by QR.
+			"admin_key_fp":        trustedAdminKeyFP(),
+			"admin_key_pinned":    adminKeyPinned() != "",
+			"admin_key_fp_pinned": adminKeyPinned(),
 			// Admission control: whether the network gates new devices, and whether
 			// THIS node has been approved (used by the mobile "pending" banner).
 			"admission_required": admissionRequired(),
@@ -1160,7 +1196,7 @@ func startControlServer(socketPath string) {
 			// Full-VPN state: whether this node routes internet traffic via an
 			// exit, which exit is pinned ("" = automatic/fastest), and which exit
 			// is currently carrying traffic.
-			"use_exit":     useExit,
+			"use_exit":     usingExit(),
 			"exit_pin":     currentExitPin(),
 			"current_exit": currentExitSummary(),
 			// Whether THIS node is an exit (EXIT_NODE / exit_node, with NAT
@@ -1174,6 +1210,12 @@ func startControlServer(socketPath string) {
 			// failed (the node then refuses to advertise rather than
 			// black-hole clients). Dashboards surface this string.
 			"exit_node_error": exitNATErr,
+			// Public exit node: this node sharing its connection with any
+			// APGO user (public_exit), and this node allowed to USE public
+			// exits for its own full VPN (use_public_exits).
+			"public_exit":        publicExitStatus(),
+			"use_public_exits":   pxUsePublic.Load(),
+			"public_exit_client": pubExitClientStatus(),
 			// Non-empty when the overlay CIDR collides with a physical
 			// network this machine is on — a config error that breaks exit
 			// return-routing and makes peer IPs ambiguous.
@@ -1237,10 +1279,56 @@ func startControlServer(socketPath string) {
 	// lets a UI render a "choose your exit" picker.
 	mux.HandleFunc("/api/exits", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"use_exit": useExit,
-			"pin":      currentExitPin(),
-			"exits":    exitCandidateList(),
+			"use_exit":         usingExit(),
+			"pin":              currentExitPin(),
+			"exits":            exitCandidateList(),
+			"use_public_exits": pxUsePublic.Load(),
+			"public_exit":      pubExitClientStatus(),
 		})
+	})
+
+	// Allow / forbid falling back to PUBLIC exit nodes: {"use_public_exits": true}.
+	// Applies live; persisting is the caller's job (it owns the config file).
+	mux.HandleFunc("/api/use-public-exits", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			On *bool `json:"use_public_exits"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.On == nil {
+			http.Error(w, "use_public_exits required", http.StatusBadRequest)
+			return
+		}
+		if pxUsePublic.Swap(*req.On) != *req.On {
+			if *req.On {
+				log.Printf("[public-exit] public exit nodes ALLOWED for full VPN (used when no internal exit is reachable)")
+			} else {
+				log.Printf("[public-exit] public exit nodes no longer allowed for full VPN")
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "use_public_exits": pxUsePublic.Load()})
+	})
+
+	// This node as a PUBLIC exit node: GET = status, POST = change
+	// ({"enabled":true,"up":"20mbit","down":"20mbit","quota":"200GB",
+	//   "max_clients":16,"per_client":"10mbit","blocked_ports":"25"}).
+	// Enabling fails (400, with the reason) unless the DHT and the public
+	// relay are on and internet sharing could be set up.
+	mux.HandleFunc("/api/public-exit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var req publicExitRequest
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if err := applyPublicExitRequest(req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, publicExitStatus())
 	})
 
 	// Set the outproxy selection mode: {"pin":""} = automatic (fastest exit),
@@ -1268,6 +1356,53 @@ func startControlServer(socketPath string) {
 			log.Printf("[exit] outproxy pinned to %q", pin)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pin": pin, "persisted": persisted})
+	})
+
+	// Switch full-VPN mode live: {"use_exit": true, "exit_peer": "10.22.55.7"}.
+	// exit_peer is optional ("" = fastest). The desktop apps call this after
+	// saving Settings so the change applies without a reconnect; persisting
+	// use_exit is the caller's job (it owns the config file).
+	mux.HandleFunc("/api/use-exit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			UseExit  *bool   `json:"use_exit"`
+			ExitPeer *string `json:"exit_peer"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UseExit == nil {
+			http.Error(w, "use_exit required", http.StatusBadRequest)
+			return
+		}
+		if err := applyUseExitRequest(*req.UseExit, req.ExitPeer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "use_exit": usingExit(), "pin": currentExitPin()})
+	})
+
+	// Switch THIS node's exit-node mode live: {"exit_node": true}. Does the
+	// NAT work first and refuses (500, with the reason) if it cannot, so a
+	// node never advertises an exit that black-holes its clients. The desktop
+	// apps call this after saving Settings; persisting is the caller's job.
+	mux.HandleFunc("/api/exit-node", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ExitNode *bool `json:"exit_node"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ExitNode == nil {
+			http.Error(w, "exit_node required", http.StatusBadRequest)
+			return
+		}
+		if err := setExitNodeEnabled(*req.ExitNode); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "exit_node": amExit})
 	})
 
 	// Admin-signed device approval (admission control): verify, apply, gossip now.
@@ -1440,6 +1575,10 @@ func startControlServer(socketPath string) {
 	// behind the admin login on the dashboard that renders the QR.
 	mux.HandleFunc("/api/join-info", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
+			// Pin for the network admin key. A device that joins with it
+			// refuses any other admin key a peer tries to seed (adminpin.go);
+			// without it, the first key it hears wins.
+			"admin_key_fp":       trustedAdminKeyFP(),
 			"network_name":       gNetworkName,
 			"psk":                gPSKString,
 			"overlay_cidr":       overlayCIDR,
@@ -1647,6 +1786,9 @@ func startControlServer(socketPath string) {
 		}
 		if pub == gKP.pub {
 			applyProvisionSelf(rec)
+		} else if rec.Address != "" && stripMask(normalizeOverlayAddr(rec.Address)) == myOverlayIP() {
+			// The admin gave THIS node's address to another key: move off it.
+			go resolveOverlayIPCollision("provision")
 		}
 		// Broadcast the signed record to every established peer right away so it
 		// reaches the target quickly (keepalive gossip keeps re-flooding it).
@@ -1677,20 +1819,19 @@ func startControlServer(socketPath string) {
 			_, _ = w.Write(blob)
 		case http.MethodPost:
 			blob, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-			// force=true: this comes from the authenticated local admin, so it may
-			// establish/replace the key even if a stale public key was trusted.
+			// force=true: a local action. It may re-store a blob for the trusted
+			// key regardless of epoch, or replace a STALE bare public key (no
+			// sealed blob held) — but never switch a live admin key; see
+			// storeSealedAdminKeyForce.
 			if !storeSealedAdminKeyForce(blob, true, true) {
-				http.Error(w, "rejected (older than the key already stored)", http.StatusConflict)
+				http.Error(w, "rejected: older than the stored key, unsigned while a signed one is held, "+
+					"a different admin key than this network's (factory-reset the node with APGO_RESET_ADMIN=1 to change it), "+
+					"or not matching admin_key_fp", http.StatusConflict)
 				return
 			}
-			// Push it to peers immediately (keepalive gossip keeps re-flooding).
-			if frame := buildSealedKeyFrame(); frame != nil {
-				for _, addr := range GlobalSessions.EstablishedAddrs() {
-					if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
-						_ = sendPacket(GlobalConn, addr, s, frame)
-					}
-				}
-			}
+			// Push it to ADMITTED peers immediately (keepalive gossip keeps
+			// re-flooding). Unapproved devices never receive the sealed key.
+			sendToAdmittedPeers(buildSealedKeyFrame())
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
 			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
@@ -1716,6 +1857,21 @@ func startControlServer(socketPath string) {
 		if err != nil || !adminPubValid(raw) {
 			http.Error(w, "bad pubkey", http.StatusBadRequest)
 			return
+		}
+		// This socket is reachable by local processes, so it must not be a way
+		// to take over a network's admin. Setting the SAME key is a no-op
+		// refresh; a first key or a replacement for a stale bare key (no sealed
+		// blob held) must match admin_key_fp when one is pinned; a node that
+		// holds a live sealed blob never switches keys here (factory-reset it).
+		if !adminSameKey(raw) {
+			if adminKeySet() && getSealedAdminKey() != nil {
+				http.Error(w, "this node already trusts a different admin key; factory-reset it (APGO_RESET_ADMIN=1) to change the admin key", http.StatusConflict)
+				return
+			}
+			if pin := adminKeyPinned(); pin != "" && adminKeyFingerprint(raw) != pin {
+				http.Error(w, "admin key does not match the pinned admin_key_fp "+pin, http.StatusConflict)
+				return
+			}
 		}
 		setAdminPub(raw, true)
 		// Seed it to every established peer right away.

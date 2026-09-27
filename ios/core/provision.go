@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"sync"
 )
@@ -160,94 +159,6 @@ func verifyProvision(rec SignedProvision) ([32]byte, bool) {
 	}
 	copy(pub[:], raw)
 	return pub, true
-}
-
-type provStore struct {
-	mu   sync.Mutex
-	recs map[[32]byte]SignedProvision
-	path string
-}
-
-var provisions = &provStore{recs: map[[32]byte]SignedProvision{}}
-
-// put stores rec if it supersedes the current entry for that target (higher seq).
-func (s *provStore) put(pub [32]byte, rec SignedProvision) bool {
-	s.mu.Lock()
-	if cur, ok := s.recs[pub]; ok && rec.Seq <= cur.Seq {
-		s.mu.Unlock()
-		return false
-	}
-	s.recs[pub] = rec
-	s.mu.Unlock()
-	s.save()
-	return true
-}
-
-func (s *provStore) get(pub [32]byte) (SignedProvision, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, ok := s.recs[pub]
-	return r, ok
-}
-
-func (s *provStore) list() []SignedProvision {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]SignedProvision, 0, len(s.recs))
-	for _, r := range s.recs {
-		out = append(out, r)
-	}
-	return out
-}
-
-func (s *provStore) save() {
-	s.mu.Lock()
-	path := s.path
-	list := make([]SignedProvision, 0, len(s.recs))
-	for _, r := range s.recs {
-		list = append(list, r)
-	}
-	s.mu.Unlock()
-	if path == "" {
-		return
-	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err == nil {
-		_ = os.Rename(tmp, path)
-	}
-}
-
-// load reads persisted provisions, re-verifying each against adminPub.
-func (s *provStore) load(path string) {
-	s.mu.Lock()
-	s.path = path
-	s.mu.Unlock()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var list []SignedProvision
-	if json.Unmarshal(data, &list) != nil {
-		return
-	}
-	for _, rec := range list {
-		pub, ok := verifyProvision(rec)
-		if !ok {
-			continue
-		}
-		s.mu.Lock()
-		if cur, exists := s.recs[pub]; !exists || rec.Seq > cur.Seq {
-			s.recs[pub] = rec
-		}
-		s.mu.Unlock()
-		if rec.Name != "" {
-			setPeerName(pub, rec.Name)
-		}
-	}
 }
 
 // buildProvisionFrame returns an "OVLYCTL1V<json>" control payload for gossip.

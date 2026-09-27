@@ -143,8 +143,16 @@ struct ContentView: View {
                                 Task { await tunnel.reconnect(config: config) }
                             }
                         }
+                    Toggle("Use public exit nodes when my network has none", isOn: Binding(
+                        get: { config.usePublicExits ?? false },
+                        set: { config.usePublicExits = $0 }))
+                        .onChange(of: config.usePublicExits) { _ in
+                            if config.useExit && (isConnected || isBusy) {
+                                Task { await tunnel.reconnect(config: config) }
+                            }
+                        }
                     if config.useExit {
-                        TextField("Exit node (blank = fastest)", text: $config.exitPeer)
+                        TextField("Internal exit node (blank = fastest, \"public\" = public only)", text: $config.exitPeer)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .onSubmit {
@@ -154,8 +162,32 @@ struct ContentView: View {
                             }
                     }
                     Text(config.useExit
-                         ? "All internet traffic egresses via an exit node on your mesh. Needs at least one device with exit-node mode enabled (a server or desktop — phones can't be exits)."
+                         ? "All internet traffic egresses via an internal exit node on your network — a server or desktop with \"Internal exit node\" turned on (phones can't be exits)."
                          : "Off: only overlay traffic is tunneled.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if config.usePublicExits ?? false {
+                        Text("If your network has no internal exit online, traffic goes through a public exit node run by another APGO user. It is encrypted to that node, but like any VPN provider it can see which sites you visit, and they see its IP address.")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
+                }
+
+                // --- Connectivity ---------------------------------------------
+                // Relaying is what keeps a peer reachable when neither side can
+                // punch a direct path (symmetric NAT, CGNAT). It is on by
+                // default; the switch exists so it can be turned OFF, and so
+                // "am I even allowed to relay?" is answerable on the device.
+                Section("Connectivity") {
+                    Toggle("Use public relays", isOn: Binding(
+                        get: { config.usePublicRelays ?? true },
+                        set: { config.usePublicRelays = $0 }))
+                        .onChange(of: config.usePublicRelays) { _ in
+                            if isConnected || isBusy {
+                                Task { await tunnel.reconnect(config: config) }
+                            }
+                        }
+                    Text("When no direct path can be punched to a peer (symmetric NAT, CGNAT), route through a volunteer relay. The relay carries ciphertext only — it holds no key. Off means such peers are simply unreachable.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("There is no DHT switch here: this app finds peers, relays and public exits through trackers, rendezvous servers and peer exchange. The DHT runs on servers and desktops only.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
@@ -171,7 +203,8 @@ struct ContentView: View {
                     Section {
                         VStack(alignment: .leading, spacing: 8) {
                             Label(c.resolved ? "Overlay IP changed automatically"
-                                             : "Overlay IP already claimed",
+                                             : (c.source == "ip-binding" ? "Overlay IP can't be verified"
+                                                                         : "Overlay IP already claimed"),
                                   systemImage: "exclamationmark.triangle.fill")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.orange)
@@ -234,6 +267,7 @@ struct ContentView: View {
                                 // (full VPN); faint globe = advertises as an exit.
                                 if p.activeExit {
                                     Label("Exit", systemImage: "globe.americas.fill")
+                                        .accessibilityLabel("Internal exit node in use")
                                         .labelStyle(.titleAndIcon)
                                         .font(.caption2.weight(.semibold))
                                         .foregroundStyle(.blue)
@@ -242,6 +276,7 @@ struct ContentView: View {
                                 } else if p.isExit {
                                     Image(systemName: "globe")
                                         .font(.caption).foregroundStyle(.secondary)
+                                        .accessibilityLabel("Internal exit node")
                                 }
                                 // Relay badge: reachable through another node
                                 // rather than a direct session (traffic still
@@ -323,7 +358,15 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) {
-                SettingsView(config: $config, octet: $octet, onDelete: deleteCurrentNetwork)
+                SettingsView(config: $config,
+                             octet: $octet,
+                             onDelete: deleteCurrentNetwork,
+                             onLogLevelChange: {
+                                 // Same reason as the Full-VPN and transport
+                                 // toggles: providerConfiguration is read once,
+                                 // at startTunnel.
+                                 Task { await tunnel.reconnect(config: config) }
+                             })
             }
             .sheet(isPresented: $showApprove) {
                 NavigationStack {

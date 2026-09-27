@@ -247,6 +247,15 @@ func noteConnectCandidates(overlayIP, candidateList string) bool {
 		log.Printf("[relay-policy] %s: %s — going relay-first (direct probes continue in the background)",
 			overlayIP, p.reason)
 	}
+	// "Cannot be punched" means "cannot be ADDRESSED": the mapping exists,
+	// its port is simply unguessable. natspray.go attacks that directly for
+	// the one pairing where it is attackable — symmetric on one side, stable
+	// on the other — by opening many mappings on the unaddressable side and
+	// probing many ports from the other. The relay stands the whole time, so
+	// this costs a few hundred kilobytes and never delays a working session.
+	if !directPunchViable(mine, theirs) {
+		maybeStartNATSpray(overlayIP, candidateList, mine, theirs)
+	}
 	return !p.relayFirst
 }
 

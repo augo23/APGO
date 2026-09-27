@@ -459,5 +459,12 @@ func overlayWriteTo(conn *net.UDPConn, frame []byte, addr *net.UDPAddr) (int, er
 		// Reporting success would hide a torn-down circuit as silent loss.
 		return 0, net.ErrClosed
 	}
+	// A peer reached by a sprayed punch (natspray.go) is only reachable
+	// through the auxiliary socket whose mapping it found: a frame sent from
+	// the main socket leaves through a different external port, which that
+	// peer's restricted NAT drops as coming from an address it never sent to.
+	if pc := punchPathFor(addr); pc != nil {
+		return pc.WriteToUDP(frame, addr)
+	}
 	return conn.WriteToUDP(frame, addr)
 }

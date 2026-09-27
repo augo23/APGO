@@ -30,9 +30,14 @@ type joinPayload struct {
 	// credential is useless to a phone that scanned only the URL.
 	RendezvousAuth string   `json:"rendezvous_auth,omitempty"`
 	Trackers       []string `json:"trackers,omitempty"` // top trackers so a scanned device shares this network's discovery
-	Cipher            string   `json:"cipher,omitempty"`   // "chacha" or "aesgcm"
-	PostQuantum       *bool    `json:"post_quantum,omitempty"`
-	PQAuth            *bool    `json:"pq_auth,omitempty"`
+	Cipher         string   `json:"cipher,omitempty"`   // "chacha" or "aesgcm"
+	PostQuantum    *bool    `json:"post_quantum,omitempty"`
+	PQAuth         *bool    `json:"pq_auth,omitempty"`
+	// AdminKeyFP pins the network admin key ("sha256:..." of its public key).
+	// A device that joins with it refuses any other admin key a peer seeds,
+	// so a PSK holder that isn't approved can't make itself the new device's
+	// admin. Omitted until the network has an admin key.
+	AdminKeyFP string `json:"admin_key_fp,omitempty"`
 }
 
 func buildJoinPayload() ([]byte, joinPayload, error) {
@@ -53,6 +58,7 @@ func buildJoinPayload() ([]byte, joinPayload, error) {
 		Cipher            string   `json:"cipher"`
 		PostQuantum       *bool    `json:"post_quantum"`
 		PQAuth            *bool    `json:"pq_auth"`
+		AdminKeyFP        string   `json:"admin_key_fp"`
 	}
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, joinPayload{}, err
@@ -68,6 +74,7 @@ func buildJoinPayload() ([]byte, joinPayload, error) {
 		Cipher:            src.Cipher,
 		PostQuantum:       src.PostQuantum,
 		PQAuth:            src.PQAuth,
+		AdminKeyFP:        src.AdminKeyFP,
 	}
 	out, err := json.Marshal(jp)
 	return out, jp, err

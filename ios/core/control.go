@@ -155,6 +155,29 @@ func resolvePeerIP(pub [32]byte) string {
 // network config + policy. This is the primary delivery path — the keepalive
 // loop only re-floods this set on a slow (~5 min) safety cadence, so a fresh or
 // reconnecting peer converges instantly without steady per-tick bandwidth.
+// mayReceiveAdminSecrets reports whether a peer may be sent the sealed admin
+// key or a rotated network config: it is approved, or this node isn't
+// enforcing admission (same rule as the data plane — a network that has an
+// admin key but has never approved anyone keeps working as before).
+func mayReceiveAdminSecrets(pub [32]byte) bool {
+	return admitted(pub) || !admissionEnforced()
+}
+
+// sendToAdmittedPeers sends frame to every established session whose peer is
+// admitted (approved, or admission control is off). Used for material an
+// unapproved device must not receive: the sealed admin key and rotated
+// network configs.
+func sendToAdmittedPeers(frame []byte) {
+	if frame == nil || GlobalSessions == nil || GlobalConn == nil {
+		return
+	}
+	for _, addr := range GlobalSessions.EstablishedAddrs() {
+		if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() && mayReceiveAdminSecrets(s.peerStatic) {
+			_ = sendPacket(GlobalConn, addr, s, frame)
+		}
+	}
+}
+
 func syncAdminStateTo(raddr *net.UDPAddr) {
 	if GlobalSessions == nil || GlobalConn == nil {
 		return
@@ -168,8 +191,13 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 			_ = sendPacket(GlobalConn, raddr, s, f)
 		}
 	}
+	// The admin PUBLIC key is public; the sealed (password-encrypted) private
+	// key and rotated network configs go only to ADMITTED peers.
+	peerAdmitted := mayReceiveAdminSecrets(s.peerStatic)
 	send(buildAdminSeed())
-	send(buildSealedKeyFrame())
+	if peerAdmitted {
+		send(buildSealedKeyFrame())
+	}
 	send(buildNameAnnounce())
 	for _, e := range revocations.list() {
 		if e.Signed && e.Rec != nil {
@@ -184,7 +212,7 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 	for _, rec := range provisions.list() {
 		send(buildProvisionFrame(rec))
 	}
-	if nc, ok := persistedNetConfig(); ok {
+	if nc, ok := persistedNetConfig(); ok && peerAdmitted {
 		send(buildNetConfigFrame(nc))
 	}
 	policyMu.Lock()
@@ -886,11 +914,8 @@ func startControlServer(socketPath string) {
 		log.Printf("[control] cannot listen on %s: %v", socketPath, err)
 		return
 	}
-	// 0666 so a non-root client (e.g. the macOS menu-bar app running as the
-	// user, while the overlay client runs as root) can reach the socket. It's
-	// still protected by the parent directory's permissions (~/.apgo is 0700
-	// on macOS; the shared volume is private to the two containers on Linux).
-	_ = os.Chmod(socketPath, 0o666)
+	// Owned by the socket directory's owner, mode 0660 (ctlsock_unix.go).
+	secureControlSocket(socketPath)
 
 	mux := http.NewServeMux()
 
@@ -905,6 +930,7 @@ func startControlServer(socketPath string) {
 			// network HAS an admin key), even if the encrypted blob for signing
 			// hasn't synced here yet.
 			"admin_trusted":  adminKeySet(),
+			"admin_key_fp":   trustedAdminKeyFP(),
 			// Admission control: whether the network gates new devices, and whether
 			// THIS node has been approved (used by the mobile "pending" banner).
 			"admission_required": admissionRequired(),
@@ -1043,6 +1069,8 @@ func startControlServer(socketPath string) {
 	// behind the admin login on the dashboard that renders the QR.
 	mux.HandleFunc("/api/join-info", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
+			// Pin for the network admin key (adminpin.go).
+			"admin_key_fp": trustedAdminKeyFP(),
 			"network_name":       gNetworkName,
 			"psk":                gPSKString,
 			"overlay_cidr":       overlayCIDR,
@@ -1196,6 +1224,9 @@ func startControlServer(socketPath string) {
 		}
 		if pub == gKP.pub {
 			applyProvisionSelf(rec)
+		} else if rec.Address != "" && stripMask(normalizeOverlayAddr(rec.Address)) == myOverlayIP {
+			// The admin gave THIS device's address to another key: move off it.
+			go resolveOverlayIPCollision("provision")
 		}
 		// Broadcast the signed record to every established peer right away so it
 		// reaches the target quickly (keepalive gossip keeps re-flooding it).
@@ -1226,20 +1257,19 @@ func startControlServer(socketPath string) {
 			_, _ = w.Write(blob)
 		case http.MethodPost:
 			blob, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-			// force=true: this comes from the authenticated local admin, so it may
-			// establish/replace the key even if a stale public key was trusted.
+			// force=true: a local action. It may re-store a blob for the trusted
+			// key regardless of epoch, or replace a STALE bare public key (no
+			// sealed blob held) — but never switch a live admin key; see
+			// storeSealedAdminKeyForce.
 			if !storeSealedAdminKeyForce(blob, true, true) {
-				http.Error(w, "rejected (older than the key already stored)", http.StatusConflict)
+				http.Error(w, "rejected: older than the stored key, unsigned while a signed one is held, "+
+					"a different admin key than this network's (factory-reset the node with APGO_RESET_ADMIN=1 to change it), "+
+					"or not matching admin_key_fp", http.StatusConflict)
 				return
 			}
-			// Push it to peers immediately (keepalive gossip keeps re-flooding).
-			if frame := buildSealedKeyFrame(); frame != nil {
-				for _, addr := range GlobalSessions.EstablishedAddrs() {
-					if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
-						_ = sendPacket(GlobalConn, addr, s, frame)
-					}
-				}
-			}
+			// Push it to ADMITTED peers immediately (keepalive gossip keeps
+			// re-flooding). Unapproved devices never receive the sealed key.
+			sendToAdmittedPeers(buildSealedKeyFrame())
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
 			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
@@ -1265,6 +1295,21 @@ func startControlServer(socketPath string) {
 		if err != nil || !adminPubValid(raw) {
 			http.Error(w, "bad pubkey", http.StatusBadRequest)
 			return
+		}
+		// This socket is reachable by local processes, so it must not be a way
+		// to take over a network's admin. Setting the SAME key is a no-op
+		// refresh; a first key or a replacement for a stale bare key (no sealed
+		// blob held) must match admin_key_fp when one is pinned; a node that
+		// holds a live sealed blob never switches keys here (factory-reset it).
+		if !adminSameKey(raw) {
+			if adminKeySet() && getSealedAdminKey() != nil {
+				http.Error(w, "this node already trusts a different admin key; factory-reset it (APGO_RESET_ADMIN=1) to change the admin key", http.StatusConflict)
+				return
+			}
+			if pin := adminKeyPinned(); pin != "" && adminKeyFingerprint(raw) != pin {
+				http.Error(w, "admin key does not match the pinned admin_key_fp "+pin, http.StatusConflict)
+				return
+			}
 		}
 		setAdminPub(raw, true)
 		// Seed it to every established peer right away.

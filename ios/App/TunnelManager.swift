@@ -204,10 +204,13 @@ final class TunnelManager: ObservableObject {
         var resolved: Bool = false
         var stale: Bool = false
         var selfFP: String = ""
+        /// "ip-binding" when the problem is that this device's manually set
+        /// address cannot be verified by other devices (not a collision).
+        var source: String = ""
 
         enum CodingKeys: String, CodingKey {
             case oldIP = "old_ip", newIP = "new_ip", peerName = "peer_name"
-            case reason, resolved, stale, selfFP = "self_fp"
+            case reason, resolved, stale, selfFP = "self_fp", source
         }
     }
 
@@ -313,7 +316,7 @@ struct Peer: Decodable, Identifiable {
     let keyFP: String
     let established: Bool
     let postQuantum: Bool
-    let isExit: Bool       // peer advertises as an internet exit node
+    let isExit: Bool       // peer advertises as an INTERNAL exit node (this network only)
     let activeExit: Bool   // the exit THIS device currently egresses through
     let relayed: Bool      // reachable only via a relay (no direct session)
     let via: String        // relayed rows: the relaying node (overlay IP or endpoint)

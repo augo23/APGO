@@ -7,9 +7,20 @@ struct OverlayConfig: Codable, Equatable {
     var psk: String = ""                  // "base64:..." pre-shared key
     var friendlyName: String = ""         // human label shown to peers
     var useExit: Bool = false             // route ALL traffic via an exit node (full VPN)
-    var exitPeer: String = ""             // pin ONE exit (overlay IP / device name / key); "" = fastest
+    var exitPeer: String = ""             // pin ONE exit (overlay IP / device name / key / "public"); "" = fastest
+    // Let Full VPN fall back to a PUBLIC exit node (another APGO user's
+    // device) when this network has no internal exit online. Optional so
+    // configs saved by older builds still decode; nil = off.
+    var usePublicExits: Bool? = nil
+    // Reach peers through a public relay when no direct path can be punched
+    // (symmetric NAT / CGNAT). Optional: nil = the core's default, which is on.
+    var usePublicRelays: Bool? = nil
     var postQuantum: Bool = true          // hybrid post-quantum layer (ML-KEM-768), on by default
     var pqAuth: Bool = true               // quantum-resistant handshake auth (XXpsk0), on by default
+    // Pin for the network admin key ("sha256:..."), taken from the join QR.
+    // The core refuses any other admin key a peer seeds. Optional so configs
+    // saved by older builds still decode; nil = unpinned (legacy TOFU).
+    var adminKeyFP: String? = nil
     var cipher: String = ""               // transport cipher; "" = core default, set by join QR
     var ipv6: Bool = true                 // dual-stack transport (direct v6, no NAT), on by default
     var overlayIP: String = "10.22.55.30" // this node's overlay address
@@ -25,6 +36,10 @@ struct OverlayConfig: Codable, Equatable {
     // being unioned back with the defaults. Optional so configs saved by older
     // builds still decode (a missing key must not wipe the user's settings).
     var trackersEdited: Bool? = nil
+    /// In-app diagnostic log capture: 0 = off, 1 = normal, 2 = verbose.
+    /// Optional so configs saved by older builds still decode — a missing key
+    /// must read as "off", not as some other level.
+    var logLevel: Int? = nil
     var stunServers: [String] = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
     var rendezvousServers: [String] = []  // HTTPS discovery servers (from a join QR)
     var mtu: Int = 1280
@@ -42,6 +57,81 @@ struct OverlayConfig: Codable, Equatable {
         "udp://opentracker.io:6969/announce",
         "udp://tracker.dler.org:6969/announce"
     ]
+
+    // --- diagnostics ---------------------------------------------------------
+    //
+    // The overlay core runs inside the TUNNEL EXTENSION, and this app process
+    // cannot read the extension's own container — which is why the node key
+    // and provisions are unreachable from here (see requestStateWipe). A log
+    // written beside them could never be exported, so diagnostics go to the
+    // shared App Group container instead, where both targets can reach them.
+
+    /// The App Group declared on BOTH targets (App/APGO.entitlements and
+    /// Tunnel/APGOTunnel.entitlements). Changing it here alone will silently
+    /// produce an unreadable log.
+    static let appGroupID = "group.com.you.APGOverlay"
+
+    static var logDirectoryURL: URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: appGroupID)?
+            .appendingPathComponent("Logs", isDirectory: true)
+    }
+
+    /// Current file plus the single rotated generation behind it. Keep these
+    /// names in sync with ios/core/mobilelog.go, which appends ".1" on rotate.
+    static var logFileURL: URL? {
+        logDirectoryURL?.appendingPathComponent("apgo.log")
+    }
+
+    static var rotatedLogFileURL: URL? {
+        logDirectoryURL?.appendingPathComponent("apgo.log.1")
+    }
+
+    private static var logFilesOldestFirst: [URL] {
+        [rotatedLogFileURL, logFileURL]
+            .compactMap { $0 }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// Total bytes captured across both generations.
+    static func logSizeBytes() -> Int64 {
+        logFilesOldestFirst.reduce(into: Int64(0)) { total, url in
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            total += (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        }
+    }
+
+    static func clearLogs() {
+        for url in [rotatedLogFileURL, logFileURL].compactMap({ $0 }) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Merge both generations into ONE file for the share sheet, oldest first
+    /// so the result reads chronologically. Returns nil when nothing has been
+    /// captured yet.
+    ///
+    /// Copying rather than sharing the live file is deliberate: the extension
+    /// may be appending to (or rotating) it at this instant, and the share
+    /// sheet can hold its URL well past the moment the user tapped.
+    static func exportLog() -> URL? {
+        let sources = logFilesOldestFirst
+        guard !sources.isEmpty else { return nil }
+
+        let name = "apgo-log-\(Int(Date().timeIntervalSince1970)).txt"
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: dest)
+        guard FileManager.default.createFile(atPath: dest.path, contents: nil),
+              let out = try? FileHandle(forWritingTo: dest) else { return nil }
+        defer { try? out.close() }
+
+        for url in sources {
+            if let data = try? Data(contentsOf: url, options: .mappedIfSafe) {
+                try? out.write(contentsOf: data)
+            }
+        }
+        return dest
+    }
 
     // --- persistence ---------------------------------------------------------
     // The config MUST survive app relaunches and network changes (a dropped
@@ -149,6 +239,8 @@ struct OverlayConfig: Codable, Equatable {
             "psk": psk,
             "friendly_name": friendlyName,
             "use_exit": useExit,
+            "use_public_exits": usePublicExits ?? false,
+            "use_public_relays": usePublicRelays ?? true,
             "exit_peer": exitPeer.trimmingCharacters(in: .whitespacesAndNewlines),
             "post_quantum": postQuantum,
             "pq_auth": pqAuth,
@@ -165,6 +257,16 @@ struct OverlayConfig: Codable, Equatable {
             "rendezvous_servers": rendezvousServers,
             "tun": ["mtu": mtu]
         ]
+        if let fp = adminKeyFP?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {
+            dict["admin_key_fp"] = fp
+        }
+        // In-app diagnostics. Sent ONLY when switched on, so an untouched
+        // install gets exactly the previous behavior (stderr only) and never
+        // writes a file it was not asked for.
+        if let lvl = logLevel, lvl > 0, let path = Self.logFileURL?.path {
+            dict["log_path"] = path
+            dict["log_level"] = lvl
+        }
         // One-shot state wipe (see requestStateWipe). Nonce-guarded in the
         // core, so resending it on every connect is harmless.
         let nonce = Self.stateWipeNonce()

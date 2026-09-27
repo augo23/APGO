@@ -250,9 +250,7 @@ func networkPageHTML() string {
   <h1>Security policy</h1>
   <p class="sub">Toggle the hybrid post-quantum layer (ML-KEM-768) for the WHOLE network with the network admin password. Applies live to every device on every platform — no reconnect. Slightly slower; safe to roll out.</p>
   <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0"><input id="pq" type="checkbox" `+pqChecked+` style="width:auto"> Post-quantum encryption (network-wide)</label>
-  <label>Network admin password</label>
-  <input id="pqpw" type="password">
-  <button type="button" class="primary" onclick="applyPolicy()">Apply security policy</button>
+  <button type="button" class="primary" onclick="applyPolicy()">Apply security policy…</button>
   <p id="pmsg" class="msg"></p>
   <hr style="border:0;border-top:1px solid var(--line);margin:26px 0">
   <h1>Network settings</h1>
@@ -262,19 +260,25 @@ func networkPageHTML() string {
   <input id="netname" type="text" spellcheck="false" value="`+htmlEsc(current)+`">
   <label>New pre-shared key</label>
   <div class="row"><input id="psk" type="text" spellcheck="false" placeholder="base64:…"><button type="button" class="gen" onclick="genPsk()">Generate</button></div>
-  <label>Network admin password</label>
-  <input id="pw" type="password">
-  <button type="button" class="primary" onclick="rotate()">Apply rotation</button>
+  <button type="button" class="primary" onclick="rotate()">Apply rotation…</button>
   <p id="msg" class="msg"></p>
   <p class="sub" style="margin-top:18px"><a href="/settings" style="color:var(--fg)">← Back to Settings</a></p>
 `, `
 function genPsk(){const b=new Uint8Array(32);crypto.getRandomValues(b);document.getElementById('psk').value='base64:'+btoa(String.fromCharCode.apply(null,b));}
-async function applyPolicy(){const msg=document.getElementById('pmsg');msg.textContent='Signing + distributing…';
- const r=await fetch('/api/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({post_quantum:document.getElementById('pq').checked,password:document.getElementById('pqpw').value})});
- const t=await r.text();msg.textContent=r.ok?'Security policy applied network-wide.':('Failed: '+t);msg.style.color=r.ok?'#38c172':'#e6b400';document.getElementById('pqpw').value='';}
-async function rotate(){const msg=document.getElementById('msg');msg.textContent='Signing + distributing…';
- const r=await fetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({network_name:document.getElementById('netname').value,psk:document.getElementById('psk').value,password:document.getElementById('pw').value})});
- const t=await r.text();msg.textContent=r.ok?'Rotation sent. Devices reconnect shortly.':('Failed: '+t);msg.style.color=r.ok?'#38c172':'#e6b400';}
+async function applyPolicy(){
+ const msg=document.getElementById('pmsg');msg.textContent='';
+ const on=document.getElementById('pq').checked;
+ const ok=await withAdminPassword({title:'Apply security policy',who:'Post-quantum encryption '+(on?'ON':'OFF')+' for every device on the network.',ok:'Apply',working:'Signing + distributing…'},
+  async(password)=>{const r=await fetch('/api/policy',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},body:JSON.stringify({post_quantum:on,password})});
+   return r.ok?null:('Failed: '+(await r.text()));});
+ if(ok){msg.textContent='Security policy applied network-wide.';msg.style.color='#38c172';}}
+async function rotate(){
+ const msg=document.getElementById('msg');msg.textContent='';
+ const network_name=document.getElementById('netname').value,psk=document.getElementById('psk').value;
+ const ok=await withAdminPassword({title:'Rotate network identity',who:'Every device reconnects under the new name and key. Offline devices will not follow.',ok:'Rotate',danger:true,working:'Signing + distributing…'},
+  async(password)=>{const r=await fetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'overlay-admin'},body:JSON.stringify({network_name,psk,password})});
+   return r.ok?null:('Failed: '+(await r.text()));});
+ if(ok){msg.textContent='Rotation sent. Devices reconnect shortly.';msg.style.color='#38c172';}}
 `)
 }
 
@@ -322,6 +326,7 @@ func featurePageShell(title, body, script string) string {
 ` + body + `
     <div><a class="back" href="/">← Back to dashboard</a></div>
   </div>
+` + adminPasswordDialog + `
 <script>
 ` + script + `
 </script>
@@ -360,6 +365,12 @@ func handleAdminNodeConfig(w http.ResponseWriter, r *http.Request) {
 		ExitUp       *string   `json:"exit_up"`
 		ExitDown     *string   `json:"exit_down"`
 		ExitQuota    *string   `json:"exit_quota"`
+		// Public exit node (share with any APGO user).
+		PublicExit           *bool   `json:"public_exit"`
+		PublicExitUp         *string `json:"public_exit_up"`
+		PublicExitDown       *string `json:"public_exit_down"`
+		PublicExitQuota      *string `json:"public_exit_quota"`
+		PublicExitMaxClients *int64  `json:"public_exit_max_clients"`
 		Password     string    `json:"password"`
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 32768))
@@ -403,6 +414,24 @@ func handleAdminNodeConfig(w http.ResponseWriter, r *http.Request) {
 		ExitUp:       rate(req.ExitUp),
 		ExitDown:     rate(req.ExitDown),
 		ExitQuota:    rate(req.ExitQuota),
+		PublicExit:           req.PublicExit,
+		PublicExitUp:         rate(req.PublicExitUp),
+		PublicExitDown:       rate(req.PublicExitDown),
+		PublicExitQuota:      rate(req.PublicExitQuota),
+		PublicExitMaxClients: req.PublicExitMaxClients,
+	}
+	if c.PublicExitMaxClients != nil && (*c.PublicExitMaxClients < 1 || *c.PublicExitMaxClients > 1024) {
+		http.Error(w, "public exit: max clients must be between 1 and 1024", http.StatusBadRequest)
+		return
+	}
+	// A public exit is only allowed on a node that already offers public
+	// service: DHT on and public relay on. Refuse at signing time when the
+	// same record turns either off (the node itself enforces it too).
+	if c.PublicExit != nil && *c.PublicExit {
+		if (c.DHT != nil && !*c.DHT) || (c.PublicRelay != nil && !*c.PublicRelay) {
+			http.Error(w, "a public exit node must also have the DHT and public relay turned on", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Refuse an unlimited public relay at the point of signing, not only on the

@@ -168,6 +168,7 @@ class MainActivity : FragmentActivity() {
                         it.cipher?.let { c -> state.cipher = c }
                         state.postQuantum = it.postQuantum
                         state.pqAuth = it.pqAuth
+                        state.adminKeyFp = it.adminKeyFp
                     }
                 }
                 if (appLock.isLocked.value) {
@@ -235,6 +236,9 @@ data class JoinInfo(
     val cipher: String? = null,          // "chacha" or "aesgcm"
     val postQuantum: Boolean = true,     // quantum-safe by default
     val pqAuth: Boolean = true,
+    // Pin for the network admin key ("sha256:..."). With it the core refuses
+    // any other admin key a peer tries to seed. Blank on older admin panels.
+    val adminKeyFp: String = "",
 ) {
     companion object {
         fun parse(s: String): JoinInfo? = try {
@@ -257,7 +261,8 @@ data class JoinInfo(
                     JoinInfo(n, p, cidr, rv, o.optString("rendezvous_auth"), tr,
                         cipher = o.optString("cipher").ifBlank { null },
                         postQuantum = o.optBoolean("post_quantum", true),
-                        pqAuth = o.optBoolean("pq_auth", true))
+                        pqAuth = o.optBoolean("pq_auth", true),
+                        adminKeyFp = o.optString("admin_key_fp"))
                 }
             }
         } catch (e: Exception) { null }
@@ -283,6 +288,13 @@ data class UiConfig(
     val cipher: String = "",           // "" = core default; set by join QR
     val trackers: List<String> = emptyList(),  // from join QR; core unions defaults
     val trackersEdited: Boolean = false, // user edited the list in Settings — it's authoritative
+    // Full VPN may fall back to a PUBLIC exit node (another APGO user's
+    // device) when this network has no internal exit online. Opt-in.
+    val usePublicExits: Boolean = false,
+    // Reach peers through a public relay when no direct path can be punched
+    // (symmetric NAT / CGNAT). On by default, like the core.
+    val usePublicRelays: Boolean = true,
+    val adminKeyFp: String = "",       // admin key pin from the join QR; "" = unpinned
 ) {
     private fun prefix(): String {
         val net = overlayCidr.substringBefore('/')
@@ -304,6 +316,8 @@ data class UiConfig(
             put("psk", psk.trim())
             put("friendly_name", friendlyName.trim())
             put("use_exit", useExit)
+            put("use_public_exits", usePublicExits)
+            put("use_public_relays", usePublicRelays)
             put("exit_peer", exitPeer.trim())
             put("post_quantum", postQuantum)
             put("pq_auth", pqAuth)
@@ -314,6 +328,7 @@ data class UiConfig(
             put("key_path", keyPath)
             put("rendezvous_servers", JSONArray(rendezvousServers))
             put("rendezvous_auth", rendezvousAuth.trim())
+            if (adminKeyFp.isNotBlank()) put("admin_key_fp", adminKeyFp.trim())
             if (trackers.isNotEmpty()) put("trackers", JSONArray(trackers))
             // User-edited list is AUTHORITATIVE (persisted to the managed
             // trackers.txt, same semantics as the desktop tracker manager) —
@@ -377,9 +392,13 @@ class AppState {
     var rendezvousAuth by mutableStateOf("")
     var trackers by mutableStateOf<List<String>>(emptyList())
     var trackersEdited by mutableStateOf(false)
+    var usePublicExits by mutableStateOf(false)
+    var usePublicRelays by mutableStateOf(true)
+    var adminKeyFp by mutableStateOf("")
 
     fun toUiConfig() = UiConfig(network, psk, friendly, cidr, octet, useExit, exitPeer,
-        rendezvous, rendezvousAuth, postQuantum, pqAuth, ipv6, cipher, trackers, trackersEdited)
+        rendezvous, rendezvousAuth, postQuantum, pqAuth, ipv6, cipher, trackers, trackersEdited,
+        usePublicExits, usePublicRelays, adminKeyFp)
 
     companion object {
         // The core's curated default trackers (keep in sync with
@@ -406,11 +425,14 @@ class AppState {
         put("network", network); put("psk", psk); put("friendly", friendly)
         put("cidr", cidr); put("octet", octet)
         put("useExit", useExit); put("exitPeer", exitPeer)
+        put("usePublicExits", usePublicExits)
+        put("usePublicRelays", usePublicRelays)
         put("postQuantum", postQuantum); put("pqAuth", pqAuth); put("ipv6", ipv6)
         put("cipher", cipher)
         put("rendezvous", JSONArray(rendezvous)); put("rendezvousAuth", rendezvousAuth)
         put("trackers", JSONArray(trackers))
         put("trackersEdited", trackersEdited)
+        put("adminKeyFp", adminKeyFp)
     }
 
     /// Load a network profile into this state (missing keys = defaults).
@@ -422,6 +444,8 @@ class AppState {
         octet = o.optString("octet").ifBlank { "30" }
         useExit = o.optBoolean("useExit", false)
         exitPeer = o.optString("exitPeer")
+        usePublicExits = o.optBoolean("usePublicExits", false)
+        usePublicRelays = o.optBoolean("usePublicRelays", true)
         postQuantum = o.optBoolean("postQuantum", true)
         pqAuth = o.optBoolean("pqAuth", true)
         ipv6 = o.optBoolean("ipv6", true)
@@ -432,6 +456,7 @@ class AppState {
         trackers = o.optJSONArray("trackers")?.let { a ->
             (0 until a.length()).map { a.getString(it) } } ?: emptyList()
         trackersEdited = o.optBoolean("trackersEdited", false)
+        adminKeyFp = o.optString("adminKeyFp")
     }
 }
 
@@ -443,7 +468,7 @@ data class Peer(
     val keyFp: String,
     val established: Boolean,
     val postQuantum: Boolean,
-    val isExit: Boolean,       // peer advertises as an internet exit node
+    val isExit: Boolean,       // peer advertises as an INTERNAL exit node (this network only)
     val activeExit: Boolean,   // the exit THIS device currently egresses through
     val lastSeenUnix: Long,
     // Admission control. The app could not previously see these at all, so a
@@ -665,10 +690,11 @@ fun MainScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Full VPN")
-                    Text(if (state.exitPeer.isBlank())
-                        "Route all traffic via the fastest exit node"
-                    else
-                        "Route all traffic via the pinned exit only",
+                    Text(when {
+                        state.exitPeer.isBlank() -> "Route all traffic via the fastest internal exit node"
+                        state.exitPeer.trim().equals("public", ignoreCase = true) -> "Route all traffic via a public exit node"
+                        else -> "Route all traffic via the pinned internal exit only"
+                    },
                         style = MaterialTheme.typography.bodySmall)
                 }
                 Switch(checked = state.useExit, onCheckedChange = {
@@ -683,9 +709,52 @@ fun MainScreen(
                 })
             }
             if (state.useExit) {
-                Text("Needs at least one device on the mesh with exit-node mode enabled (a Linux server or a Mac — phones can't be exits). Exit-capable devices show a green E in the peer list.",
+                Text("Needs a device on this network with “Internal exit node” turned on (a Linux server, Mac, or Windows PC — phones can't be exits). Internal exit nodes show a green E in the peer list.",
                     style = MaterialTheme.typography.bodySmall)
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Use public exit nodes")
+                    Text("When my network has no internal exit online",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                Switch(checked = state.usePublicExits, onCheckedChange = {
+                    state.usePublicExits = it
+                    if (connected && state.useExit) {
+                        scope.launch {
+                            onDisconnect()
+                            delay(1500)
+                            onConnect(state.toUiConfig())
+                        }
+                    }
+                })
+            }
+            if (state.usePublicExits) {
+                Text("A public exit node is run by another APGO user. Traffic is encrypted to it, but like any VPN provider it can see which sites you visit, and they see its IP address.",
+                    style = MaterialTheme.typography.bodySmall, color = Color(0xFFE6B400))
+            }
+            // Relaying keeps a peer reachable when neither side can punch a
+            // direct path (symmetric NAT, CGNAT). On by default; the switch is
+            // here so it can be turned off and so its state is visible.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Use public relays")
+                    Text("When no direct path to a peer can be punched",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                Switch(checked = state.usePublicRelays, onCheckedChange = {
+                    state.usePublicRelays = it
+                    if (connected) {
+                        scope.launch {
+                            onDisconnect()
+                            delay(1500)
+                            onConnect(state.toUiConfig())
+                        }
+                    }
+                })
+            }
+            Text("The relay carries ciphertext only — it holds no key. Off means peers with no direct path are unreachable. This app has no DHT switch: it finds peers, relays and public exits through trackers, rendezvous servers and peer exchange (the DHT runs on servers and desktops).",
+                style = MaterialTheme.typography.bodySmall)
             // Full VPN captures ALL traffic, so until an exit is selected the
             // internet is deliberately paused (fail-closed, no leaks). Show the
             // live outproxy state from the core so this is diagnosable on the
@@ -705,19 +774,30 @@ fun MainScreen(
                     known.append(label)
                     if (!o.optBoolean("reachable")) known.append(" (unreachable)")
                 }
+                val pub = exits?.optJSONObject("public_exit")
                 if (selLabel != null) {
-                    Text("✓ Exit: $selLabel",
+                    Text("✓ Internal exit: $selLabel",
                         style = MaterialTheme.typography.bodySmall, color = Color(0xFF3FB950))
+                } else if (pub != null && pub.optBoolean("active")) {
+                    val rtt = pub.optLong("rtt_ms", 0)
+                    Text("✓ Public exit: ${pub.optString("endpoint")}" + (if (rtt > 0) " · $rtt ms" else ""),
+                        style = MaterialTheme.typography.bodySmall, color = Color(0xFFC792EA))
                 } else {
-                    Text(if (peers.any { it.isExit })
-                            "⚠ Connecting to an exit node… internet is paused until one is selected."
-                        else
-                            "⚠ No exit node is reachable — internet is paused. Enable exit-node mode on a Linux, macOS, or Windows node on this mesh (green E), or turn Full VPN off.",
+                    Text(when {
+                            peers.any { it.isExit } ->
+                                "⚠ Connecting to an internal exit node… internet is paused until one is selected."
+                            pub != null && pub.optBoolean("searching") ->
+                                "⚠ No internal exit node — looking for a public exit node… internet is paused until one answers."
+                            state.usePublicExits ->
+                                "⚠ No exit node is reachable — internet is paused. Turn on “Internal exit node” on a Linux, macOS, or Windows device on this network (green E), wait for a public exit node, or turn Full VPN off."
+                            else ->
+                                "⚠ No exit node is reachable — internet is paused. Turn on “Internal exit node” on a Linux, macOS, or Windows device on this network (green E), allow public exit nodes, or turn Full VPN off."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error)
                     val pin = exits?.optString("pin").orEmpty()
                     Text(if (exArr == null || exArr.length() == 0)
-                            "Diagnostics: no exit announcement has reached this device. The exit must show “exit-node mode ON” in its log AND have a direct (●) session to this phone — a relayed exit can't carry traffic."
+                            "Diagnostics: no internal exit announcement has reached this device. The exit must show “exit-node mode ON” in its log AND have a direct (●) session to this phone — a relayed exit can't carry traffic."
                         else
                             "Diagnostics: known exits — $known" +
                             (if (pin.isNotEmpty()) " · pinned to “$pin” — the pin must match the exit's name, IP, or fingerprint exactly" else ""),
@@ -727,7 +807,7 @@ fun MainScreen(
             }
             if (state.useExit) {
                 OutlinedTextField(state.exitPeer, { state.exitPeer = it },
-                    label = { Text("Exit node (blank = fastest)") },
+                    label = { Text("Internal exit node (blank = fastest, “public” = public only)") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
             }
 
@@ -749,6 +829,7 @@ fun MainScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
                         "⚠ " + (if (resolved) "Overlay IP changed automatically"
+                                else if (c.optString("source", "") == "ip-binding") "Overlay IP can't be verified"
                                 else "Overlay IP already claimed"),
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFFE6A400)
@@ -991,8 +1072,7 @@ fun PeerRow(p: Peer, canApprove: Boolean = false, onApprove: (Peer) -> Unit = {}
                 Text(p.name, style = MaterialTheme.typography.bodySmall)
             }
         }
-        // Exit badges. Green "E" = this device can be an exit node for the VPN
-        // relay; the highlighted badge = the exit THIS device's internet
+        // Exit badges. Green "E" = an INTERNAL exit node (serves this network); the highlighted badge = the exit THIS device's internet
         // traffic currently egresses through (full VPN).
         if (p.activeExit) {
             Text("\uD83C\uDF10 EXIT", style = MaterialTheme.typography.labelSmall,

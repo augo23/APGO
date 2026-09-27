@@ -80,10 +80,19 @@ overlay IP on `ovl0`. The node key and managed state live in `/etc/apgo/`
   devices (peers also need a route for your LAN subnet via this router's
   overlay IP).
 
-## Exit node
+## Internal exit node
 
 `exit_node: true` NAT setup in-process uses iptables; on modern
 (nftables-based) OpenWrt either install `iptables-nft`, or add the
 masquerade yourself: enable `masq` on the `wan` zone for the overlay subnet
 (`uci set firewall.@zone[1].masq_src='10.22.55.0/24'` style) and forward
 `apgo` → `wan`.
+
+## Public exit node
+
+`option public_exit '1'` shares the router's internet with **any APGO user**
+(public internet only) and turns on the DHT and the public relay it needs.
+The in-process NAT and block rules use iptables, like the internal exit, so on
+nftables-based OpenWrt install `iptables-nft` first. Its own limits:
+`public_exit_up_limit`, `public_exit_down_limit`, `public_exit_quota`,
+`public_exit_max_clients`. Their traffic leaves from the router's WAN address.

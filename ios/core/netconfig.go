@@ -123,13 +123,8 @@ func adoptNetConfig(nc SignedNetworkConfig) {
 
 	// Flood to every peer NOW (over the still-valid old tunnel), then restart a
 	// few seconds later so the change has time to propagate before we drop.
-	if f := buildNetConfigFrame(nc); f != nil && GlobalSessions != nil && GlobalConn != nil {
-		for _, addr := range GlobalSessions.EstablishedAddrs() {
-			if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
-				_ = sendPacket(GlobalConn, addr, s, f)
-			}
-		}
-	}
+	// Only ADMITTED peers get the rotated config (it carries the new PSK).
+	sendToAdmittedPeers(buildNetConfigFrame(nc))
 	time.AfterFunc(4*time.Second, func() {
 		log.Printf("[netconfig] restarting now to apply epoch %d", nc.Epoch)
 		os.Exit(0) // supervisor (app / k8s / compose) restarts us with the new config
@@ -154,13 +149,5 @@ func gossipNetConfig() {
 	if !ok {
 		return
 	}
-	f := buildNetConfigFrame(nc)
-	if f == nil {
-		return
-	}
-	for _, addr := range GlobalSessions.EstablishedAddrs() {
-		if s := GlobalSessions.GetByAddr(addr); s != nil && s.Established() {
-			_ = sendPacket(GlobalConn, addr, s, f)
-		}
-	}
+	sendToAdmittedPeers(buildNetConfigFrame(nc))
 }

@@ -24,10 +24,15 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+// usingExit reports whether full-VPN mode is on (shared code calls this;
+// the mobile core sets useExit once per tunnel start).
+func usingExit() bool { return useExit }
 
 var (
 	amExit  bool // this node forwards internet traffic for clients
@@ -140,7 +145,10 @@ func buildExitAnnounce() []byte {
 	if !amExit {
 		return nil
 	}
-	return append(append([]byte(nil), ctlMagic...), 'E')
+	// One payload byte (version). handleControl on every build discards
+	// control frames shorter than two bytes, so the bare "E" this used to
+	// send was dropped on arrival and no device ever learned of an exit.
+	return append(append([]byte(nil), ctlMagic...), 'E', 1)
 }
 
 // handleExitAnnounce records a peer that advertised itself as an exit.
@@ -268,6 +276,10 @@ func noteExitDrop(dst string) {
 	why := exitDiagnosis()
 	if why == "" {
 		why = "no exit selected"
+	}
+	// (Checked outside exitDiagnosis: that runs under exitMu.)
+	if pxUsePublic.Load() {
+		why += "; public exit nodes are allowed but none is connected yet"
 	}
 	log.Printf("[exit] FULL-VPN IS DROPPING TRAFFIC: %d packet(s) for the internet (most recently %s) discarded because %s",
 		n, dst, why)
@@ -399,4 +411,34 @@ func exitSelectionLoop() {
 			}
 		}
 	}
+}
+
+// exitAllowLAN lets an exit forward to private, loopback, link-local and other
+// non-public destinations (its LAN, 169.254.169.254 cloud metadata, ...).
+// OFF by default (EXIT_ALLOW_LAN=1 turns it on): an exit is for reaching the
+// INTERNET, not a pivot into the exit host's own networks. Mirrors client/exit.go.
+func exitAllowLAN() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("EXIT_ALLOW_LAN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// exitForwardAllowed is the exit node's outbound policy for a client packet's
+// destination: outside the overlay, and public unless EXIT_ALLOW_LAN.
+func exitForwardAllowed(dst string) bool {
+	if !isInternetDst(dst) {
+		return false
+	}
+	if exitAllowLAN() {
+		return true
+	}
+	v4 := net.ParseIP(dst).To4()
+	if v4 == nil {
+		return false
+	}
+	var a [4]byte
+	copy(a[:], v4)
+	return pxIsPublicIPv4(a)
 }

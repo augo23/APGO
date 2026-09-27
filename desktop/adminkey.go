@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -89,9 +90,9 @@ func adminPublicKeyB64() string {
 	return ""
 }
 
-// decryptSeed derives the key-encryption key from password and opens the sealed
-// Ed25519 seed. The caller MUST zero the returned seed after use.
-func decryptSeed(akf adminKeyFile, password string) ([]byte, error) {
+// openSeed derives the key-encryption key from password and opens the sealed
+// seed. The caller MUST zero the returned seed after use.
+func openSeed(akf adminKeyFile, password string) ([]byte, error) {
 	salt, _ := base64.StdEncoding.DecodeString(akf.Salt)
 	nonce, _ := base64.StdEncoding.DecodeString(akf.Nonce)
 	sealed, _ := base64.StdEncoding.DecodeString(akf.Sealed)
@@ -109,8 +110,8 @@ func genAdminKey(password string) (string, error) {
 	if adminKeyAvailable() {
 		return "", errors.New("an admin key already exists for this network")
 	}
-	if len(password) < 8 {
-		return "", errors.New("password must be at least 8 characters")
+	if len(password) < minAdminPasswordLen {
+		return "", fmt.Errorf("password must be at least %d characters", minAdminPasswordLen)
 	}
 	// Post-quantum admin key: a random seed, from which the ML-DSA-65 keypair is
 	// derived deterministically. Only the 32-byte seed is encrypted at rest.
@@ -128,8 +129,8 @@ func genAdminKey(password string) (string, error) {
 	}
 	dk := pbkdf2SHA256([]byte(password), salt, pbkdfIter, 32)
 	nonce, sealed, err := aesgcmSeal(dk, seed)
-	zero(seed)
 	if err != nil {
+		zero(seed)
 		return "", err
 	}
 	akf := adminKeyFile{
@@ -141,6 +142,8 @@ func genAdminKey(password string) (string, error) {
 		Sealed:    base64.StdEncoding.EncodeToString(sealed),
 		Epoch:     time.Now().UnixNano(),
 	}
+	signSealedBlob(&akf, seed)
+	zero(seed)
 	if err := saveAdminKeyFile(akf); err != nil {
 		return "", err
 	}
@@ -154,8 +157,8 @@ func genAdminKey(password string) (string, error) {
 // changeAdminPassword re-encrypts the admin key under a new password (given the
 // current one), bumps the epoch, and re-distributes it network-wide.
 func changeAdminPassword(oldPw, newPw string) error {
-	if len(newPw) < 8 {
-		return errors.New("new password must be at least 8 characters")
+	if len(newPw) < minAdminPasswordLen {
+		return fmt.Errorf("new password must be at least %d characters", minAdminPasswordLen)
 	}
 	adminKeyMu.Lock()
 	defer adminKeyMu.Unlock()
@@ -164,7 +167,7 @@ func changeAdminPassword(oldPw, newPw string) error {
 	if !ok {
 		return errors.New("no admin key available on this device")
 	}
-	seed, err := decryptSeed(akf, oldPw)
+	seed, err := openSeed(akf, oldPw)
 	if err != nil {
 		return errWrongPassword
 	}
@@ -184,6 +187,7 @@ func changeAdminPassword(oldPw, newPw string) error {
 	akf.Sealed = base64.StdEncoding.EncodeToString(sealed)
 	akf.Iter = pbkdfIter
 	akf.Epoch = time.Now().UnixNano()
+	signSealedBlob(&akf, seed)
 
 	if adminKeyConfigured() {
 		_ = saveAdminKeyFile(akf)
