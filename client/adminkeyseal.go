@@ -192,7 +192,7 @@ func storeSealedAdminKeyForce(blob []byte, persist, force bool) bool {
 	}
 	if persist && path != "" {
 		tmp := path + ".tmp"
-		if os.WriteFile(tmp, blob, 0o600) == nil {
+		if writeFileNoFollow(tmp, blob, 0o600) == nil {
 			_ = os.Rename(tmp, path)
 		}
 	}

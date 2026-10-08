@@ -882,7 +882,7 @@ func (d *dhtState) saveNodes() {
 		}
 	}
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+	if err := writeFileNoFollow(tmp, buf, 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, p)

@@ -155,14 +155,14 @@ func loadStoredNetworks() []SecondaryNetwork {
 
 func saveStoredNetwork(n SecondaryNetwork) error {
 	dir := filepath.Join(networksBaseDir(), n.id())
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllNoLink(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := yaml.Marshal(&n)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(netProfilePath(n.id()), data, 0o600)
+	return writeFileNoFollow(netProfilePath(n.id()), data, 0o600)
 }
 
 func removeStoredNetwork(name string) {
@@ -325,7 +325,7 @@ func superviseChild(c *netChild) {
 func buildChildCmd(parent *ClientConfig, n SecondaryNetwork) (*exec.Cmd, error) {
 	id := n.id()
 	dir := filepath.Join(networksBaseDir(), id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllNoLink(dir, 0o700); err != nil {
 		return nil, err
 	}
 	cc := childConfig(parent, n)
@@ -334,7 +334,7 @@ func buildChildCmd(parent *ClientConfig, n SecondaryNetwork) (*exec.Cmd, error) 
 		return nil, err
 	}
 	cfgPath := filepath.Join(dir, "client.yaml")
-	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
+	if err := writeFileNoFollow(cfgPath, data, 0o600); err != nil {
 		return nil, err
 	}
 	exe, err := os.Executable()
@@ -395,7 +395,7 @@ func buildChildCmd(parent *ClientConfig, n SecondaryNetwork) (*exec.Cmd, error) 
 	if pub := adminPubBytes(); len(pub) > 0 {
 		p := filepath.Join(dir, "admin.pub")
 		if _, err := os.Stat(p); err != nil {
-			_ = os.WriteFile(p, []byte(base64.StdEncoding.EncodeToString(pub)), 0o600)
+			_ = writeFileNoFollow(p, []byte(base64.StdEncoding.EncodeToString(pub)), 0o600)
 		}
 	}
 	sealedMu.Lock()
@@ -404,7 +404,7 @@ func buildChildCmd(parent *ClientConfig, n SecondaryNetwork) (*exec.Cmd, error) 
 	if len(blob) > 0 {
 		p := filepath.Join(dir, "sealed-admin.json")
 		if _, err := os.Stat(p); err != nil {
-			_ = os.WriteFile(p, blob, 0o600)
+			_ = writeFileNoFollow(p, blob, 0o600)
 		}
 	}
 	return cmd, nil

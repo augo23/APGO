@@ -62,7 +62,7 @@ func saveTrackers(list []string) error {
 	// One tracker per line, separated by ONE blank line — the canonical format
 	// of config/trackers.txt, shared by every platform's tracker editor.
 	// (Readers skip blank lines, so files in either format parse fine.)
-	if err := os.WriteFile(tmp, []byte(strings.Join(out, "\n\n")+"\n"), 0o644); err != nil {
+	if err := writeFileNoFollow(tmp, []byte(strings.Join(out, "\n\n")+"\n"), 0o644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

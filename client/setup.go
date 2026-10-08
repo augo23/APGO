@@ -114,7 +114,7 @@ func runSetupServerAndWait(sock string) {
 		}
 		blob, _ := json.MarshalIndent(s, "", "  ")
 		tmp := setupFilePath() + ".tmp"
-		if os.WriteFile(tmp, blob, 0o600) != nil || os.Rename(tmp, setupFilePath()) != nil {
+		if writeFileNoFollow(tmp, blob, 0o600) != nil || os.Rename(tmp, setupFilePath()) != nil {
 			http.Error(w, "could not save setup (is the state volume writable?)", http.StatusInternalServerError)
 			return
 		}

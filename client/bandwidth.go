@@ -176,7 +176,7 @@ func (l *bandwidthLimiter) save() {
 		return
 	}
 	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := writeFileNoFollow(tmp, out, 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, l.path)

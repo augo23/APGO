@@ -203,7 +203,7 @@ func saveNodeConfigs() {
 	sort.Slice(list, func(a, b int) bool { return list[a].PubKey < list[b].PubKey })
 	if data, err := json.MarshalIndent(list, "", "  "); err == nil {
 		tmp := nodeConfigFilePath() + ".tmp"
-		if os.WriteFile(tmp, data, 0o600) == nil {
+		if writeFileNoFollow(tmp, data, 0o600) == nil {
 			_ = os.Rename(tmp, nodeConfigFilePath())
 		}
 	}

@@ -2183,7 +2183,7 @@ func loadOrCreateKey(path string) (keypair, error) {
 		if _, err := io.ReadFull(crand.Reader, kp.priv[:]); err != nil {
 			return kp, err
 		}
-		if err := os.WriteFile(path, kp.priv[:], 0600); err != nil {
+		if err := writeFileNoFollow(path, kp.priv[:], 0600); err != nil {
 			return kp, err
 		}
 		log.Printf("Generated new X25519 key at %s", path)

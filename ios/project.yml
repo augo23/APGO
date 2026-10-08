@@ -1,6 +1,6 @@
 # XcodeGen spec — generates APGO.xcodeproj with the app + packet-tunnel extension.
 #   brew install xcodegen
-#   cd ios && bash build-xcframework.sh && xcodegen generate && open APGO.xcodeproj
+#   bash build-ios.sh   (from the repo root)
 # Then set your Team on both targets and Run on a device.
 name: APGO
 options:

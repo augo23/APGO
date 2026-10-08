@@ -68,7 +68,7 @@ func saveNodeRelaySettings(dht, useRelays, publicRelay bool, upBps, downBps, quo
 		return err
 	}
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := writeFileNoFollow(tmp, out, 0o600); err != nil {
 		nodeSettingsMu.Unlock()
 		return err
 	}
@@ -112,7 +112,7 @@ func saveNodeRendezvous(servers []string, auth string) error {
 		return err
 	}
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := writeFileNoFollow(tmp, out, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p)
@@ -155,7 +155,7 @@ func saveNodeIPv6(enabled bool) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, out, 0o644)
+	return writeFileNoFollow(p, out, 0o644)
 }
 
 // saveNodeExitPin persists the pinned-outproxy override ("" = automatic).
@@ -176,7 +176,7 @@ func saveNodeExitPin(pin string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, out, 0o644)
+	return writeFileNoFollow(p, out, 0o644)
 }
 
 // applyNodeSettings overrides the live toggles from the persisted file. Called

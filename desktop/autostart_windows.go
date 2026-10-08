@@ -10,10 +10,8 @@ package main
 // means no admin rights are needed just to toggle the setting.
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -64,9 +62,8 @@ const bootTaskName = "APGOClient"
 
 func bootStartSupported() bool { return true }
 
-// bootLauncherPath is the batch the boot task runs — it sets the client's env
-// (absolute user paths) and launches overlay-client with output to the log.
-func bootLauncherPath() string { return filepath.Join(appDir(), "boot-launch.cmd") }
+// bootLauncherPath (sysdir_windows.go) is the batch the boot task runs. It
+// lives in the protected %ProgramData%\\APGO, not the user profile.
 
 func bootStartEnabled() bool {
 	cmd := exec.Command("schtasks", "/Query", "/TN", bootTaskName)
@@ -74,46 +71,30 @@ func bootStartEnabled() bool {
 	return cmd.Run() == nil
 }
 
-// writeBootLauncher regenerates the boot batch from the current config so the
-// SYSTEM task starts the client with the right environment.
-func writeBootLauncher() error {
-	c := loadConfig()
-	var b strings.Builder
-	b.WriteString("@echo off\r\n")
-	b.WriteString("set \"CLIENT_CONFIG=" + configPath() + "\"\r\n")
-	b.WriteString("set \"CONTROL_SOCKET=" + controlSocket() + "\"\r\n")
-	b.WriteString("set \"ADMIN_PUBKEY_FILE=" + adminPubKeyPath() + "\"\r\n")
-	b.WriteString("set \"PROVISIONS_FILE=" + provisionsPath() + "\"\r\n")
-	b.WriteString("set \"REVOCATIONS_FILE=" + revocationsPath() + "\"\r\n")
-	b.WriteString("set \"SEALED_ADMIN_KEY_FILE=" + sealedKeyPath() + "\"\r\n")
-	b.WriteString("set \"APPROVALS_FILE=" + approvalsPath() + "\"\r\n")
-	b.WriteString("set \"NETCONFIG_FILE=" + netConfigPath() + "\"\r\n")
-	b.WriteString("set \"TRACKERS_FILE=" + trackersPath() + "\"\r\n")
-	b.WriteString("set \"POLICY_FILE=" + policyPath() + "\"\r\n")
-	if c.AdminPublicKey != "" {
-		b.WriteString("set \"ADMIN_PUBLIC_KEY=" + c.AdminPublicKey + "\"\r\n")
-	}
-	b.WriteString("\"" + clientBinary() + "\" >> \"" + logPath() + "\" 2>&1\r\n")
-	return os.WriteFile(bootLauncherPath(), []byte(b.String()), 0o644)
-}
-
-// setBootStart creates (enable) or deletes (disable) the boot scheduled task.
-// Both elevate via UAC because a SYSTEM / highest-privilege task requires admin.
+// setBootStart creates (enable) or deletes (disable) the boot scheduled task,
+// in one elevated step. Enabling also prepares the protected system dir and
+// writes the launcher there (see bootTaskInstallPS).
 func setBootStart(enable bool) error {
 	if !enable {
-		ps := "Start-Process -FilePath 'schtasks' -ArgumentList '/Delete','/TN','" +
-			bootTaskName + "','/F' -Verb RunAs -WindowStyle Hidden -Wait"
-		return exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+		return runElevatedPS("$ErrorActionPreference = 'Stop'\n" +
+			"Unregister-ScheduledTask -TaskName " + psQuote(bootTaskName) + " -Confirm:$false -ErrorAction SilentlyContinue\n" +
+			"Remove-Item -LiteralPath " + psQuote(bootLauncherPath()) + " -Force -ErrorAction SilentlyContinue\n")
 	}
-	if err := writeBootLauncher(); err != nil {
+	bat, err := clientLaunchBatch(loadConfig())
+	if err != nil {
 		return err
 	}
-	// /RU SYSTEM + /RL HIGHEST so it runs fully privileged at boot with no login;
-	// /SC ONSTART triggers at system startup.
-	ps := fmt.Sprintf(
-		"Start-Process -FilePath 'schtasks' -ArgumentList '/Create','/TN','%s',"+
-			"'/TR','\"%s\"','/SC','ONSTART','/RU','SYSTEM','/RL','HIGHEST','/F' "+
-			"-Verb RunAs -WindowStyle Hidden -Wait",
-		bootTaskName, bootLauncherPath())
-	return exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+	return runElevatedPS(prepareSysDirPS() + bootTaskInstallPS(bat))
+}
+
+// bootTaskInstallPS returns elevated PowerShell that writes the boot launcher
+// into the protected system dir and (re)registers the SYSTEM startup task to
+// run it. Register-ScheduledTask -Force replaces a task left by an older
+// version that pointed at a batch in the user's profile.
+func bootTaskInstallPS(bat string) string {
+	return writeSysFilePS(bootLauncherPath(), bat) +
+		"$a = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c \"' + " + psQuote(bootLauncherPath()) + " + '\"')\n" +
+		"$t = New-ScheduledTaskTrigger -AtStartup\n" +
+		"$pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\n" +
+		"Register-ScheduledTask -TaskName " + psQuote(bootTaskName) + " -Action $a -Trigger $t -Principal $pr -Force | Out-Null\n"
 }

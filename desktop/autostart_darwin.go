@@ -10,6 +10,7 @@ package main
 // boot.
 
 import (
+	"encoding/base64"
 	"fmt"
 	"html"
 	"os"
@@ -48,6 +49,7 @@ func bootEnvPlist() string {
 	env := map[string]string{
 		"CLIENT_CONFIG":         configPath(),
 		"CONTROL_SOCKET":        controlSocket(),
+		"CONTROL_SOCKET_OWNER":  socketOwnerEnv(),
 		"ADMIN_PUBKEY_FILE":     adminPubKeyPath(),
 		"PROVISIONS_FILE":       provisionsPath(),
 		"REVOCATIONS_FILE":      revocationsPath(),
@@ -79,7 +81,19 @@ func setBootStart(enable bool) error {
 		sh := fmt.Sprintf("launchctl bootout system %s 2>/dev/null; rm -f %s", q(p), q(p))
 		return runAdmin(sh)
 	}
+	return runAdmin(prepareSysDirScript() + bootDaemonInstallScript())
+}
 
+// bootDaemonInstallScript returns a root shell fragment that writes the boot
+// LaunchDaemon plist and (re)loads it. The plist runs the ROOT-OWNED client
+// copy in the system dir and logs there too.
+//
+// The plist text travels INSIDE the privileged command (base64) instead of
+// being staged in ~/.apgo and copied: a staged file sits in a user-writable
+// directory between the write and the privileged cp, and anything running as
+// the user could swap in its own ProgramArguments during that window.
+func bootDaemonInstallScript() string {
+	p := bootDaemonPath()
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -93,20 +107,13 @@ func setBootStart(enable bool) error {
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, bootDaemonLabel, html.EscapeString(clientBinary()), bootEnvPlist(),
+`, bootDaemonLabel, html.EscapeString(installedClient()), bootEnvPlist(),
 		html.EscapeString(logPath()), html.EscapeString(logPath()))
-
-	// Stage the plist in user space, then install it with one privileged step:
-	// copy into /Library/LaunchDaemons, fix ownership/perms, and bootstrap.
-	tmp := filepath.Join(appDir(), "boot-daemon.plist")
-	if err := os.WriteFile(tmp, []byte(plist), 0o644); err != nil {
-		return err
-	}
-	sh := fmt.Sprintf(
-		"cp %s %s && chown root:wheel %s && chmod 644 %s && "+
-			"launchctl bootout system %s 2>/dev/null; launchctl bootstrap system %s",
-		q(tmp), q(p), q(p), q(p), q(p), q(p))
-	return runAdmin(sh)
+	b64 := base64.StdEncoding.EncodeToString([]byte(plist))
+	return fmt.Sprintf(
+		"rm -f %[1]s; printf %%s %[2]s | /usr/bin/base64 -D > %[1]s && chown root:wheel %[1]s && chmod 644 %[1]s && "+
+			"{ launchctl bootout system %[1]s 2>/dev/null; launchctl bootstrap system %[1]s; }",
+		q(p), q(b64))
 }
 
 func launchAgentPath() string {

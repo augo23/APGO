@@ -90,7 +90,7 @@ func setAdminPub(raw []byte, persist bool) {
 		return
 	}
 	if persist && adminPubFile != "" {
-		_ = os.WriteFile(adminPubFile, []byte(base64.StdEncoding.EncodeToString(raw)), 0o644) // public; the desktop app (running as the user) reads it
+		_ = writeFileNoFollow(adminPubFile, []byte(base64.StdEncoding.EncodeToString(raw)), 0o644) // public; the desktop app (running as the user) reads it
 	}
 }
 
@@ -305,7 +305,7 @@ func (s *revStore) save() {
 		return
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err == nil {
+	if err := writeFileNoFollow(tmp, data, 0o644); err == nil {
 		_ = os.Rename(tmp, path)
 	}
 }

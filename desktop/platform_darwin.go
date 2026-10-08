@@ -93,6 +93,9 @@ func doConnect() {
 	if c.AdminPublicKey != "" {
 		env += " ADMIN_PUBLIC_KEY=" + q(c.AdminPublicKey)
 	}
+	// The socket now lives in the root-owned system dir; tell the client which
+	// user to hand it to (see client/ctlsock_unix.go).
+	env += " CONTROL_SOCKET_OWNER=" + q(socketOwnerEnv())
 	// Hand ~/.apgo back to the user before launching anything as root.
 	//
 	// The client runs privileged, so any file or directory it creates here is
@@ -109,14 +112,28 @@ func doConnect() {
 	// next time the user clicks the button, with no reinstall.
 	//
 	// Root keeps full access regardless, so the client is unaffected.
-	fixOwn := fmt.Sprintf("chown %d:%d %s 2>/dev/null || true; chmod 700 %s 2>/dev/null || true; ",
-		os.Getuid(), os.Getgid(), q(appDir()), q(appDir()))
+	//
+	// Only ever on a REAL directory, and with -h: ~/.apgo is under the user's
+	// control, and a plain `chown` run as root on a symlink named ~/.apgo would
+	// hand the link's target (/etc, say) to the user.
+	fixOwn := fmt.Sprintf("if [ -d %[3]s ] && [ ! -L %[3]s ]; then chown -h %[1]d:%[2]d %[3]s 2>/dev/null; chmod 700 %[3]s 2>/dev/null; fi; ",
+		os.Getuid(), os.Getgid(), q(appDir()))
+
+	// Root-owned state dir + root-owned client copy. Same single admin prompt.
+	prep := prepareSysDirScript()
 
 	// Launch detached: redirect all std fds (no controlling terminal — no nohup,
 	// which fails under privileged exec) and background it; the child reparents
 	// to launchd and keeps running after the privileged shell returns.
-	sh := fixOwn + fmt.Sprintf("%s %s >> %s 2>&1 </dev/null & echo $! > %s",
-		env, q(clientBinary()), q(logPath()), q(pidPath()))
+	sh := prep + fixOwn + fmt.Sprintf("%s %s >> %s 2>&1 </dev/null & echo $! > %s",
+		env, q(installedClient()), q(logPath()), q(pidPath()))
+	if bootStartEnabled() {
+		// A boot daemon is installed: (re)write it — which also migrates one
+		// left by an older version that ran from, and logged into, user-writable
+		// paths — and let launchd start the client. Starting our own copy as
+		// well would put two instances on the network.
+		sh = prep + fixOwn + bootDaemonInstallScript()
+	}
 	if err := runAdmin(sh); err != nil {
 		notify("Connect failed: " + err.Error())
 		return
@@ -164,7 +181,10 @@ func doDisconnect() {
 	sh.WriteString("/bin/launchctl bootout system/" + bootDaemonLabel + " 2>/dev/null || true; ")
 	// Older macOS (and older installs) only understand `unload`.
 	sh.WriteString("/bin/launchctl unload " + q(bootDaemonPath()) + " 2>/dev/null || true; ")
-	sh.WriteString("if [ -f " + q(pidPath()) + " ]; then kill $(cat " + q(pidPath()) + ") 2>/dev/null || true; fi; ")
+	// pidPath is in the root-owned system dir, so its contents can be trusted;
+	// still refuse anything that is not a plain number.
+	sh.WriteString("if [ -f " + q(pidPath()) + " ] && [ ! -L " + q(pidPath()) + " ]; then " +
+		"pid=$(cat " + q(pidPath()) + "); case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null ;; esac; fi; ")
 	sh.WriteString("rm -f " + q(pidPath()) + "; ")
 	sh.WriteString("/usr/bin/pkill -x overlay-client 2>/dev/null || true")
 	if err := runAdmin(sh.String()); err != nil {

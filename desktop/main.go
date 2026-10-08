@@ -598,7 +598,6 @@ func appDir() string {
 }
 
 func configPath() string      { return filepath.Join(appDir(), "client.yaml") }
-func controlSocket() string   { return filepath.Join(appDir(), "control.sock") }
 func provisionsPath() string  { return filepath.Join(appDir(), "provisions.json") }
 func revocationsPath() string { return filepath.Join(appDir(), "revocations.json") }
 func sealedKeyPath() string   { return filepath.Join(appDir(), "admin-key-sealed.json") }
@@ -611,7 +610,6 @@ func netSharesPath() string   { return filepath.Join(appDir(), "netshares.json")
 // networksStateDir holds secondary-network profiles + per-network child state
 // (see client/multinet.go). NOT the tray's profile-switcher dir ("networks").
 func networksStateDir() string { return filepath.Join(appDir(), "netstate") }
-func logPath() string          { return filepath.Join(appDir(), "overlay-client.log") }
 
 // lastClientError digs the actual reason out of the tail of the client log so
 // a failed Connect can SAY what went wrong instead of pointing at a file.
@@ -657,7 +655,6 @@ func lastClientError() string {
 	}
 	return "the log is empty; open it from the menu for details."
 }
-func pidPath() string         { return filepath.Join(appDir(), "client.pid") }
 func nodeKeyPath() string     { return filepath.Join(appDir(), "node.key") }
 func adminPubKeyPath() string { return filepath.Join(appDir(), "admin-pubkey") }
 

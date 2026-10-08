@@ -111,7 +111,7 @@ func saveSelfEndpointsLocked() {
 		return
 	}
 	tmp := path + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
+	if writeFileNoFollow(tmp, b, 0o600) == nil {
 		_ = os.Rename(tmp, path)
 	}
 }

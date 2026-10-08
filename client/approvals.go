@@ -357,7 +357,7 @@ func (s *approvalStore) save() {
 	}
 	if data, err := json.MarshalIndent(list, "", "  "); err == nil {
 		tmp := path + ".tmp"
-		if os.WriteFile(tmp, data, 0o644) == nil {
+		if writeFileNoFollow(tmp, data, 0o644) == nil {
 			_ = os.Rename(tmp, path)
 		}
 	}

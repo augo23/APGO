@@ -116,7 +116,7 @@ func adoptNetConfig(nc SignedNetworkConfig) {
 		return
 	}
 	tmp := netConfigFilePath() + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) != nil || os.Rename(tmp, netConfigFilePath()) != nil {
+	if writeFileNoFollow(tmp, data, 0o600) != nil || os.Rename(tmp, netConfigFilePath()) != nil {
 		log.Printf("[netconfig] failed to persist rotated config")
 		return
 	}

@@ -141,7 +141,7 @@ func savePolicies() {
 	policyMu.Unlock()
 	if data, err := json.MarshalIndent(list, "", "  "); err == nil {
 		tmp := policyFilePath() + ".tmp"
-		if os.WriteFile(tmp, data, 0o600) == nil {
+		if writeFileNoFollow(tmp, data, 0o600) == nil {
 			_ = os.Rename(tmp, policyFilePath())
 		}
 	}

@@ -229,7 +229,7 @@ func (s *netShareStore) persistLocked() {
 		recs = append(recs, r)
 	}
 	if data, err := json.Marshal(recs); err == nil {
-		_ = os.WriteFile(s.path, data, 0o600)
+		_ = writeFileNoFollow(s.path, data, 0o600)
 	}
 }
 
