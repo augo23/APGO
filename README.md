@@ -96,7 +96,7 @@ A standalone shareable diagram is in [`docs/apgo-architecture.svg`](docs/apgo-ar
 | `easy-deploy.sh` | One-command build + up for a single host (podman/docker) |
 | `docs/cli.md` | Command-line reference: every binary, flag, env var and control-API endpoint |
 | `easy-compose.yml` | Compose stack used by `easy-deploy.sh` (`overlay-client` / `overlay-admin`) |
-| `apgoclient.containerfile`, `apgoadmin.containerfile` | Image builds for the client and dashboard |
+| `apgo-client.containerfile`, `apgo-admin.containerfile` | Image builds for the client and dashboard |
 
 ## Deployment
 

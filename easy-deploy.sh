@@ -66,8 +66,8 @@ BUILD_ARGS=""
 [ "${1:-}" = "--rebuild" ] && BUILD_ARGS="--no-cache"
 
 echo "==> Building images with $ENGINE…"
-$ENGINE build $BUILD_ARGS -f apgoclient.containerfile -t apgoclient:latest .
-$ENGINE build $BUILD_ARGS -f apgoadmin.containerfile  -t apgoadmin:latest  .
+$ENGINE build $BUILD_ARGS -f apgo-client.containerfile -t apgo-client:latest .
+$ENGINE build $BUILD_ARGS -f apgo-admin.containerfile  -t apgo-admin:latest  .
 
 echo "==> Starting stack…"
 $COMPOSE -f easy-compose.yml up -d

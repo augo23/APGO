@@ -1,5 +1,5 @@
 # APGO overlay client image. Build from the REPO ROOT as the context:
-#   podman build -f apgoclient.containerfile -t apgoclient:latest .
+#   podman build -f apgo-client.containerfile -t apgo-client:latest .
 # Go 1.24: the Windows Wintun dep (golang.zx2c4.com/wireguard/tun, resolved by
 # `go mod tidy` across all platforms) requires >= 1.23.1. It is only COMPILED on
 # Windows; on this Linux build it is resolved then excluded by build tags.

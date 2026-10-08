@@ -1,6 +1,6 @@
 # APGO rendezvous (HTTPS discovery) server image.
 # Build from the REPO ROOT as the context:
-#   podman build -f apgorendezvous.containerfile -t apgorendezvous:latest .
+#   podman build -f apgo-rendezvous.containerfile -t apgo-rendezvous:latest .
 #
 # The rendezvous server is a tiny stateless HTTP service: nodes POST their
 # network id (info-hash) + public endpoint and get back the other endpoints in

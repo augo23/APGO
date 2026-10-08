@@ -1,5 +1,5 @@
 # APGO admin dashboard image. Build from the REPO ROOT as the context:
-#   podman build -f apgoadmin.containerfile -t apgoadmin:latest .
+#   podman build -f apgo-admin.containerfile -t apgo-admin:latest .
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY admin/ ./
