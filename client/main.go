@@ -307,6 +307,14 @@ type ClientConfig struct {
 	// elsewhere — while the pinned exit is unreachable). Also settable via
 	// the EXIT_PEER environment variable.
 	ExitPeer string `yaml:"exit_peer"`
+	// ReplicaPorts and ReplicaNodes say that copies of the service on THIS
+	// node's address also run on other nodes (replicas.go); clients send each
+	// new connection to the fastest healthy copy. ReplicaPorts maps each port
+	// to the port the copies listen on, e.g. "tcp/80=6980,tcp/443=6943";
+	// ReplicaNodes lists the nodes' overlay addresses. Env: REPLICA_PORTS,
+	// REPLICA_NODES (comma- or space-separated).
+	ReplicaPorts string   `yaml:"replica_ports"`
+	ReplicaNodes []string `yaml:"replica_nodes"`
 	// Networks are ADDITIONAL overlay networks this node participates in
 	// concurrently (e.g. guest networks). Each runs as a supervised child
 	// instance with its own TUN, port and state — see multinet.go.
@@ -1469,7 +1477,11 @@ func startNATProbing(conn *net.UDPConn, stunServers []string) {
 		update()
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-ticker.C:
+			case <-natReprobe: // Refresh routes: classify now, not in a minute
+			}
 			update()
 		}
 	}()
@@ -2952,6 +2964,14 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		}
 		handleExitPong(raddr, body[1:])
 		return
+	case 'I':
+		// The node at a service address says where copies of its service run
+		// (replicas.go). Gated like 'E': an unapproved node must not steer
+		// anyone's traffic. The sender must also be the node at the address.
+		if s := GlobalSessions.GetByAddr(raddr); s != nil && s.Established() && admissionOK(s.peerStatic, "replica-announce") {
+			handleReplicaAnnounce(s.peerStatic, body[1:])
+		}
+		return
 	case 'A':
 		// Peer announces its overlay IP. The claim is only believed if the
 		// announcing KEY owns the address (ipbinding.go) — otherwise any
@@ -4252,6 +4272,9 @@ func main() {
 	if ip, _, err := net.ParseCIDR(cfg.Tun.AddressCIDR); err == nil && ip.To4() != nil {
 		setMyOverlayIP(ip.To4().String())
 	}
+	// Copies of this node's service on other nodes (replicas.go). After our
+	// own address is known: the announce names it.
+	initReplicas(cfg)
 
 	udpConn, port, err := bindListenPort(cfg)
 	if err != nil {
@@ -4289,6 +4312,9 @@ func main() {
 	}
 	initExit(cfg)
 	go exitSelectionLoop()
+	// Measures every service owner and its copies, and expires stale ones
+	// (replicas.go). Idle when there are none.
+	go replicaProbeLoop()
 
 	// Full-VPN mode on macOS/Windows: pin the transport socket to the physical
 	// interface (so encrypted UDP to peers never loops back into the TUN), then
@@ -4571,6 +4597,12 @@ func main() {
 			// Guard rails, so this cannot silently regress again: the write
 			// error is checked rather than discarded, and datapath_test.go
 			// asserts that a frame addressed to this node reaches the TUN.
+			//
+			// A reply from a service copy we sent a connection to goes up as
+			// a reply from the service address the application dialled
+			// (replicas.go). The source check above already ran against the
+			// copy's own address, which is what the packet carries on the wire.
+			replicaRewriteIn(pt)
 			statRxDelivered.Add(1)
 			if _, err := tunIF.Write(pt); err != nil {
 				statTxError.Add(1)
@@ -4727,6 +4759,15 @@ func main() {
 				// No exit available (or still selecting) — drop rather than leak
 				// onto the overlay broadcast path.
 				continue
+			}
+
+			// Service copies (replicas.go): when a copy of dst's service on
+			// another node is faster than dst itself, the packet is rewritten
+			// to that node here and routed below like any packet for it.
+			if dst != "" {
+				if node, ok := replicaRewriteOut(ip, dst); ok {
+					dst = node
+				}
 			}
 
 			// Fast path: we know which endpoint owns dst and have a live
@@ -5057,6 +5098,11 @@ func main() {
 			}
 			targets := GlobalSessions.EstablishedAddrs()
 			exitAd := buildExitAnnounce() // nil unless we're an exit node
+			// nil unless copies of our service run elsewhere (replicas.go).
+			// Re-sent every tick: it expires on the receiver after
+			// replicaAnnounceTTL, so clients stop using copies of a node that
+			// went away.
+			replicaAd := buildReplicaAnnounce()
 			// BATTERY (yes, on the desktop/server too): every packet this node
 			// sends to a PHONE peer powers up that phone's radio. So the
 			// mobile idle drain is bounded by the chattiest node on the mesh,
@@ -5100,6 +5146,9 @@ func main() {
 				}
 				if exitAd != nil {
 					_ = sendPacket(GlobalConn, addr, s, exitAd)
+				}
+				if replicaAd != nil {
+					_ = sendPacket(GlobalConn, addr, s, replicaAd)
 				}
 				// PEX carries ENDPOINTS — connectivity machinery, not display
 				// state: it is how peers learn the addresses to punch, so it

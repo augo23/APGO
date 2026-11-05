@@ -1,9 +1,9 @@
 # APGO overlay client image. Build from the REPO ROOT as the context:
 #   podman build -f apgo-client.containerfile -t apgo-client:latest .
-# Go 1.24: the Windows Wintun dep (golang.zx2c4.com/wireguard/tun, resolved by
+# Go 1.26: golang.org/x/crypto v0.52 needs >= 1.25. The Windows Wintun dep (golang.zx2c4.com/wireguard/tun, resolved by
 # `go mod tidy` across all platforms) requires >= 1.23.1. It is only COMPILED on
 # Windows; on this Linux build it is resolved then excluded by build tags.
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 RUN apk add --no-cache git gcc musl-dev
 WORKDIR /src
 COPY client/ ./
@@ -13,7 +13,7 @@ RUN CGO_ENABLED=1 go build -o /out/overlay-client ./
 
 FROM alpine:3.21
 # iptables is needed for EXIT_NODE (internet outproxy) NAT.
-RUN apk add --no-cache ca-certificates iputils iproute2 iptables tini
+RUN apk add --no-cache ca-certificates iputils iproute2 iptables tini curl jq util-linux-misc
 COPY --from=build /out/overlay-client /usr/local/bin/overlay-client
 
 # Bake the network config INTO the image as a read-only seed. At runtime the
@@ -99,7 +99,7 @@ done
 # new node's address by itself. Unset/unmatched simply falls through to the
 # existing behaviour.
 if [ -n "${NODE_PUBLIC_IPS:-}" ] && [ -n "${NODE_NAME:-}" ]; then
-  _ip="$(printf '%s' "$NODE_PUBLIC_IPS" | tr ',' '\n' | while IFS='=' read -r n v; do
+  _ip="$(printf '%s\n' "$NODE_PUBLIC_IPS" | tr ',' '\n' | while IFS='=' read -r n v; do
       [ "$(printf '%s' "$n" | tr -d ' ')" = "$NODE_NAME" ] && printf '%s' "$(printf '%s' "$v" | tr -d ' ')" && break
     done)"
   if [ -n "$_ip" ]; then
@@ -119,8 +119,107 @@ if [ -n "${NODE_PUBLIC_IPS:-}" ] && [ -n "${NODE_NAME:-}" ]; then
   fi
 fi
 
+# LAN CANDIDATES, AUTO-DETECTED (2026-10-19). Nothing is configured per node.
+# A pod on a node that shares a public IP with the peers trying to reach it
+# (any node at a site where the devices also live) only advertises
+# <public ip>:6970. Those peers can only reach that through NAT loopback, which
+# most home routers do not do, and the pod's LAN-discovery beacon never leaves
+# the pod network - so laptops/phones on the same LAN ended up relayed or with
+# no path at all. Fix: advertise every private IPv4 address the NODE itself
+# has, paired with the hostPort. The hostPort DNAT answers on every node
+# address, so whichever LAN a peer shares with the node, it gets a direct path.
+# Remote peers cannot reach a private address and move on to the public one.
+#
+# How: the container is privileged and /proc of the HOST is mounted at
+# /host/proc (apgo.yaml), so nsenter can read the host's interfaces. Skipped:
+# loopback, CNI/pod/tunnel/overlay interfaces and non-private addresses.
+# LAN_CANDIDATES=off disables it; anything else (default "auto") enables it.
+if [ "${LAN_CANDIDATES:-auto}" != off ] && [ -e /host/proc/1/ns/net ] && command -v nsenter >/dev/null 2>&1; then
+  _lans="$(nsenter --net=/host/proc/1/ns/net ip -4 -o addr show scope global 2>/dev/null \
+    | awk '{ i=$2; sub(/@.*/,"",i); if (i !~ /^(lo|cni|flannel|cali|vxlan|tunl|veth|ovl|zt|docker|podman|br-|kube|nodelocaldns|wg|tailscale|cilium)/) { split($4,a,"/"); print a[1] } }' \
+    | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | sort -u)"
+  _added=""
+  for _ip in $_lans; do
+    _c="${_ip}:${ADVERTISE_PORT:-6970}"
+    case ",${EXTRA_CANDIDATES:-}," in *",${_c},"*) continue ;; esac
+    EXTRA_CANDIDATES="${EXTRA_CANDIDATES:+${EXTRA_CANDIDATES},}${_c}"
+    _added="${_added:+${_added} }${_c}"
+  done
+  export EXTRA_CANDIDATES
+  if [ -n "$_added" ]; then
+    echo "[entrypoint] node ${NODE_NAME:-?}: LAN candidates ${_added} (EXTRA_CANDIDATES=$EXTRA_CANDIDATES)"
+  else
+    echo "[entrypoint] node ${NODE_NAME:-?}: no private LAN address found on the host - none advertised"
+  fi
+elif [ "${LAN_CANDIDATES:-auto}" != off ]; then
+  echo "[entrypoint] LAN candidates: host /proc not mounted at /host/proc or nsenter missing - skipped"
+fi
+
 exec /usr/local/bin/overlay-client "$@"
 EOF
 RUN chmod +x /usr/local/bin/apgo-entrypoint
+
+# `apgo` — operator CLI inside the container. It is a thin client for the same
+# local control socket the admin dashboard uses (control.go); nothing new is
+# exposed. Usage: apgo help
+RUN cat > /usr/local/bin/apgo <<'EOF'
+#!/bin/sh
+SOCK="${CONTROL_SOCKET:-/shared/control.sock}"
+api() {
+  [ -S "$SOCK" ] || { echo "apgo: control socket $SOCK not found (is overlay-client running? set CONTROL_SOCKET)" >&2; exit 1; }
+  curl -fsS --unix-socket "$SOCK" "http://apgo$1"
+}
+case "${1:-help}" in
+  peers|sessions)
+    api /api/sessions | jq -r '
+      (["NAME","OVERLAY_IP","PATH","VIA","REMOTE","EST","APPROVED","LAST_SEEN_S"] | @tsv),
+      (sort_by(.overlay_ip)[] | [
+        (.name // "-" | if .=="" then "-" else . end), .overlay_ip,
+        (.path // (if .relayed then "relay" else "?" end)),
+        (if (.via // "") == "" then "-" else .via end),
+        .remote, .established, .approved,
+        (if .last_seen_unix then (now - .last_seen_unix | floor) else "-" end)
+      ] | @tsv)' | column -t -s "$(printf '\t')" ;;
+  relayed)
+    api /api/sessions | jq -r '.[] | select(.relayed or .path=="relay") | "\(.name // "") \(.overlay_ip) via \(.via)"' ;;
+  status|info)  api /api/info | jq . ;;
+  exits)        api /api/exits | jq . ;;
+  discovery)    api /api/discovery | jq . ;;
+  trackers)     api /api/trackers | jq . ;;
+  revocations)  api /api/revocations | jq . ;;
+  networks)     api /api/networks | jq . ;;
+  services|replicas)
+    # Service copies (client/replicas.go): the copies THIS node publishes for
+    # its own address (with health), then every service with copies this node
+    # knows. "*" marks where NEW connections go.
+    _j="$(api /api/services)"
+    printf '%s' "$_j" | jq -r 'if .publishing then
+        "publishing copies of \(.publishing.address) (\(.publishing.ports)): " +
+        (.publishing.nodes | map("\(.address) \(if .healthy then "ok" else "DOWN" end)") | join(", ")), ""
+      else empty end'
+    printf '%s' "$_j" | jq -r '(["SERVICE","CANDIDATE","NAME","RTT_MS","USABLE"] | @tsv),
+      ((.services // [])[] | .address as $a | .candidates[] |
+        [$a, ((if .preferred then "*" else "" end) + .address + (if .owner then " (owner)" else "" end)),
+         (if (.name // "") == "" then "-" else .name end), (.rtt_ms // "?"), .usable] | @tsv)' | column -t -s "$(printf '\t')"
+    printf '%s' "$_j" | jq -r '"", "redirected connections: \(.flows)  packets rewritten out/in: \(.tx_rewritten)/\(.rx_rewritten)"'
+    ;;
+  get)          api "$2" | jq . ;;
+  log|logs)     exec tail -n "${2:-100}" -F "${LOG_FILE:-/shared/overlay-client.log}" ;;
+  help|-h|--help)
+    cat <<H
+apgo — APGO overlay node CLI (talks to $SOCK)
+  apgo peers         peers with path (lan/direct/wan/relay) and relay node (VIA)
+  apgo relayed       only peers reached through a relay
+  apgo status        this node: key, overlay IP, uptime, config
+  apgo services      service copies: what this node publishes, which copy each service uses, RTTs
+  apgo exits | discovery | trackers | revocations | networks
+  apgo get /api/...  raw GET of any control endpoint
+  apgo log [N]       follow the client log
+H
+    ;;
+  *) echo "apgo: unknown command '$1' (try: apgo help)" >&2; exit 2 ;;
+esac
+EOF
+RUN chmod +x /usr/local/bin/apgo && ln -s apgo /usr/local/bin/apgoverlay
 
 ENTRYPOINT ["tini", "--", "/usr/local/bin/apgo-entrypoint"]

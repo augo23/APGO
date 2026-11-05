@@ -147,6 +147,11 @@ func logSelfCheck() {
 		}
 	}
 
+	// --- service copies (replicas.go) -----------------------------------------
+	for _, line := range replicaSelfCheckLines() {
+		fmt.Fprintf(&b, "[selfcheck] %s\n", line)
+	}
+
 	fmt.Fprintf(&b, "[selfcheck] counters: %v\n", dataStats())
 	fmt.Fprintf(&b, "[selfcheck] verdict: %s", dataPathVerdict())
 	log.Print(b.String())

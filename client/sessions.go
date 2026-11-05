@@ -510,6 +510,19 @@ func (t *SessionTable) RecordSuccess(addr *net.UDPAddr) {
 	t.mu.Unlock()
 }
 
+// ResetBackoff clears every retry back-off (keeping the "has ever worked"
+// memory), so the next punch round dials every peer immediately. Used by
+// Refresh routes.
+func (t *SessionTable) ResetBackoff() {
+	t.mu.Lock()
+	now := time.Now()
+	for _, b := range t.peerBackoff {
+		b.failures = 0
+		b.until = now
+	}
+	t.mu.Unlock()
+}
+
 func (t *SessionTable) ShouldSkip(addr *net.UDPAddr) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

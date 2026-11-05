@@ -8,7 +8,7 @@ require (
 	github.com/cloudflare/circl v1.5.0
 	github.com/flynn/noise v1.1.0
 	github.com/pierrec/lz4/v4 v4.1.26
-	golang.org/x/crypto v0.27.0
+	golang.org/x/crypto v0.52.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

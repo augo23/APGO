@@ -293,6 +293,9 @@ func syncAdminStateTo(raddr *net.UDPAddr) {
 	for _, rec := range provisions.list() {
 		send(buildProvisionFrame(rec))
 	}
+	// Where copies of our service run, so a new peer can use them at once
+	// instead of after the next keepalive (replicas.go).
+	send(buildReplicaAnnounce())
 	if nc, ok := persistedNetConfig(); ok && peerAdmitted {
 		send(buildNetConfigFrame(nc))
 	}
@@ -1449,6 +1452,13 @@ func startControlServer(socketPath string) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		go adoptNetConfig(nc) // persists, floods, then restarts this node
+	})
+
+	// Service copies (replicas.go).
+	//   GET /api/services -> copies this node publishes (health), and every
+	//                        service with copies it knows, with RTTs
+	mux.HandleFunc("/api/services", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, replicaStatus())
 	})
 
 	// Admin-signed network policy (post-quantum on/off): verify, apply LIVE, gossip.

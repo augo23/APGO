@@ -91,6 +91,20 @@ type SignedNodeConfig struct {
 	PublicExitQuota      *int64 `json:"public_exit_quota_bytes,omitempty"`
 	PublicExitMaxClients *int64 `json:"public_exit_max_clients,omitempty"`
 
+	// Version-3 fields (OVLYNODECFG3).
+	//
+	// IPv6 turns this node's IPv6 transport on or off. It is persisted in the
+	// node's settings file and takes effect on the node's next restart, the
+	// same as the local /api/set-ipv6 switch.
+	//
+	// RefreshRoutes is a ONE-SHOT request, not a setting: a timestamp the
+	// admin panel stamps when "Refresh routes" is pressed. A node acts once per
+	// new value (it forgets relay verdicts and back-offs, re-probes its NAT and
+	// re-dials every known peer) and ignores a value it has already acted on,
+	// so re-gossip and restarts never repeat it.
+	IPv6          *bool  `json:"ipv6,omitempty"`
+	RefreshRoutes *int64 `json:"refresh_routes,omitempty"`
+
 	Epoch int64  `json:"epoch"`
 	Ts    int64  `json:"ts"`
 	Sig   string `json:"sig"`
@@ -144,6 +158,20 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	// record keeps its exact signed string. It is a separately built, well
 	// formed string. Stripping the v2 fields from a v2 record (or adding them
 	// to a v1 one) changes the version and breaks the signature.
+	if c.IPv6 != nil || c.RefreshRoutes != nil {
+		// Version 3: everything v2 signs, plus the v3 fields. Only used when a
+		// v3 field is present, so v1/v2 records keep their exact signed string.
+		return strings.Join([]string{"OVLYNODECFG3",
+			c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
+			trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+			str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
+			i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
+			i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
+			b(c.PublicExit), i(c.PublicExitUp), i(c.PublicExitDown), i(c.PublicExitQuota), i(c.PublicExitMaxClients),
+			b(c.IPv6), i(c.RefreshRoutes),
+			fmt.Sprintf("%d", c.Epoch), fmt.Sprintf("%d", c.Ts),
+		}, "|")
+	}
 	if c.PublicExit == nil && c.PublicExitUp == nil && c.PublicExitDown == nil &&
 		c.PublicExitQuota == nil && c.PublicExitMaxClients == nil {
 		return v1
@@ -318,6 +346,14 @@ func effectiveNodeConfig(self string) SignedNodeConfig {
 		if mine.ExitQuota != nil {
 			out.ExitQuota = mine.ExitQuota
 		}
+		if mine.IPv6 != nil {
+			out.IPv6 = mine.IPv6
+		}
+		// RefreshRoutes: the LATER request wins, whichever record carries it,
+		// so a network-wide refresh still reaches a node with its own record.
+		if mine.RefreshRoutes != nil && (out.RefreshRoutes == nil || *mine.RefreshRoutes > *out.RefreshRoutes) {
+			out.RefreshRoutes = mine.RefreshRoutes
+		}
 		if mine.Epoch > out.Epoch {
 			out.Epoch = mine.Epoch
 		}
@@ -447,6 +483,11 @@ func nodeConfigSnapshot(pubB64 string) map[string]any {
 		"public_exit_quota_bytes":  derefI(eff.PublicExitQuota),
 		"public_exit_max_clients":  derefI(eff.PublicExitMaxClients),
 		"public_exit_live":         publicExitLiveFor(pubB64),
+		// IPv6: the signed setting when one exists; for THIS node with no
+		// record, what it is actually running with. null = unknown (a remote
+		// node nobody has set it on), which the panel shows as "unchanged".
+		"ipv6":           ipv6SnapshotFor(pubB64, eff.IPv6),
+		"refresh_routes": derefI(eff.RefreshRoutes),
 	}
 }
 
@@ -472,6 +513,7 @@ func recomputeSelfNodeConfig() {
 	}
 	appliedCfgEpoch = c.Epoch
 	applyNodeConfigLive(c, "admin")
+	maybeRefreshRoutes(c)
 }
 
 // applyNodeConfigLive is the single place that turns a record into running
@@ -496,6 +538,15 @@ func applyNodeConfigLive(c SignedNodeConfig, source string) {
 			log.Printf("[nodecfg] could not save tracker list: %v", err)
 		} else {
 			changed = append(changed, fmt.Sprintf("trackers=%d", len(*c.Trackers)))
+		}
+	}
+	if c.IPv6 != nil {
+		if err := saveNodeIPv6(*c.IPv6); err != nil {
+			log.Printf("[nodecfg] could not save IPv6 setting: %v", err)
+		} else if *c.IPv6 != ipv6Enabled {
+			changed = append(changed, fmt.Sprintf("ipv6=%v(applies on restart)", *c.IPv6))
+		} else {
+			changed = append(changed, fmt.Sprintf("ipv6=%v", *c.IPv6))
 		}
 	}
 	if c.TrackersOn != nil {

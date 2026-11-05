@@ -346,6 +346,14 @@
       </label>
 
       <label class="cfgrow">
+        <input type="checkbox" id="cfgIpv6">
+        <span><strong>IPv6 transport</strong>
+        <em>Use IPv6 for overlay traffic when the node has a public IPv6 address &mdash;
+        no NAT, so peers usually connect directly. Takes effect when that node next
+        restarts. <span id="cfgIpv6Note"></span></em></span>
+      </label>
+
+      <label class="cfgrow">
         <input type="checkbox" id="cfgDht">
         <span><strong>Join the public DHT</strong>
         <em>Finds peers without a rendezvous server. The lookup key is derived from
@@ -473,6 +481,8 @@
       <div class="msg" id="cfgMsg"></div>
       <div class="modal-actions wrapact">
         <button class="ghost" id="cfgCancel" type="button">Cancel</button>
+        <button class="edit-btn" id="cfgRefresh" type="button"
+          title="Forget relay decisions and retry back-offs, re-check the NAT and re-dial every peer. Live connections stay up.">Refresh routes&hellip;</button>
         <button class="primary" id="cfgApply" type="button">Apply&hellip;</button>
       </div>
     </div>
@@ -1838,7 +1848,9 @@ async function openCfgModal(pubkey, label){
                    "cfgPubExitUp","cfgPubExitDown","cfgPubExitQuota","cfgPubExitMax"]){
     document.getElementById(id).value = "";
   }
-  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit","cfgPubExit",
+  cfgIpv6Was = null;
+  document.getElementById("cfgIpv6Note").textContent = "";
+  for(const id of ["cfgIpv6","cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit","cfgPubExit",
                    "cfgSocks","cfgSocksOverlayOnly"]){
     document.getElementById(id).checked = false;
   }
@@ -1900,6 +1912,17 @@ async function openCfgModal(pubkey, label){
         : pxl.prerequisite && pxl.enabled ? ("Paused: " + pxl.prerequisite)
         : pxl.enabled ? ("Running now — " + (pxl.clients||0) + " user(s) connected.") : "";
     }
+    /* IPv6: null means nobody has set it for that node and it is not this
+       node, so its real state is unknown. Show the box unticked and send it
+       only if the admin actually ticks it -- sending an unchanged value would
+       sign a v3 record that older nodes cannot verify and would then ignore
+       entirely. */
+    if(d.ipv6 === true || d.ipv6 === false){
+      document.getElementById("cfgIpv6").checked = d.ipv6;
+      cfgIpv6Was = d.ipv6;
+    } else {
+      document.getElementById("cfgIpv6Note").textContent = "(current setting unknown — only sent if you change it)";
+    }
     document.getElementById("cfgRelayList").value  = (d.trackers||[]).join("\n");
     document.getElementById("cfgTrackersOn").checked = d.trackers_on !== false;
     document.getElementById("cfgRv").value      = d.rendezvous || "";
@@ -1960,7 +1983,33 @@ async function applyCfg(){
 
 /* The signed part of Apply. Returns null on success or the server's refusal,
    which the password dialog shows (so a mistyped password can be retried). */
-async function applyCfgSigned(pass, pxOn, pxMax){
+let cfgIpv6Was = null;
+
+/* Refresh routes. Signed and delivered exactly like Apply -- it IS an Apply,
+   carrying the sheet's current settings plus a one-shot refresh request. It has
+   to carry them: a node keeps one config record, and a record holding only
+   the refresh would replace (and so clear) every other setting on it. */
+async function refreshCfgRoutes(){
+  if(!cfgTarget) return;
+  const msg = document.getElementById("cfgMsg"), btn = document.getElementById("cfgRefresh");
+  const pxOn = document.getElementById("cfgPubExit").checked;
+  const pxMaxRaw = document.getElementById("cfgPubExitMax").value.trim();
+  const pxMax = pxMaxRaw === "" ? null : Number(pxMaxRaw);
+  msg.textContent = ""; btn.disabled = true;
+  const wide = document.getElementById("cfgScope").value === "network";
+  try{
+    const ok = await withAdminPassword({
+      title: "Refresh routes", who: wide ? "every node" : cfgTarget.label, ok: "Refresh",
+      working: "Signing + distributing…",
+    }, async (pass) => { const e = await applyCfgSigned(pass, pxOn, pxMax, {refresh:true}); if(e) msg.textContent = e; return e; });
+    if(!ok) return;
+    msg.textContent = "Refresh sent. The node re-checks its paths now; a peer that can be reached " +
+      "directly moves off the relay within a few seconds. Requires the new client build on that node.";
+  } finally { btn.disabled = false; }
+}
+
+async function applyCfgSigned(pass, pxOn, pxMax, opts){
+  opts = opts || {};
   try{
     /* Identity first, as a separate admin-signed PROVISION. Name and overlay
        address are provisioned facts about a node, not runtime settings, and
@@ -2019,6 +2068,9 @@ async function applyCfgSigned(pass, pxOn, pxMax){
       body.public_exit_quota = cfgGBField("cfgPubExitQuota");
       if(pxMax !== null) body.public_exit_max_clients = pxMax;
     }
+    const v6 = document.getElementById("cfgIpv6").checked;
+    if(cfgIpv6Was === null ? v6 : v6 !== cfgIpv6Was) body.ipv6 = v6;
+    if(opts.refresh) body.refresh_routes = true;
     const sp = document.getElementById("cfgSocksPass").value;
     if(sp !== "") body.socks5_pass = sp;   // blank means "leave unchanged"
     const r = await fetch("/api/node-config", {method:"POST",
@@ -2027,6 +2079,7 @@ async function applyCfgSigned(pass, pxOn, pxMax){
        relay with the DHT off, a wrong password. Each needs a different fix. */
     if(!r.ok) return (await r.text()) || "Failed.";
     cfgPubExitWas = cfgPubExitWas || pxOn;
+    if("ipv6" in body) cfgIpv6Was = body.ipv6;
     return null;
   }catch(e){ return "request failed: " + e; }
 }
@@ -2112,6 +2165,7 @@ function cfgSyncSocks(){
 document.getElementById("cfgCancel").addEventListener("click", closeCfgModal);
 document.getElementById("cfgModal").addEventListener("click", (e)=>{ if(e.target.id==="cfgModal") closeCfgModal(); });
 document.getElementById("cfgApply").addEventListener("click", applyCfg);
+document.getElementById("cfgRefresh").addEventListener("click", refreshCfgRoutes);
 document.getElementById("cfgSeed").addEventListener("click", cfgSeedFromSelf);
 document.getElementById("cfgPublicRelay").addEventListener("change", cfgSyncLimits);
 document.getElementById("cfgExit").addEventListener("change", cfgSyncLimits);

@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // --- device approval -----------------------------------------------------
@@ -886,6 +887,12 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		PublicExitDown       *string `json:"public_exit_down"`
 		PublicExitQuota      *string `json:"public_exit_quota"`
 		PublicExitMaxClients *int64  `json:"public_exit_max_clients"`
+		// IPv6 transport (applies on the target's next restart). Sent only
+		// when the admin changed it, so an Apply does not force every record
+		// to the v3 format that older nodes cannot verify.
+		IPv6 *bool `json:"ipv6"`
+		// RefreshRoutes: true = stamp a one-shot "refresh routes" request.
+		RefreshRoutes bool   `json:"refresh_routes"`
 		Password     string    `json:"password"`
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 32768))
@@ -934,6 +941,11 @@ func handleAPINodeConfig(w http.ResponseWriter, r *http.Request) {
 		PublicExitDown:       rate(req.PublicExitDown),
 		PublicExitQuota:      rate(req.PublicExitQuota),
 		PublicExitMaxClients: req.PublicExitMaxClients,
+		IPv6:                 req.IPv6,
+	}
+	if req.RefreshRoutes {
+		now := time.Now().Unix()
+		c.RefreshRoutes = &now
 	}
 	if c.PublicExitMaxClients != nil && (*c.PublicExitMaxClients < 1 || *c.PublicExitMaxClients > 1024) {
 		http.Error(w, "public exit: max clients must be between 1 and 1024", http.StatusBadRequest)

@@ -241,11 +241,20 @@ func noteConnectCandidates(overlayIP, candidateList string) bool {
 	p := relayPolicyFor(overlayIP)
 	p.natClass = theirs
 
-	if !directPunchViable(mine, theirs) && !p.relayFirst {
+	viable := directPunchViable(mine, theirs)
+	if !viable && !p.relayFirst {
 		p.relayFirst = true
 		p.reason = "nat pairing " + mine + "/" + theirs + " cannot be punched"
 		log.Printf("[relay-policy] %s: %s — going relay-first (direct probes continue in the background)",
 			overlayIP, p.reason)
+	} else if viable && p.relayFirst {
+		// The verdict is re-evaluated on every candidate exchange. It used to
+		// be one-way: a single bad classification (one STUN server answering,
+		// a NAT mid-reboot, an older peer build) pinned the peer to relay for
+		// the life of the process, even after both sides reclassified.
+		p.relayFirst = false
+		p.reason = ""
+		log.Printf("[relay-policy] %s: nat pairing %s/%s is punchable again — direct first", overlayIP, mine, theirs)
 	}
 	// "Cannot be punched" means "cannot be ADDRESSED": the mapping exists,
 	// its port is simply unguessable. natspray.go attacks that directly for
@@ -288,6 +297,7 @@ func relayPreferred(overlayIP string, established bool) bool {
 	p := relayPolicyFor(overlayIP)
 
 	if established {
+		p.relayFirst = false // a live direct session disproves the verdict
 		p.firstPunch = time.Now()
 		if p.escalated {
 			p.escalated = false

@@ -270,6 +270,8 @@ func handleExitPong(raddr *net.UDPAddr, ts []byte) {
 		e.lastReply = time.Now()
 	}
 	exitMu.Unlock()
+	// The same pings measure service owners and their copies (replicas.go).
+	noteReplicaRTT(s.peerStatic, rtt)
 }
 
 // exitStatusFor reports whether the peer with static key pub advertises as an

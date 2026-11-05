@@ -1,0 +1,1570 @@
+# APGO + NGINX Proxy Manager on Kubernetes, in the "apgo" namespace. APGO
+# images come from your registry; NPM comes from Docker Hub.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE POD, ONE NETWORK NAMESPACE — and why that is the whole design
+#
+# The rule that governs everything here: a listener is reachable over the
+# overlay only if it lives in the SAME network namespace as the ovl0 TUN.
+#
+# There are two constraints on this stack, and they used to point in opposite
+# directions:
+#
+#   1. NPM's admin UI on :81 must share a namespace with the TUN, or overlay
+#      traffic can only reach it by crossing a namespace boundary.
+#   2. NPM's Node backend on :3000 must NOT be in the host namespace, or another
+#      service on the node (Grafana et al) steals the port, the backend
+#      crash-loops, nginx serves the UI but 502s every /api call, and the
+#      dashboard reports "API is not healthy" forever.
+#
+# The previous layout ran apgo with hostNetwork (TUN in the HOST namespace) and
+# NPM as a separate pod (:3000 safely private). That satisfies #2 and BREAKS #1:
+# reaching :81 then required a CNI portmap hostPort DNAT plus a forward across
+# the CNI bridge. That path is fragile for packets arriving on a TUN, and even
+# when it forwards it breaks on MSS — NPM's socket only saw eth0's ~1450 MTU and
+# advertised a segment size too large for the overlay, so the handshake
+# succeeded and the first full-size response was silently dropped. Loopback
+# worked because portmap has a special lo path with a 65k MTU, which is exactly
+# the "127.0.0.1:81 answers, every other address hangs" symptom.
+#
+# A single NON-hostNetwork pod satisfies BOTH constraints at once. The pod's
+# namespace is private, so :3000 cannot collide with anything on the node; and
+# the overlay client creates ovl0 INSIDE that same namespace, so NPM's :81 and
+# the admin dashboard's :8789 are plain local sockets on the overlay address. An
+# inbound packet for 10.22.22.22:81 is delivered straight to a socket — no DNAT,
+# no forwarding, no MTU renegotiation, no proxy hop.
+#
+# This is the same shape the zerotier-self stack uses (podman containers with
+# --network host inside a pod that is itself NOT hostNetwork), which is why that
+# stack can serve NPM at <overlay-ip>:81 with no special plumbing at all.
+#
+# What this deleted, relative to the previous version: the separate npm
+# Deployment, the npm-admin Service, the npm-admin-proxy socat Deployment, the
+# TCPMSS clamp initContainer, and the podAffinity gluing npm to apgo. None of
+# them were wrong; they were all patches over the namespace split.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT IS AND IS NOT PUBLISHED ON THE NODE
+#
+#   80/443 TCP  — hostPort. Public ingress arriving on the node's physical NIC.
+#                 This is ordinary north-south traffic and the portmap path
+#                 handles it fine; it is only the TUN-ingress case that didn't.
+#   6970  UDP   — hostPort. The overlay transport. A pod namespace has no
+#                 host-facing UDP port of its own, so without this the client
+#                 could dial out but nothing could punch back in.
+#   81    TCP   — NOT published. Deliberately. It is reachable at
+#                 10.22.22.22:81 over the overlay, which is how you use it.
+#   8789  TCP   — NOT published. Same: 10.22.22.22:8789 over the overlay.
+#
+# Note that 10.22.22.22 is now a POD address rather than a node address. For
+# tunnelling in from a laptop over APGO that changes nothing — you still dial
+# 10.22.22.22:81 and :8789. But the NODE itself no longer has a route into the
+# overlay, so nothing running directly on zx3t/zx7t can reach 10.22.22.x. If you
+# ever need that back, run a second small hostNetwork APGO client with its own
+# overlay address rather than reverting this file.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS LAYOUT AND NOT hostNetwork — THE REASON THAT ACTUALLY MATTERS
+#
+# The pod namespace ISOLATES ovl0, and that is the point.
+#
+# These nodes already run a SECOND APGO client (the podman one, tun.name ovl7),
+# and it is where the Kubernetes node IPs come from: zx3t is 10.22.22.3 and zx7t
+# is 10.22.22.7 — both inside overlay_cidr 10.22.22.0/24. If this client's ovl0
+# is ALSO in the host namespace, that namespace ends up with two connected routes
+# for 10.22.22.0/24 and the kernel picks between them arbitrarily. Replies to an
+# overlay peer then leave via the wrong tunnel under the wrong node identity, and
+# you get: ~66% ping loss, endless "cipher: message authentication failed" and
+# "replayed or expired nonce", constant re-handshakes, and 10.22.22.22:81 timing
+# out even from the node holding it. All of that was measured, not theorised.
+#
+# Running the client in this pod's own namespace puts ovl0 in a routing table
+# where nothing else claims that /24. Same reason the zerotier-self stack works:
+# its ZeroTier TUN is alone in ITS pod namespace too.
+#
+# THE COST THIS LAYOUT USED TO HAVE, AND HOW IT IS PAID OFF NOW
+#
+# Outbound overlay packets leave via the CNI bridge, which masquerades them and
+# REWRITES THE SOURCE PORT — a different external port per destination. That is
+# a symmetric NAT stacked under the router's, and it defeats hole punching, so
+# sessions to NAT'd peers (phones especially) fell back to RELAY. That single
+# side effect is what drove the repeated attempts to move back to hostNetwork.
+#
+# It is fixed HERE instead, by the apgo-natpin DaemonSet at the bottom of this
+# file. One rule per node, ahead of the CNI masquerade:
+#
+#   -t nat -I POSTROUTING -p udp -s <pod cidr> --sport 6970 \
+#          -j MASQUERADE --to-ports 6970
+#
+# --to-ports forces a PORT-PRESERVING, endpoint-independent mapping for the
+# overlay's UDP: every peer now observes the same <node public ip>:6970, which
+# is precisely the property hole punching needs, and it is the same property
+# hostNetwork was being used to obtain. Inbound is already deterministic via
+# the hostPort DNAT below. So you get direct sessions AND a private namespace.
+#
+# DO NOT "fix" relaying by moving back to hostNetwork. That trades a working
+# path for the ovl0/ovl7 route collision above — and, as of Aug 18, for a
+# second failure this file had not seen before: with the TUN in the host
+# namespace, the kubelet's probe target (status.hostIP, an OVERLAY address on
+# this cluster) stops being locally deliverable when the two clients disagree
+# about who owns 10.22.22.0/24. NPM then answers instantly on 127.0.0.1:81 and
+# times out on 10.22.22.3:81, the startupProbe never passes, and the pod sits
+# at 2/3 Running with 0 restarts forever. The probes below are exec-based
+# specifically so that a routing fault can never again present as a dead pod.
+#
+# If direct sessions still degrade after this, the next levers are an anchor —
+# a publicly reachable endpoint in static_peers on every node — or
+# RENDEZVOUS_SERVERS below, both of which are additive to the port pin.
+#
+# PRECONDITION, on each ingress node:  sudo ufw allow 6970/udp
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRETS — create these once (network name + PSK, and the dashboard login):
+#
+# kubectl create namespace apgo
+# kubectl -n apgo delete secret apgo-network --ignore-not-found
+# kubectl -n apgo create secret generic apgo-network \
+#   --from-literal=NETWORK_NAME='network-name' \
+#   --from-literal=PSK='base64:PSK'
+# kubectl -n apgo rollout restart deploy/apgo
+#
+# # APGO admin dashboard login.
+# kubectl -n apgo create secret generic apgo-admin \
+#   --from-literal=ADMIN_USER='admin' \
+#   --from-literal=ADMIN_PASSWORD='pass'
+# kubectl -n apgo rollout restart deploy/apgo
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ROLLING OUT A NEW BUILD — read this before wondering why your change is not live
+#
+# The admin dashboard's HTML is COMPILED INTO the apgoadmin binary (//go:embed
+# static in admin/main.go). Editing admin/static/index.html on your workstation
+# changes nothing in the cluster until you rebuild and push the image. There is
+# no volume mount to shortcut it, by design: the dashboard and the binary that
+# serves it are versioned together.
+#
+# And `kubectl apply -f apgo.yaml` alone will NOT pick up a new image either,
+# for two compounding reasons:
+#
+#   1. The image reference (localhost:5000/apgo-admin:latest) is unchanged, so
+#      the Deployment's pod template is unchanged, so Kubernetes sees nothing
+#      to roll out and does nothing at all.
+#   2. Even forcing a restart is not enough: these containers run with
+#      imagePullPolicy: IfNotPresent, so the kubelet reuses the :latest image
+#      already cached on the node and never contacts the registry. A moving
+#      tag plus IfNotPresent means "pin to whatever this node happened to pull
+#      first", which is almost never what you want during development.
+#
+# So the full sequence, from an edited file to a live dashboard:
+#
+#   # 1. build + push (from the repo root, on a node that can reach the registry)
+#   podman build -t localhost:5000/apgo-admin:latest -f apgo-admin.containerfile .
+#   podman push  localhost:5000/apgo-admin:latest
+#
+#   # 2. make the node forget the cached copy, or the push above is invisible
+#   #    to it. On k3s/containerd:
+#   sudo crictl rmi localhost:5000/apgo-admin:latest
+#   #    (Docker: docker rmi localhost:5000/apgo-admin:latest)
+#
+#   # 3. restart so the kubelet pulls again
+#   kubectl -n apgo rollout restart deploy/apgo
+#   kubectl -n apgo rollout status  deploy/apgo
+#
+# To CONFIRM you are running what you think you are — worth doing once, because
+# a stale dashboard looks exactly like a change that did not work:
+#
+#   kubectl -n apgo get pod -l app=apgo \
+#     -o jsonpath='{.items[0].status.containerStatuses[*].imageID}{"\n"}'
+#
+# Compare that digest before and after. If it did not change, step 2 was
+# skipped and you are still on the old build.
+#
+# If you iterate on the dashboard often, the friction is worth removing
+# properly: tag each build (…:2026-09-02-1) and bump the tag here, so the
+# Deployment actually changes and Kubernetes rolls it out on its own. Immutable
+# tags are the real fix; steps 2 and 3 are the workaround for a moving one.
+# Alternatively set imagePullPolicy: Always on the apgo* containers — but note
+# the trade-off the comment at overlay-client describes: a node whose registry
+# is unreachable then cannot restart the overlay AT ALL, which is a bad state
+# for the software you may be relying on to reach that cluster.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# MIGRATING FROM THE TWO-DEPLOYMENT LAYOUT
+#
+# The old objects are not in this file any more, so `kubectl apply` will not
+# remove them. Delete them explicitly, once:
+#
+#   kubectl -n apgo delete deploy/npm deploy/npm-admin-proxy
+#   kubectl -n apgo delete svc/npm-admin
+#   kubectl apply -f apgo.yaml
+#
+# Delete npm FIRST: it holds npm-data and npm-letsencrypt, which are
+# ReadWriteOnce, and the new apgo pod cannot attach them until it lets go.
+#
+# The MSS clamp installed by the old initContainer persists in the node's mangle
+# table after the pod is gone. It is harmless, but to clean up:
+#   sudo iptables -t mangle -D FORWARD -o ovl+ -p tcp --tcp-flags SYN,RST SYN \
+#     -j TCPMSS --clamp-mss-to-pmtu
+#
+# Any NPM proxy host pointing at apgo-admin.apgo.svc:8788 can go back to
+# 127.0.0.1:8789 — the dashboard is a container in this same pod again.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apgo
+  labels:
+    name: apgo
+---
+# High scheduling priority so a rescheduled apgo pod jumps ahead of ordinary
+# workloads (and can preempt them) when a node comes back or fails over.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: apgo-critical
+value: 1000000
+globalDefault: false
+description: "APGO overlay + ingress stack — reschedule before ordinary workloads."
+---
+# =============================================================================
+# STORAGE CLASS: linstor-apgo-r2 — DEFINED IN piraeus-linstor.yaml, NOT HERE
+#
+# MOVED 2026-09-04. This file used to declare linstor-apgo-r2 itself. So did
+# three other repos for their own classes, and the four copies had already
+# drifted: different placement counts, different split-brain policy, and
+# allowRemoteVolumeAccess unset in every one of them — which is what let a pod
+# be scheduled onto a node holding none of its data.
+#
+# Storage policy now lives with the storage platform. This file declares its
+# PVCs and references the class BY NAME; it does not define it.
+#
+# apgo-state / npm-data / npm-letsencrypt uses linstor-apgo-r2:
+#   placementCount 4 — one replica on every node, so the pod's fallback scheduling is real
+#   allowRemoteVolumeAccess: "false" — the CSI driver reports only nodes that
+#   hold a replica, so the scheduler will not place this pod anywhere its data
+#   is not. That is what makes the nodeAffinity below a safety net rather than
+#   the only thing standing between you and a pod stuck in Init forever.
+#
+# THIS FILE NO LONGER STANDS ALONE FOR STORAGE. On a fresh cluster apply
+# piraeus-linstor.yaml FIRST. Without it the PVC below stays Pending with
+# "storageclass.storage.k8s.io not found" — which is the correct failure, and
+# is not the same as the PVC hanging Pending because a placement constraint
+# matched zero nodes. Check `kubectl get sc` before debugging anything else.
+#
+# TO CHANGE THE CLASS: edit piraeus-linstor.yaml. StorageClass.parameters is
+# immutable, so it is delete-then-apply, and it changes NOTHING about volumes
+# that already exist. That file documents the migration steps.
+# =============================================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  # The overlay node's IDENTITY lives here (node.key + admin material) — this
+  # PVC following the pod between zx3t/zx7t is what makes failover come back
+  # as the same overlay node at the same 10.22.22.22 address.
+  name: apgo-state
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+  storageClassName: linstor-apgo-r2
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-data
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: linstor-apgo-r2
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-letsencrypt
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 512Mi
+  storageClassName: linstor-apgo-r2
+---
+# =============================================================================
+# 2026-10-18: THE POD NOW USES THE *-v2 CLAIMS BELOW, NOT THE THREE ABOVE.
+#
+# The original three volumes kept their only UpToDate replicas on zx3t/zx7t.
+# When both remote sites dropped off (etcd/WAN trouble), no reachable node had
+# a usable copy, every attach failed with "could not determine device path",
+# and apgo sat in Init:0/1 for hours. The data was recovered from zx7t's
+# backing files and restored into these v2 claims on home-replicated, which
+# keeps both replicas on the two LOCAL nodes (zx11t + zx13t) and does NOT
+# allow remote (diskless) access. So:
+#   * the pod can only run on zx11t or zx13t (see the required affinity)
+#   * a remote-site outage can no longer take apgo's data away
+# The three claims above are kept as the fallback copy of the old data. Delete
+# them (and their PVs) only once the v2 volumes are confirmed good.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: apgo-state-v2
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 256Mi
+  storageClassName: home-replicated
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-data-v2
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: home-replicated
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: npm-letsencrypt-v2
+  namespace: apgo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 512Mi
+  storageClassName: home-replicated
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apgo-config
+  namespace: apgo
+data:
+  OVERLAY_CIDR: "10.22.22.0/24"
+  FRIENDLY_NAME: "k8s-node"
+  # Pin this node's overlay IP (matches the admin-panel assignment). Without a
+  # pin the client auto-derives an IP from its key, which can collide with
+  # another node's (that exact collision — two nodes on 10.22.22.105 — caused
+  # heavy packet loss here once). Keep this in sync if you re-assign it.
+  OVERLAY_ADDRESS: "10.22.22.22"
+  # Set to "1" to make this node an internet EXIT / outproxy.
+  #
+  # NOTE: exit/outproxy from a pod namespace NATs twice — once by the client's
+  # own iptables rules inside the pod, then again by the CNI masquerade on the
+  # way out of the node. It works, but it is a slower path than it was under
+  # hostNetwork. If you turn this on and it underperforms, that is why.
+  EXIT_NODE: "1"
+  # OPTIONAL nodeName -> PUBLIC IP map. LEAVE IT EMPTY unless you have proven
+  # you need it.
+  #
+  # Normally you do NOT: a pod's traffic egresses via the node it runs on, so
+  # STUN reports that node's own public IP, which is exactly where the hostPort
+  # DNAT lives — the advertised endpoint is correct with no configuration, and
+  # it follows the pod across a reschedule by itself.
+  #
+  # This exists only for the asymmetric case, where a cluster's egress leaves
+  # through a DIFFERENT node than the pod runs on (policy routing, an egress
+  # gateway, a default route over a tunnel). There STUN reports the egress
+  # node, peers dial a machine with no route to this pod, and everything falls
+  # back to relay while the endpoint looks plausible.
+  #
+  # HOW TO TELL, rather than guess — compare the two:
+  #   kubectl -n apgo exec deploy/apgo -c overlay-client -- wget -qO- ip.me   # egress
+  #   ssh <node> curl -4 ip.me                                               # the node
+  # Same answer  -> leave this empty; STUN is right.
+  # Different    -> fill in "<nodeName>=<node public ip>" entries. The
+  #                 entrypoint resolves the pod's ACTUAL spec.nodeName, so it
+  #                 still follows a reschedule; nothing is pinned.
+  NODE_PUBLIC_IPS: ""
+  # Optional HTTPS discovery servers for BitTorrent-blocked networks (comma
+  # list). Worth populating now: with the client behind CNI masquerade, a
+  # rendezvous server is the cleanest fallback if hole punching degrades.
+  RENDEZVOUS_SERVERS: ""
+  # Base client config (env vars still override name/PSK/CIDR). STUN servers
+  # are REQUIRED for internet peers — without them the client can't learn its
+  # public endpoint and hole punching fails. A fixed UDP port keeps the NAT
+  # mapping stable across restarts and must match the hostPort on the
+  # overlay-client container below.
+  client.yaml: |
+    udp_listen_port: 6970
+
+    # Announce the hostPort, not the port STUN observed.
+    #
+    # STUN reports the port the CNI masquerade picked for the packet sent TO the
+    # STUN server — a different port for every destination, so what this node
+    # published to trackers was an endpoint nothing could ever reach. 6970 is
+    # DNAT'd to this pod and is stable.
+    #
+    # As of the apgo-natpin DaemonSet this is no longer just an announcement —
+    # it is TRUE. natpin pins the outbound masquerade to 6970 as well, so the
+    # port peers observe and the port announced here are the same number, and
+    # the mapping is endpoint-independent instead of per-destination.
+    #
+    # This is ALSO what makes the pod's endpoint failover-safe with nothing
+    # pinned: STUN supplies the public IP of whichever node the pod currently
+    # runs on, this supplies the port, and the pair is re-derived on every
+    # announce (and immediately when the IP changes). Move the pod to another
+    # node and the advertised endpoint follows it by itself.
+    #
+    # Completes the path from outside the site only if inbound UDP 6970 is
+    # open on that node (`sudo ufw allow 6970/udp`); otherwise peers reach the
+    # pod by relay, which costs a hop but works.
+    advertise_port: 6970
+
+
+    tun:
+      # MUST match the rest of the fleet. config/client.yaml in this repo ships
+      # mtu: 1280, but this ConfigMap never set it, so this node was silently
+      # running the client's built-in default of 1420 (see client/tun_linux.go)
+      # while every other node was at 1280. An MTU mismatch produces exactly the
+      # "connects, then hangs on the first large response" symptom, and it was
+      # doing so independently of any of the namespace problems above.
+      mtu: 1280
+
+    # MUST match every node on the network — the podman stack and the
+    # macOS/Windows app both use aesgcm; a mismatch fails every handshake
+    # with "cipher: message authentication failed".
+    cipher: "aesgcm"
+
+    # Symmetric-NAT port prediction. REQUIRED now that this client runs in a pod
+    # namespace: CNI masquerade rewrites the source port on every outbound
+    # packet, which presents to peers as a symmetric NAT. The client probes the
+    # allocation stride and sprays predicted ports during a coordinated punch.
+    # config/client.yaml already sets this true for every other node; it was
+    # missing here and therefore defaulting to false.
+    port_prediction: true
+
+    # Fast discovery tick — the client announces to a rotating subset of
+    # trackers each tick (individual trackers still see gentle intervals), so
+    # peers converge in seconds instead of the 15-min default.
+    min_announce_interval_seconds: 30
+
+    # NAT keepalive (default 10s). Lower it further only for extremely
+    # aggressive NATs; sessions self-heal (tear down + re-punch) after ~3
+    # missed intervals either way. Keep this SHORT here: the CNI masquerade
+    # adds a second conntrack table whose UDP entries also need refreshing.
+    keepalive_seconds: 10
+
+    stun_servers:
+      - "stun:stun.l.google.com:19302"
+      - "stun:stun1.l.google.com:19302"
+      - "stun:global.stun.twilio.com:3478"
+
+    # NO static_peers here — deliberately.
+    #
+    # This used to pin "127.0.0.1:6969" to reach the same-host podman node,
+    # because both clients shared the host namespace and so could not discover
+    # each other (self-drop on LAN sweep, only one can bind the discovery port,
+    # and same-site dial suppression blocked the tracker path). Two things
+    # changed:
+    #
+    #   1. That port was wrong. config/client.yaml has the podman node on
+    #      udp_listen_port 32555, not 6969, so this pin has been dialling
+    #      nothing.
+    #   2. They are no longer in the same namespace, so the reason for a
+    #      loopback pin is gone.
+    #
+    # The pin now lives on the PODMAN side only, where config/client.yaml
+    # already has static_peers: ["127.0.0.1:6970"]. That still works: the host's
+    # 127.0.0.1:6970 hits this pod through the UDP hostPort below, via portmap's
+    # loopback rule. One-directional pinning is enough — the podman node dials,
+    # this pod answers, the session is established. See
+    # docs/two-nodes-same-host.md.
+---
+# Custom NGINX snippet appended to every NPM proxy server block. This is the
+# ONLY supported way to change proxy behavior in nginx-proxy-manager (the jc21
+# image reads /data/nginx/custom/*.conf; there is no env var for it).
+# Ref: https://nginxproxymanager.com/advanced-config/#custom-nginx-configurations
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: npm-custom
+  namespace: apgo
+data:
+  server_proxy.conf: |
+    # Stream upstreams (RustDesk, long-lived peer connections) straight through
+    # instead of buffering, so a slow or aborting client no longer pins an
+    # nginx worker waiting out the default 60s proxy timeout. Worker-pool
+    # starvation from held connections is what made the admin UI (and every
+    # proxy host) hang "after a little while."
+    proxy_request_buffering off;
+    proxy_buffering off;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apgo
+  namespace: apgo
+  labels:
+    app: apgo
+spec:
+  replicas: 1
+  # Recreate: the three PVCs are ReadWriteOnce — a rolling update would deadlock
+  # with old and new pods both claiming them. This also guarantees only one
+  # holder of the overlay node key exists at a time (see the HA note below).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: apgo
+  template:
+    metadata:
+      labels:
+        app: apgo
+    spec:
+      # NO hostNetwork — this is the entire point of this layout. ovl0 is
+      # created inside this pod's namespace, alongside NPM's :81 and the admin
+      # dashboard's :8789, so all three are local sockets on 10.22.22.22.
+      #
+      # ClusterFirst (the default) rather than the Default/node resolver this
+      # used under hostNetwork. Trade-off: tracker and STUN lookups now go
+      # through CoreDNS, so peer discovery has a dependency it did not have
+      # before. In exchange, NPM can resolve in-cluster Service names for proxy
+      # host backends, which it needs far more often. If cluster DNS here is
+      # flaky enough to hurt discovery, switch to dnsPolicy: Default and change
+      # any Service-name proxy backends to IPs.
+      dnsPolicy: ClusterFirst
+      # Fast recovery: jump the scheduling queue, and don't linger 30s in
+      # Terminating during a Recreate rollover or node drain.
+      priorityClassName: apgo-critical
+      terminationGracePeriodSeconds: 10
+      # HA MODEL — fast-failover ACTIVE-PASSIVE with one shared identity.
+      # This pod IS overlay node 10.22.22.22: the node key lives on the
+      # apgo-state PVC and OVERLAY_ADDRESS pins the IP, so wherever the pod
+      # reschedules it comes back as the SAME node at the SAME overlay address
+      # (peers re-handshake to the new endpoint within a few keepalives).
+      # Active-ACTIVE (two live replicas sharing the identity) is deliberately
+      # NOT done: overlay identity is the node key, and two live holders of one
+      # key desync every peer session (endpoint flapping + conflicting
+      # announces). Failover between zx3t/zx7t is instead made as fast as
+      # possible: hard-pinned to those two nodes, 0s unreachable tolerations,
+      # top scheduling priority, and the apgo-prepull DaemonSet keeps images
+      # warm on the standby node so recovery never waits on the registry.
+      # zx3t/zx7t are control-plane nodes (etcd + apiserver), so they carry the
+      # control-plane NoSchedule taint; the toleration below is what lets the
+      # pod land on them at all.
+      affinity:
+        nodeAffinity:
+          # ---- REQUIRED: NODES THAT CAN HOLD THIS POD'S DATA ----
+          #
+          # !! zx5t IS ABSENT FROM THIS LIST ON PURPOSE AND MUST STAY ABSENT. !!
+          # It has an hdd-pool but NO DRBD kernel module ("Module drbd not
+          # found"), so it can neither hold nor attach a replica.
+          #
+          # THIS LIST IS NOT A PLACEMENT PREFERENCE. It is the set of nodes on
+          # which apgo-state / npm-data / npm-letsencrypt actually have a
+          # replica. A node outside it cannot serve this pod AT ALL:
+          # linstor-apgo-r2 sets allowRemoteVolumeAccess: "false", so the CSI
+          # driver will not attach a diskless resource over the network. The
+          # attach does not degrade, it fails:
+          #
+          #     ControllerPublishVolume failed for pvc-...: 404 Not Found
+          #
+          # retried forever, pod stuck Init:0/1 with no IP. Observed
+          # 2026-09-07: zx3t was fenced during a drill, both remaining ingress
+          # nodes reported no free hostPorts, the pod fell through to zx5t
+          # under the old `preferred` rule, and the whole overlay stayed down
+          # until a human noticed. A pod that cannot mount is not a degraded
+          # overlay node — it is an absent one, with a slower failure.
+          #
+          # WHY THIS IS NOT A RETURN TO THE OLD HARD PIN. The previous hard
+          # requirement listed zx3t/zx7t ONLY and produced "0/4 nodes are
+          # available" when neither could take the pod. That is what the
+          # `preferred` rule was reacting to, and the reaction was right about
+          # the problem and wrong about the fix: the answer is a WIDER required
+          # set, not an unbounded one. Three data-capable nodes is strictly
+          # better fallback than the two the hard pin allowed, and unlike
+          # `preferred` every member of the set can actually run the pod.
+          #
+          # BEFORE ADDING A NODE HERE, it must have BOTH a LINSTOR storage pool
+          # AND a replica of all three PVCs. Verify, do not assume:
+          #     linstor storage-pool list
+          #     linstor resource list | grep -E 'apgo|npm'
+          # If zx11t turns out to have no pool, REMOVE IT from this list — a
+          # required entry that cannot mount is worse than no entry, because
+          # the scheduler will happily use it.
+          #
+          #
+          # ── 2026-10-08: EVERY NODE EXCEPT zx5t ──────────────────────────────
+          # Checked 2026-10-08: all three PVs (pvc-9533c01e, pvc-559a3833,
+          # pvc-4892bd89) carry volumeAttributes remote-access-policy: "true".
+          # They predate linstor-apgo-r2's allowRemoteVolumeAccess "false", and
+          # volumeAttributes are immutable, so they KEEP remote access: on a
+          # node without a local copy LINSTOR attaches them diskless over the
+          # network. Every DRBD node can therefore run this pod. zx5t is the one
+          # exception — no DRBD kernel module, so it cannot attach at all (that,
+          # not a missing replica, is why the pod hung there on 2026-09-07).
+          # The long note above describes the old hand-written node list; it is
+          # history. IF THESE PVCs ARE EVER RECREATED under linstor-apgo-r2 they
+          # lose remote access and this rule must go back to a node list.
+          #
+          # ── 2026-10-18: zx11t + zx13t ONLY ──────────────────────────────────
+          # The PVCs WERE recreated (apgo-state-v2 / npm-data-v2 /
+          # npm-letsencrypt-v2 on home-replicated, see the note at the PVCs).
+          # home-replicated has allowRemoteVolumeAccess "false" and keeps its
+          # replicas on zx11t + zx13t only, so those are the only two nodes
+          # that can mount this pod's data. Any other node here would just
+          # hang in Init. The zx7t/zx3t preferences below therefore never
+          # match while this rule stands; they are kept for when the remote
+          # sites are stable enough to hold replicas again.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx11t", "zx13t"]
+          # ---- PREFERRED: THE INGRESS NODES ----
+          #
+          # zx3t/zx7t are where this pod belongs: 80/443 are hostPorts and
+          # public DNS points at those two boxes. Maximum weight, so the
+          # scheduler takes one whenever either can accept the pod.
+          #
+          # Falling back to zx11t costs north-south ingress only: the overlay
+          # stays reachable at 10.22.22.x because EXTRA_CANDIDATES is built
+          # from status.hostIP, so whichever node it lands on advertises its
+          # own LAN address and peers still get a real endpoint to punch.
+          # 80/443 will not serve the public names until DNS points at that
+          # box. A degraded overlay node beats an absent one — which is the
+          # original reasoning, now applied to a set where every option works.
+          #
+          # ORDER (2026-10-08): zx7t first, then zx3t, then any other node in
+          # the required list. The weights add per node, so zx7t scores 100,
+          # zx3t 60, every other node 0. Weight is a strong bias, not an absolute rule:
+          # if zx7t cannot take the pod (cordoned, NotReady, hostPort or
+          # resources taken) the scheduler falls through to zx3t, then any other node that holds the data.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx7t"]
+            - weight: 60
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx3t"]
+      tolerations:
+        # Tolerate the control-plane taint so zx3t / zx7t are schedulable.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        # Fail over quickly if a node goes away.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+        # Piraeus taints a node when ANY DRBD volume on it loses quorum (e.g.
+        # a remote site drops out). That says nothing about apgo's own
+        # volumes, so don't let it keep the most important pod off a node.
+        - key: drbd.linbit.com/lost-quorum
+          operator: Exists
+          effect: NoSchedule
+        - key: drbd.linbit.com/force-io-error
+          operator: Exists
+          effect: NoSchedule
+      # Copy the custom nginx snippet onto the PVC as a NORMAL writable file.
+      # Mounting the ConfigMap directly at /data/nginx/custom/... crash-looped
+      # the pod: ConfigMap mounts are always read-only, NPM's s6 "prepare" step
+      # chowns everything under /data/nginx, the chown on the mounted file
+      # failed, and s6 aborted the container on every start.
+      initContainers:
+        - name: install-custom-conf
+          image: docker.io/jc21/nginx-proxy-manager:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "mkdir -p /data/nginx/custom && cp /npm-custom/server_proxy.conf /data/nginx/custom/server_proxy.conf"]
+          volumeMounts:
+            - name: npm-data
+              mountPath: /data
+            - name: npm-custom
+              mountPath: /npm-custom
+          resources:
+            requests: {cpu: "10m", memory: "32Mi"}
+            limits: {cpu: "200m", memory: "128Mi"}
+
+      containers:
+        # --- APGO overlay client ---------------------------------------------
+        # Creates ovl0 in THIS pod's network namespace. Every other container in
+        # this pod shares that namespace, which is what makes NPM reachable on
+        # the overlay address with no proxying.
+        - name: overlay-client
+          image: localhost:5000/apgo-client:latest
+          # IfNotPresent: restart from the cached image immediately instead of
+          # waiting on (or failing against) the registry. To roll out a new
+          # :latest build:  kubectl -n apgo rollout restart deploy/apgo  after
+          # pre-pulling, or temporarily flip this back to Always.
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          envFrom:
+            # optional: if the secret is missing, the client starts in setup mode
+            # and you configure it from the admin dashboard (/network-setup).
+            - secretRef:
+                name: apgo-network
+                optional: true
+            - configMapRef:
+                name: apgo-config
+                optional: true
+          env:
+            # The node's own LAN address, via the downward API.
+            #
+            # This pod runs in its own network namespace, so the only address it
+            # can see is the pod IP (10.42.x.y) — meaningless outside the
+            # cluster. The address that actually reaches it is the NODE's LAN
+            # address paired with the hostPort below, DNAT'd straight in with no
+            # masquerade involved. The pod cannot discover that: the node's
+            # interfaces are in a different namespace, and STUN only ever
+            # reports whatever the CNI rewrote the source port to.
+            #
+            # So it has to be told. EXTRA_CANDIDATES is advertised verbatim to
+            # peers, ahead of anything STUN-derived. A device on the same LAN
+            # then has a real endpoint to punch instead of three dead ones.
+            #
+            # Kept here because it is genuinely useful diagnostic context in
+            # the client log, NOT because it is advertised — see
+            # EXTRA_CANDIDATES below for why that is now empty.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Which node we landed on — the entrypoint resolves this against
+            # NODE_PUBLIC_IPS to advertise the correct public endpoint, and
+            # re-resolves it on every reschedule.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_PUBLIC_IPS
+              valueFrom:
+                configMapKeyRef:
+                  name: apgo-config
+                  key: NODE_PUBLIC_IPS
+                  optional: true
+            - name: ADVERTISE_PORT
+              value: "6970"
+            # EXTRA_CANDIDATES is deliberately EMPTY on this cluster.
+            #
+            # It used to be "$(NODE_IP):6970", and on a normal cluster that is
+            # right: status.hostIP is the node's LAN address, so a peer on that
+            # LAN gets a real endpoint to punch. But HERE the k3s node network
+            # runs over the APGO overlay, so status.hostIP is an OVERLAY
+            # address (zx3t is 10.22.22.3, zx7t is 10.22.22.7 — the podman
+            # client's addresses, not this pod's). Advertising one means this
+            # pod tells the whole mesh "reach me at another node's overlay IP":
+            #
+            #   * every dashboard shows this node's endpoint as someone else's
+            #     IP, which is simply wrong information;
+            #   * desktops reach it by nesting the transport inside the overlay
+            #     (works, but an extra encrypt/decrypt hop, and it breaks the
+            #     moment that node's client is down);
+            #   * PHONES cannot use it at all — a tunnel process's own sockets
+            #     bypass its tunnel by OS design — so they stay relayed forever.
+            #
+            # With it empty, the pod advertises the endpoint it genuinely owns:
+            # <this node's public IP, from STUN>:6970. Inbound lands via the
+            # hostPort DNAT below; outbound keeps port 6970 because apgo-natpin
+            # pins the masquerade. Correct, self-describing, follows the pod
+            # across a reschedule, and works for phones and desktops alike.
+            #
+            # 2026-10-19: still empty here, but the ENTRYPOINT now appends the
+            # node's own private LAN addresses, AUTO-DETECTED from the host's
+            # interfaces (host /proc mounted at /host/proc, below). That is not
+            # the old "$(NODE_IP)" mistake: these are the node's real LAN
+            # addresses, not overlay ones, discovered on whatever node the pod
+            # lands on. Without them, a device on the same LAN as the pod's node
+            # could only use <public ip>:6970, i.e. NAT loopback, which the
+            # router does not do - so it was relayed or unreachable.
+            # Set LAN_CANDIDATES=off to disable.
+            - name: EXTRA_CANDIDATES
+              value: ""
+            - name: CLIENT_CONFIG
+              value: /config/client.yaml
+            - name: NODE_KEY_FILE
+              value: /state/node.key
+            - name: CONTROL_SOCKET
+              value: /shared/control.sock
+            - name: LOG_FILE
+              value: /shared/overlay-client.log
+            - name: REVOCATIONS_FILE
+              value: /state/revocations.json
+            - name: PROVISIONS_FILE
+              value: /state/provisions.json
+            - name: ADMIN_PUBKEY_FILE
+              value: /state/admin-pubkey
+            - name: SEALED_ADMIN_KEY_FILE
+              value: /state/admin-key-sealed.json
+            # Per-node toggles set from the admin panel (IPv6, DHT, public
+            # relays, rendezvous servers) persist here. WITHOUT this the panel
+            # can display those switches but every save is refused with "no
+            # persistent settings path configured on this node" — the endpoint
+            # deliberately will not accept a setting it cannot remember across
+            # a pod restart. easy-compose.yml has always set it; this file did
+            # not, so the Kubernetes node was the one place the switches could
+            # not be changed at all.
+            - name: NODE_SETTINGS_FILE
+              value: /state/node-settings.json
+            # Admission control: "0" = WARN ONLY. The client build currently in
+            # your registry may be the intermediate one that ENFORCED admission
+            # unconditionally, which black-holes every unapproved peer while
+            # control frames keep flowing — the node stays visible in peer lists
+            # and passes no data. This pins it off regardless of which build runs.
+            # Unapproved peers are logged once per peer per 30s:
+            #   [admission] would drop <path> from unapproved peer <fingerprint>
+            - name: ADMISSION_ENFORCE
+              value: "0"
+          ports:
+            # The overlay transport. MUST match udp_listen_port in client.yaml.
+            #
+            # This hostPort is load-bearing in a way it was not under
+            # hostNetwork: a pod namespace has no host-facing UDP port, so
+            # without it nothing outside the node could ever punch back in — the
+            # client could dial out and form outbound sessions, but every peer
+            # trying to reach this node first would fail, and the podman node's
+            # 127.0.0.1:6970 static peer would dial into nothing.
+            - name: overlay-udp
+              containerPort: 6970
+              hostPort: 6970
+              protocol: UDP
+          volumeMounts:
+            # Host /proc, read-only: the entrypoint reads the NODE's LAN addresses
+            # from it (LAN candidates). Needs the container's existing privileged.
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+            - name: state
+              mountPath: /state
+            - name: client-config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "2", memory: "512Mi"}
+        # --- APGO admin dashboard --------------------------------------------
+        - name: overlay-admin
+          image: localhost:5000/apgo-admin:latest
+          # IfNotPresent + a moving :latest tag means this node keeps whatever
+          # it cached first. The dashboard HTML is embedded in this binary, so
+          # if a dashboard change has not appeared, this is why — see "ROLLING
+          # OUT A NEW BUILD" at the top of this file for the three commands.
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # optional: if missing, you're prompted to create a dashboard login
+            # on first visit.
+            - secretRef:
+                name: apgo-admin
+                optional: true
+          env:
+            # 8789 (not 8788) so it can coexist with an old standalone APGO
+            # stack still holding 8788 on the host during migration.
+            - name: ADMIN_LISTEN
+              value: ":8789"
+            - name: CONTROL_SOCKET
+              value: /shared/control.sock
+            - name: LOG_FILE
+              value: /shared/overlay-client.log
+            - name: ADMIN_CREDS_FILE
+              value: /adminkey/credentials.json
+            - name: ADMIN_KEY_FILE
+              value: /adminkey/admin.key
+          ports:
+            # Must match ADMIN_LISTEN (:8789). No hostPort: this is reached at
+            # 10.22.22.22:8789 over the overlay, and in-cluster via the
+            # apgo-admin Service below.
+            - name: dashboard
+              containerPort: 8789
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: state
+              mountPath: /adminkey
+              subPath: adminkey
+          resources:
+            requests: {cpu: "10m", memory: "32Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+        # --- NGINX Proxy Manager ---------------------------------------------
+        # Now a container in THIS pod rather than a Deployment of its own. Its
+        # Node backend on :3000 is still fully private — a pod namespace hides
+        # it from the node exactly as well as a separate pod did, so the "API is
+        # not healthy" port-3000 collision cannot come back.
+        #
+        # Its route to overlay backends (10.22.22.x proxy hosts) is now this
+        # pod's OWN ovl0, at the correct 1280 MTU. That is why the TCPMSS clamp
+        # initContainer that used to live here is gone: nginx now negotiates MSS
+        # against the real overlay path instead of against the CNI bridge.
+        - name: nginx
+          image: docker.io/jc21/nginx-proxy-manager:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Bind the admin UI (and proxy) on IPv4 only. On a host with a
+            # non-routable IPv6 address the browser prefers [::]:81, loads the
+            # page shell, then hangs on the /api calls — the classic "UI loads
+            # but spins forever." Forcing IPv4 avoids that. (APGO's own overlay
+            # IPv6 transport is unaffected — this only changes NPM's listeners.)
+            - name: DISABLE_IPV6
+              value: "true"
+            # NOTE: the nginx "hang after a while on long-lived upstreams" fix is
+            # NOT an env var — jc21/nginx-proxy-manager has no PROXY_REQUEST_BUFFERING
+            # setting (it was silently ignored, so nginx kept buffering and kept
+            # hanging). It's done the supported way, via the npm-custom
+            # ConfigMap copied onto the PVC by the initContainer above.
+          ports:
+            # Public ingress. hostPort is correct for these: traffic arrives on
+            # the node's physical NIC, which is the ordinary north-south path
+            # portmap handles well. It was only TUN-ingress that it couldn't.
+            - name: http
+              containerPort: 80
+              hostPort: 80
+            - name: https
+              containerPort: 443
+              hostPort: 443
+            # Admin UI — NO hostPort, by design. It is reachable at
+            # 10.22.22.22:81 over the overlay because nginx binds it in the same
+            # namespace as ovl0. Adding a hostPort here would not just be
+            # redundant, it would install a PREROUTING DNAT rule that runs
+            # BEFORE local socket lookup and would start intercepting overlay
+            # traffic destined for this very socket.
+            - name: npm-admin
+              containerPort: 81
+          # Give the Node backend + DB migrations time to finish on first boot
+          # (slow on a Longhorn PVC) BEFORE liveness can fire. Without a startup
+          # gate a first-boot migration that ran past the old 60s liveness delay
+          # was killed mid-migration and the pod could never come up — the
+          # "worked once, then crash-looped forever" symptom. While the startup
+          # probe is running, liveness/readiness are suppressed.
+          #
+          # ── WHY exec AND NOT httpGet ────────────────────────────────────────
+          # All three probes below run curl INSIDE the container against
+          # 127.0.0.1 instead of letting the kubelet dial the pod IP. This is
+          # not a style preference, it is the fix for an outage:
+          #
+          # An httpGet probe is dialled BY THE KUBELET, from the node, at the
+          # pod IP. On this cluster that address is an overlay address (the
+          # node network runs over APGO), so a plain health check on a socket
+          # sitting inside this pod became dependent on overlay routing being
+          # correct. On Aug 18 it wasn't: NPM answered 127.0.0.1:81/api/ in
+          # under a second with {"status":"OK"} while the kubelet's probe to
+          # 10.22.22.3:81 timed out 25 times in a row. Pod stuck at 2/3
+          # Running, 0 restarts, no crash, nothing in the logs — because
+          # nothing was wrong with NPM. Note the tell: a TIMEOUT rather than
+          # "connection refused" means the SYN never reached local socket
+          # lookup, i.e. the problem is the address, not the port.
+          #
+          # exec probes have no network path to break. They also keep working
+          # unchanged if this pod is ever moved back to hostNetwork, where the
+          # pod IP becomes the node IP and the same trap reopens.
+          #
+          # curl IS present in jc21/nginx-proxy-manager (verified: 8.14.1).
+          # Keep each -m below the surrounding timeoutSeconds so curl exits on
+          # its own and the kubelet reports a clean failure instead of a kill.
+          #
+          # Timings: the Node backend takes well over 300s on a cold Longhorn
+          # PVC (migrations, certbot plugin install, IP-range fetches), so the
+          # startup budget is 120 x 10s = 20 min. Once the startup probe
+          # succeeds once it is never re-evaluated until the container
+          # restarts.
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - curl -fsS -m 8 -o /dev/null http://127.0.0.1:81/api/
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 120  # up to 20 min on cold PVC / first boot
+          # Surface backend health instead of silently serving a dead UI:
+          # /api answers {"status":"OK"} only once the Node backend is up and
+          # migrations have run. If it ever regresses, the pod goes unready —
+          # visible in `kubectl get pods` instead of a mystery browser error.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - curl -fsS -m 4 -o /dev/null http://127.0.0.1:81/api/
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Liveness must tolerate a momentarily-busy nginx. The default 1s
+          # timeout meant one slow response — all workers briefly busy on
+          # long-lived upstream streams — made the admin port miss a probe and
+          # the kubelet KILLED the pod, turning a transient hang into a hard
+          # crash-loop. 5s timeout + 6 failures rides out blips and restarts
+          # only on a genuine, sustained (~2 min) hang.
+          # Probe /api/ (not /): / is only the static UI shell and keeps
+          # answering 200 even after the Node backend has died — so the
+          # dashboard "works then stops," serving 502s on every /api call
+          # FOREVER with no restart. /api/ returns 200 only while the backend is
+          # actually alive, so a dead backend now self-heals via a restart.
+          #
+          # IMPORTANT: this probe restarts the nginx CONTAINER only, not the
+          # pod. The overlay client keeps running and ovl0 survives, so an NPM
+          # restart no longer disturbs overlay sessions — strictly better
+          # isolation than the previous split, where the two were separate pods
+          # but an apgo pod restart still dropped everything.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - curl -fsS -m 4 -o /dev/null http://127.0.0.1:81/api/
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # NPM had no requests/limits, making it BestEffort QoS — the FIRST
+          # pod the kubelet OOM-evicts under node memory pressure, and with
+          # nothing guaranteed it often didn't recover. Guarantee a floor and
+          # cap the ceiling. Raised 512Mi -> 1Gi: OpenResty + the Node backend +
+          # SQLite sit ~150-300 MB idle, but under a burst of long-lived proxied
+          # connections the pod crept past 512Mi and was OOM-killed mid-serve —
+          # the other half of the "works for a bit then stops" symptom.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: npm-data
+              mountPath: /data
+            - name: npm-letsencrypt
+              mountPath: /etc/letsencrypt
+            # NOTE: the custom snippet (npm-custom ConfigMap) is NOT mounted
+            # here — the install-custom-conf initContainer copies it onto the
+            # npm-data PVC as a regular file. A direct ConfigMap mount is
+            # read-only, which made NPM's startup chown fail and s6 kill the
+            # container on every boot.
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: shared
+          emptyDir: {}
+        - name: state
+          persistentVolumeClaim:
+            claimName: apgo-state-v2
+        - name: client-config
+          configMap:
+            name: apgo-config
+            items:
+              - key: client.yaml
+                path: client.yaml
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: npm-data
+          persistentVolumeClaim:
+            claimName: npm-data-v2
+        - name: npm-letsencrypt
+          persistentVolumeClaim:
+            claimName: npm-letsencrypt-v2
+        - name: npm-custom
+          configMap:
+            name: npm-custom
+---
+# APGO dashboard reachable in-cluster at apgo-admin.apgo.svc:8788 (the Service
+# keeps port 8788 outward; the container listens on 8789).
+#
+# NOTE: NPM no longer needs this — it is a container in the same pod, so its
+# proxy hosts can point at 127.0.0.1:8789 again. Kept for anything ELSE in the
+# cluster that wants the dashboard.
+apiVersion: v1
+kind: Service
+metadata:
+  name: apgo-admin
+  namespace: apgo
+spec:
+  selector:
+    app: apgo
+  ports:
+    - name: dashboard
+      port: 8788
+      # The admin container listens on 8789 (ADMIN_LISTEN); 8788 stays the
+      # in-cluster Service port.
+      targetPort: 8789
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# RENDEZVOUS — HTTPS discovery server (alternative to BitTorrent trackers)
+#
+# Nodes POST their network id + public endpoint here and get back the other
+# endpoints. It never sees keys or the PSK, so it cannot join or decrypt the
+# overlay — but it does see WHICH endpoints announce, so it runs authenticated.
+#
+# Credentials come from the apgo-rendezvous Secret. With OpenBao, project the
+# secret with your usual mechanism (VSO / External Secrets / injector
+# annotations) so it lands as a Secret named apgo-rendezvous with these keys:
+#
+#   AUTH_TOKENS   comma-separated bearer tokens        (e.g. "tok1,tok2")
+#   AUTH_USERS    comma-separated user:password pairs  (e.g. "phone:pw1")
+#
+# Either key may be omitted; if BOTH are missing the server runs OPEN and says
+# so in its log. Manual (non-OpenBao) creation for a quick test:
+#
+#   kubectl -n apgo create secret generic apgo-rendezvous \
+#     --from-literal=AUTH_TOKENS="$(openssl rand -hex 24)"
+#
+# Clients then set that same value: desktop/mobile Settings → "Rendezvous
+# username or token", or RENDEZVOUS_TOKEN / RENDEZVOUS_AUTH env on a headless
+# node. Publish this Service through NPM on 443 with a real certificate — the
+# credential is sent in an Authorization header, so TLS is what protects it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apgo-rendezvous
+  namespace: apgo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apgo-rendezvous
+  template:
+    metadata:
+      labels:
+        app: apgo-rendezvous
+    spec:
+      priorityClassName: apgo-critical
+      # SAME PLACEMENT RULE AS THE apgo POD. Prefer zx3t/zx7t whenever either
+      # can take it, but stay schedulable anywhere if both are gone.
+      #
+      # THE TOLERATIONS BELOW ARE WHAT MAKE THIS PREFERENCE MEAN ANYTHING.
+      # zx3t and zx7t are control-plane nodes and carry
+      # node-role.kubernetes.io/control-plane:NoSchedule. Without tolerating
+      # it, this pod could NEVER land there, and the affinity would be a
+      # preference for two nodes it is forbidden from using — silently, with no
+      # error, just always running somewhere else. That was the state of this
+      # Deployment before: no affinity AND no tolerations, so rendezvous only
+      # ever ran on zx11t/zx5t while the apgo pod it serves ran on zx3t/zx7t.
+      #
+      # WHAT "PREFERRED" ACTUALLY GUARANTEES, because it is weaker than it
+      # looks: weight 100 is the maximum for node affinity, but it is one SCORE
+      # among several the scheduler sums — resource fit, image locality, taint
+      # scoring. A zx3t/zx7t running near capacity CAN lose to an idle zx11t on
+      # the resource-fit score even with the maximum affinity weight. This
+      # cluster runs those two nodes close to their CPU requests, so that is a
+      # live possibility rather than a theoretical one.
+      #
+      # Kubernetes has no manifest-level way to say "hard prefer, with
+      # fallback". If placement on zx3t/zx7t ever needs to be a guarantee
+      # rather than a strong hint, the levers are (a) raise the NodeAffinity
+      # plugin weight in the scheduler profile — cluster config, not this file
+      # — or (b) a PreferNoSchedule taint on zx11t/zx5t, which penalises them
+      # for every pod, not just this one. A required affinity is NOT the
+      # answer: that is what produced "0/4 nodes are available" and no fallback
+      # at all.
+      affinity:
+        nodeAffinity:
+          #
+          # ORDER (2026-10-08): zx7t first, then zx3t, then any other node in
+          # the required list. The weights add per node, so zx7t scores 100,
+          # zx3t 60, every other node 0. Weight is a strong bias, not an absolute rule:
+          # if zx7t cannot take the pod (cordoned, NotReady, hostPort or
+          # resources taken) the scheduler falls through to zx3t, then zx11t.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx7t"]
+            - weight: 60
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["zx3t"]
+      tolerations:
+        # Lets zx3t / zx7t be schedulable at all — see above.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        # Move immediately when a node goes away. Safe to be this aggressive
+        # here in a way it is not for stateful pods: rendezvous is stateless
+        # with no PVC, so there is no RWO volume to strand on a dead node and
+        # nothing to lose by starting a replacement early. Its whole state is
+        # an in-memory endpoint map rebuilt by the next announce round.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 0
+      containers:
+        - name: rendezvous
+          image: localhost:5000/apgo-rendezvous:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: PEER_TTL_SECONDS
+              value: "300"
+          envFrom:
+            # optional: absent secret = open server (it logs a warning).
+            - secretRef:
+                name: apgo-rendezvous
+                optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+          # Stateless and unprivileged — the whole service is one in-memory
+          # map of endpoint -> last-seen, rebuilt by the next announce round.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: "5m", memory: "16Mi"}
+            limits: {cpu: "200m", memory: "64Mi"}
+          # httpGet is FINE here, unlike on the apgo pod: this is an ordinary
+          # CNI pod whose pod IP is a plain 10.42.x.y address with no overlay
+          # involvement, so the kubelet's dial cannot be broken by a routing
+          # fault in the overlay.
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+---
+# Rendezvous reachable in-cluster at apgo-rendezvous.apgo.svc:8080.
+# Point an NPM proxy host (443, with a certificate) at this Service, then give
+# nodes the public URL, e.g. https://rv.example.com
+apiVersion: v1
+kind: Service
+metadata:
+  name: apgo-rendezvous
+  namespace: apgo
+spec:
+  selector:
+    app: apgo-rendezvous
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# NPM admin UI reachable in-cluster at npm-admin.apgo.svc:81.
+#
+# This is NOT the overlay path — 10.22.22.22:81 works directly now, because
+# nginx binds :81 in the same namespace as ovl0. This Service exists only for
+# other in-cluster workloads that want the NPM API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: npm-admin
+  namespace: apgo
+spec:
+  selector:
+    app: apgo
+  ports:
+    - name: admin
+      port: 81
+      targetPort: 81
+---
+# Pre-pull DaemonSet — keeps every image of the apgo/npm stack warm on BOTH
+# ingress nodes, so a failover of the apgo pod to the standby node never stalls
+# on (or fails against) the registry. Each container pulls its image and then
+# sleeps ~forever at zero cost; a rollout restart of this DaemonSet re-pulls
+# after you push new :latest builds.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: apgo-prepull
+  namespace: apgo
+spec:
+  selector:
+    matchLabels:
+      app: apgo-prepull
+  template:
+    metadata:
+      labels:
+        app: apgo-prepull
+    spec:
+      # NO node affinity, deliberately. This DaemonSet exists so a failover
+      # never waits on an image pull — which only helps on nodes the workload
+      # can actually land on. Now that the Deployment's affinity is a
+      # preference rather than a requirement, that is every node; pinning the
+      # prepull to two of them would guarantee a cold pull on exactly the
+      # occasion it was built to prevent.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: apgo-client
+          image: localhost:5000/apgo-client:latest
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          resources:
+            requests: {cpu: "1m", memory: "8Mi"}
+            limits: {cpu: "10m", memory: "32Mi"}
+        - name: apgo-admin
+          image: localhost:5000/apgo-admin:latest
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          resources:
+            requests: {cpu: "1m", memory: "8Mi"}
+            limits: {cpu: "10m", memory: "32Mi"}
+        - name: npm
+          image: docker.io/jc21/nginx-proxy-manager:latest
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          resources:
+            requests: {cpu: "1m", memory: "8Mi"}
+            limits: {cpu: "10m", memory: "32Mi"}
+        # Keep the natpin image warm too, so the port pin is re-armed
+        # immediately on a node that just came back rather than waiting on an
+        # external registry at exactly the wrong moment.
+        #
+        # !! THIS MUST BE THE SAME IMAGE THE apgo-natpin DAEMONSET RUNS. !!
+        # It was not, from 2026-09-04 to 2026-09-07, and that is the whole bug:
+        # natpin moved from alpine:latest to debian-iptables and this entry was
+        # left behind. So the image natpin actually needs was never warmed on
+        # any node, IfNotPresent found nothing, and natpin sat in
+        # ImagePullBackOff on zx5t/zx7t/zx11t for 27 HOURS — every surviving
+        # node relaying, silently, which is exactly the failure the natpin
+        # DaemonSet exists to prevent.
+        #
+        # Worse, prepull reported 4/4 Running the entire time, because it was
+        # successfully warming an image nothing uses. A prepull entry that does
+        # not match its consumer is not a warm cache, it is a false green light.
+        #
+        # IF YOU RETAG natpin, RETAG IT HERE IN THE SAME COMMIT.
+        - name: natpin
+          image: localhost:5000/apgo-natpin:latest
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          resources:
+            requests: {cpu: "1m", memory: "8Mi"}
+            limits: {cpu: "10m", memory: "32Mi"}
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# apgo-natpin — the reason this stack does not need hostNetwork
+#
+# THE PROBLEM. In a pod namespace, outbound overlay UDP is masqueraded by the
+# CNI on the way out of the node, and the masquerade picks a DIFFERENT external
+# source port for every destination. To a peer that is textbook SYMMETRIC NAT:
+# the endpoint it learns from a tracker or from STUN is not the endpoint the
+# next packet arrives from, so a coordinated hole punch can never line up and
+# the session degrades to RELAY. Phones suffer worst — a tunnel provider's own
+# sockets bypass its tunnel by OS design, so they cannot use the in-overlay
+# fallback path that desktops can.
+#
+# Historically the answer was hostNetwork, which removes the CNI masquerade
+# entirely. It also removes the namespace that keeps :3000, :81 and ovl0 out of
+# the node's way, and it puts this client's TUN in the same routing table as
+# the podman backbone client's. That trade has now failed twice, in two
+# different ways (port collision on :3000; the kubelet losing its route to the
+# probe target). See the header of this file.
+#
+# THE FIX. Keep the namespace and pin the port instead. One rule per node,
+# inserted at the TOP of nat/POSTROUTING so it runs before the CNI masquerade:
+#
+#   -t nat -I POSTROUTING 1 -p udp -s 10.42.0.0/16 --sport 6970 \
+#          -j MASQUERADE --to-ports 6970
+#
+# --to-ports forces the external port to 6970 for every flow, which makes the
+# mapping ENDPOINT-INDEPENDENT: every peer observes the same
+# <node public ip>:6970, matching what advertise_port announces and what the
+# hostPort DNAT accepts inbound. That is a full-cone-like mapping, which is
+# exactly the property hole punching requires.
+#
+# WHY IT IS SAFE. The match is narrow — UDP only, from the pod CIDR only,
+# source port 6970 only. Nothing else on the node matches it. Reply traffic for
+# inbound (hostPort-DNAT'd) sessions is handled by conntrack and never
+# re-consults the nat table, so this rule cannot affect it. Many concurrent
+# peers can share external port 6970 because a NAT tuple is
+# (src, sport, dst, dport) — only the source half is pinned.
+#
+# WHY A DAEMONSET AND NOT A ONE-OFF COMMAND. The rule does not survive a reboot,
+# and CNI restarts reorder POSTROUTING. The loop re-asserts it every 30s and
+# removes it cleanly on shutdown. It runs on EVERY node for the same reason
+# apgo-prepull does: the apgo Deployment's node affinity is a preference, not a
+# requirement, so the pod can land anywhere and the pin has to already be there
+# when it does.
+#
+# IF IT IS NOT WORKING, the pod says so: the readinessProbe re-checks that the
+# rule is actually present, so `kubectl -n apgo get pods` shows natpin NotReady
+# rather than silently leaving you relayed. Check its log first — the most
+# likely cause is the iptables backend, below.
+#
+#   kubectl -n apgo logs ds/apgo-natpin --tail=20
+#
+# STILL REQUIRED, once per ingress node:  sudo ufw allow 6970/udp
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: apgo-natpin
+  namespace: apgo
+spec:
+  selector:
+    matchLabels:
+      app: apgo-natpin
+  template:
+    metadata:
+      labels:
+        app: apgo-natpin
+    spec:
+      # hostNetwork here is correct and is NOT the thing this file warns about:
+      # this container creates no TUN and binds no port. It needs the host's
+      # network namespace only so its iptables writes land in the host's nat
+      # table, which is where the CNI masquerade it must precede also lives.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: apgo-critical
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: natpin
+          # IMAGE MUST SHIP iptables. Built in-house from apgo-natpin.containerfile
+          # (alpine:3.22 + iptables, both backends) and served from localhost:5000 like
+          # the other apgo images. Changed 2026-10-07 from
+          # registry.k8s.io/build-image/debian-iptables:bookworm-v1.0.4 — that
+          # tag never existed upstream, so natpin sat in ImagePullBackOff on
+          # every node and the port pin was absent cluster-wide (everything
+          # to this pod relayed).
+          #
+          # Earlier history: changed from alpine:latest 2026-09-04.
+          #
+          # alpine has no iptables, so this container used to `apk add` it at
+          # startup. That made a DaemonSet which is ITSELF PART OF THE NETWORK
+          # PATH depend on outbound network before it can do its job — a
+          # bootstrap circularity that fails silently per node. On 2026-09-04
+          # zx11t and zx5t sat 0/1 Running for a day:
+          #   [natpin] WARN: apk add iptables failed (no network?)
+          #   [natpin] FATAL: no iptables available. Staying NotReady deliberately.
+          # NAT pinning was silently absent on half the cluster, which degrades
+          # peers on those nodes to RELAY — the exact failure this DaemonSet
+          # exists to prevent, presenting as Running.
+          #
+          # debian-iptables is maintained upstream for exactly this job and
+          # ships BOTH backends, so the nft/legacy detection below still works.
+          # If you re-tag, verify the binaries survive:
+          #   docker run --rm <image> sh -c 'iptables-nft -V; iptables-legacy -V'
+          # A self-built image in the local registry is equally fine and the
+          # apgo-prepull DaemonSet already warms images on every node.
+          image: localhost:5000/apgo-natpin:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            # Must match the cluster's pod CIDR (k3s default is 10.42.0.0/16;
+            # confirm with `kubectl get node <n> -o jsonpath='{.spec.podCIDR}'`).
+            # Too narrow and the rule never matches; too wide and it would pin
+            # unrelated UDP that happened to use source port 6970.
+            - name: POD_CIDR
+              value: "10.42.0.0/16"
+            # MUST equal udp_listen_port / advertise_port / the hostPort.
+            - name: OVERLAY_PORT
+              value: "6970"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+
+              CHAIN="POSTROUTING"
+              RULE="-p udp -s ${POD_CIDR} --sport ${OVERLAY_PORT} -j MASQUERADE --to-ports ${OVERLAY_PORT}"
+
+              # iptables comes FROM THE IMAGE now — nothing is installed at
+              # runtime. This check is a backstop against a bad image tag, not
+              # a recovery path: there is nothing to retry, so fail loudly and
+              # stay NotReady rather than run without the rule.
+              if ! command -v iptables-nft >/dev/null 2>&1; then
+                echo "[natpin] FATAL: no iptables available. Staying NotReady deliberately."
+                while true; do sleep 300 & wait $!; done
+              fi
+
+              # Pick the backend the HOST actually uses. A k3s node running
+              # nft with our rule written into the legacy table gives you a
+              # rule that exists, reads correctly, and never fires — strictly
+              # worse than no rule, because it looks like it worked. Count the
+              # nat rules in each and take the populated one (same heuristic
+              # kube-proxy and calico use).
+              NFT=$(iptables-nft-save -t nat 2>/dev/null | grep -c '^-' || true)
+              LEG=$(iptables-legacy-save -t nat 2>/dev/null | grep -c '^-' || true)
+              NFT=${NFT:-0}; LEG=${LEG:-0}
+              if [ "$NFT" -ge "$LEG" ]; then IPT=iptables-nft; else IPT=iptables-legacy; fi
+              echo "[natpin] node=${NODE_NAME:-?} backend=$IPT (nat rules: nft=$NFT legacy=$LEG)"
+
+              # The readinessProbe runs this, so what the probe checks and what
+              # the loop installs can never drift apart.
+              printf '#!/bin/sh\nexec %s -t nat -C %s %s\n' "$IPT" "$CHAIN" "$RULE" > /tmp/check.sh
+              chmod +x /tmp/check.sh
+
+              cleanup() {
+                echo "[natpin] removing rule on shutdown"
+                $IPT -t nat -D $CHAIN $RULE 2>/dev/null || true
+                exit 0
+              }
+              trap cleanup TERM INT
+
+              while true; do
+                if ! $IPT -t nat -C $CHAIN $RULE 2>/dev/null; then
+                  if $IPT -t nat -I $CHAIN 1 $RULE 2>/dev/null; then
+                    echo "[natpin] installed: -t nat -I $CHAIN 1 $RULE"
+                  else
+                    echo "[natpin] ERROR: could not install rule"
+                  fi
+                fi
+                # Backgrounded so the TERM trap fires immediately on shutdown
+                # instead of waiting out the sleep.
+                sleep 30 & wait $!
+              done
+          readinessProbe:
+            exec:
+              command: ["/tmp/check.sh"]
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 2
+          resources:
+            requests: {cpu: "1m", memory: "16Mi"}
+            limits: {cpu: "100m", memory: "64Mi"}
+
