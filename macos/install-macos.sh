@@ -330,7 +330,7 @@ ensure_go() {
       return
     fi
   done
-  local ver="go1.24.5" arch tgz
+  local ver="go1.26.1" arch tgz
   case "$(uname -m)" in
     arm64)  arch="arm64" ;;
     x86_64) arch="amd64" ;;

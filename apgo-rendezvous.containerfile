@@ -8,7 +8,7 @@
 # block them. It never sees keys or the PSK, so it cannot join or decrypt the
 # overlay — but it CAN see which endpoints announce, so run it authenticated
 # (AUTH_TOKENS / AUTH_USERS) and behind TLS.
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY rendezvous/ ./
 RUN go mod tidy

@@ -1,6 +1,6 @@
 # APGO admin dashboard image. Build from the REPO ROOT as the context:
 #   podman build -f apgo-admin.containerfile -t apgo-admin:latest .
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY admin/ ./
 # Resolve the go-qrcode dependency (writes go.sum) then build.
