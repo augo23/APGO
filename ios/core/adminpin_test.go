@@ -242,3 +242,43 @@ func TestCanonicalSealedBlobVector(t *testing.T) {
 		t.Fatalf("canonicalSealedBlob = %q, want %q", got, want)
 	}
 }
+
+// A malformed pin must fail CLOSED: refuse every seeded key rather than fall
+// back to trust-on-first-use.
+func TestMalformedPinFailsClosed(t *testing.T) {
+	resetAdminState(t)
+	t.Setenv("ADMIN_KEY_FP", "sha256:not-a-real-digest")
+	applyAdminKeyPin("")
+	_, k := newTestAdminKey(t)
+	adoptSeededAdminPub(base64.StdEncoding.EncodeToString(k), "test")
+	if adminKeySet() {
+		t.Fatal("a node with a malformed admin_key_fp adopted a seeded key (fell open into TOFU)")
+	}
+}
+
+// A second Start() in the same process (a network switch) must not inherit the
+// previous network's admin key or the records verified under it.
+func TestResetAdminTrustStateForgetsPreviousNetwork(t *testing.T) {
+	resetAdminState(t)
+	_, k := newTestAdminKey(t)
+	if !setAdminPubBytes(k) {
+		t.Fatal("setup: could not set admin key")
+	}
+	var pub [32]byte
+	pub[0] = 1
+	approvals.mu.Lock()
+	approvals.recs[pub] = storedApproval{}
+	approvals.mu.Unlock()
+
+	resetAdminTrustState()
+
+	if adminKeySet() || adminPub != nil {
+		t.Fatal("previous network's admin key survived the reset")
+	}
+	approvals.mu.Lock()
+	n := len(approvals.recs)
+	approvals.mu.Unlock()
+	if n != 0 {
+		t.Fatal("previous network's approvals survived the reset")
+	}
+}

@@ -40,6 +40,9 @@ func applyRuntimeConfig(cfg *ClientConfig) {
 // injected instead of created, and shutdown driven by the stop channel instead
 // of OS signals.
 func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error {
+	// The process may have run a different network before this one; drop that
+	// network's admin trust before anything here verifies a record (adminreset.go).
+	resetAdminTrustState()
 	applyRuntimeConfig(cfg)
 
 	// An admin-signed network name/PSK rotation (compromise recovery) overrides

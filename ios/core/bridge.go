@@ -145,8 +145,12 @@ func Start(tunFD int, configJSON string) error {
 
 	// loadAdminPublicKey reads ADMIN_PUBLIC_KEY from the environment; set it so
 	// the app-provided admin key is trusted from the first packet.
+	// CLEAR it otherwise: the process can outlive a network switch, and a
+	// previous profile's key left in the environment would be trusted here.
 	if mc.AdminPubKey != "" {
 		_ = os.Setenv("ADMIN_PUBLIC_KEY", mc.AdminPubKey)
+	} else {
+		_ = os.Unsetenv("ADMIN_PUBLIC_KEY")
 	}
 	// Set or CLEAR the pin: the extension process can outlive a network
 	// switch, and a stale pin would refuse the new network's admin key.

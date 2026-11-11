@@ -68,7 +68,11 @@ func loadAdminPublicKey() {
 	if adminPubFile != "" {
 		if data, err := os.ReadFile(adminPubFile); err == nil {
 			if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil && adminPubValid(raw) {
-				if pin := adminKeyPinned(); pin != "" && adminKeyFingerprint(raw) != pin {
+				if pin := adminKeyPinned(); pin == adminKeyPinInvalid {
+					// Refuse it but keep the file: the pin is a typo, and fixing
+					// it should not cost the node its learned key.
+					log.Printf("[revocation] NOT loading previously seeded admin key %s: admin_key_fp is invalid", adminKeyFingerprint(raw))
+				} else if pin != "" && adminKeyFingerprint(raw) != pin {
 					log.Printf("[revocation] DISCARDING previously seeded admin key %s: it does not match the pinned fingerprint %s",
 						adminKeyFingerprint(raw), pin)
 					_ = os.Remove(adminPubFile)

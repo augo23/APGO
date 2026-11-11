@@ -251,3 +251,16 @@ func TestCanonicalSealedBlobVector(t *testing.T) {
 		t.Fatalf("canonicalSealedBlob = %q, want %q", got, want)
 	}
 }
+
+// A malformed pin must fail CLOSED: refuse every seeded key rather than fall
+// back to trust-on-first-use.
+func TestMalformedPinFailsClosed(t *testing.T) {
+	resetAdminState(t)
+	t.Setenv("ADMIN_KEY_FP", "sha256:not-a-real-digest")
+	applyAdminKeyPin("")
+	_, k := newTestAdminKey(t)
+	adoptSeededAdminPub(base64.StdEncoding.EncodeToString(k), "test")
+	if adminKeySet() {
+		t.Fatal("a node with a malformed admin_key_fp adopted a seeded key (fell open into TOFU)")
+	}
+}

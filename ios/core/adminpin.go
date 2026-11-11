@@ -48,6 +48,10 @@ import (
 // adminKeyFPPrefix labels the fingerprint format so it can evolve.
 const adminKeyFPPrefix = "sha256:"
 
+// adminKeyPinInvalid is stored as the pin when the configured one is
+// unparseable. It is not a valid digest, so it matches no key.
+const adminKeyPinInvalid = adminKeyFPPrefix + "invalid-pin"
+
 var (
 	adminPinMu sync.RWMutex
 	adminPin   string // normalized fingerprint, "" = no pin
@@ -110,9 +114,14 @@ func applyAdminKeyPin(fromConfig string) {
 	}
 	n := normalizeAdminKeyFP(v)
 	if n == "" {
-		log.Printf("[adminkey] admin_key_fp / ADMIN_KEY_FP %q is not a valid SHA-256 fingerprint — IGNORED", v)
+		// Fail CLOSED. An operator who set a pin meant "only this key"; a typo
+		// must not silently drop the node back to trust-on-first-use, where
+		// any PSK peer could seed its own key. The sentinel never equals a
+		// real fingerprint, so every seeded or persisted key is refused until
+		// the pin is fixed. (An explicit ADMIN_PUBLIC_KEY still wins.)
+		log.Printf("[adminkey] admin_key_fp / ADMIN_KEY_FP %q is not a valid SHA-256 fingerprint — REFUSING every seeded admin key until it is fixed", v)
 		adminPinMu.Lock()
-		adminPin = ""
+		adminPin = adminKeyPinInvalid
 		adminPinMu.Unlock()
 		return
 	}

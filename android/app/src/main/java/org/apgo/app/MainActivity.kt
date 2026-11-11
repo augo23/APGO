@@ -987,6 +987,22 @@ fun MainScreen(
                             approveTarget?.name?.takeIf { it.isNotBlank() }?.let {
                                 Text(it, style = MaterialTheme.typography.bodySmall)
                             }
+                            // The overlay IP and name above are claimed by the
+                            // peer itself. The approval is signed for its KEY,
+                            // so show the key fingerprint: it's the one value
+                            // the admin can confirm out of band before approving.
+                            approveTarget?.let { t ->
+                                Text("Key fingerprint", style = MaterialTheme.typography.labelSmall)
+                                Text(
+                                    t.keyFp.ifBlank { "unknown — do not approve" },
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                Text(
+                                    "The IP and name are reported by the device itself and can be spoofed. Confirm this fingerprint with the device\u2019s owner before approving.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                             OutlinedTextField(
                                 value = approvePassword,
                                 onValueChange = { approvePassword = it; approveError = null },

@@ -32,6 +32,27 @@ func signSealedBlob(akf *adminKeyFile, seed []byte) {
 	akf.Sig = base64.StdEncoding.EncodeToString(adminSignWithSeed(seed, []byte(canonicalSealedBlob(*akf))))
 }
 
+// sealedBlobSigValid reports whether akf.Sig is a valid signature by the admin
+// key named in the blob itself.
+func sealedBlobSigValid(akf adminKeyFile) bool {
+	if akf.Sig == "" {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(akf.Sig)
+	if err != nil {
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(akf.PublicKey)
+	if err != nil {
+		return false
+	}
+	pk, err := adminSig.UnmarshalBinaryPublicKey(raw)
+	if err != nil {
+		return false
+	}
+	return adminSig.Verify(pk, []byte(canonicalSealedBlob(akf)), sig, nil)
+}
+
 // decryptSeed opens the sealed seed with password. On success, a blob that
 // predates signing is signed and re-distributed so the network upgrades.
 // The caller MUST zero the returned seed after use.

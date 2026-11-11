@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -111,9 +113,31 @@ func networkHasAdminKey() bool {
 // currentAdminKeyFile returns the admin key blob, preferring the local file and
 // falling back to the sealed blob gossiped to our client.
 func currentAdminKeyFile() (adminKeyFile, bool) {
-	if akf, err := loadAdminKeyFile(); err == nil && akf.PublicKey != "" {
-		return akf, true
+	local, lerr := loadAdminKeyFile()
+	haveLocal := lerr == nil && local.PublicKey != ""
+	gossiped, haveGossiped := gossipedAdminKeyFile()
+	if !haveLocal {
+		return gossiped, haveGossiped
 	}
+	// The local file is a COPY, and the password can be changed from any
+	// node. If the network holds a newer blob for the same key, signed by that
+	// key, the password was rotated elsewhere: adopt it, or the OLD password
+	// would keep unlocking the key on this machine.
+	if haveGossiped && gossiped.PublicKey == local.PublicKey &&
+		gossiped.Epoch > local.Epoch && sealedBlobSigValid(gossiped) {
+		if err := saveAdminKeyFile(gossiped); err != nil {
+			log.Printf("[adminkey] could not refresh the local admin key file from the network's newer copy: %v", err)
+		} else {
+			log.Printf("[adminkey] local admin key file was stale (epoch %d < %d); replaced with the network's copy", local.Epoch, gossiped.Epoch)
+		}
+		return gossiped, true
+	}
+	return local, true
+}
+
+// gossipedAdminKeyFile returns the sealed blob our client holds (gossiped by
+// the network), if any.
+func gossipedAdminKeyFile() (adminKeyFile, bool) {
 	code, body, err := ctlGet("/api/admin-key-sealed")
 	if err != nil || code != 200 {
 		return adminKeyFile{}, false
@@ -126,11 +150,20 @@ func currentAdminKeyFile() (adminKeyFile, bool) {
 }
 
 // distributeSealedKey hands the ciphertext blob to our client, which stores it
-// and gossips it to every node.
-func distributeSealedKey(akf adminKeyFile) {
-	if blob, err := json.Marshal(akf); err == nil {
-		_, _, _ = ctlPost("/api/admin-key-sealed", blob)
+// and gossips it to every node. It reports whether the client accepted it.
+func distributeSealedKey(akf adminKeyFile) error {
+	blob, err := json.Marshal(akf)
+	if err != nil {
+		return err
 	}
+	code, body, err := ctlPost("/api/admin-key-sealed", blob)
+	if err != nil {
+		return fmt.Errorf("could not reach the local client: %w", err)
+	}
+	if code != 200 {
+		return fmt.Errorf("the local client refused the new admin key blob (HTTP %d): %s", code, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func loadAdminKeyFile() (adminKeyFile, error) {
@@ -203,10 +236,17 @@ func changeAdminPassword(oldPw, newPw string) error {
 	akf.Epoch = time.Now().UnixNano()
 	signSealedBlob(&akf, seed)
 
+	// Report failure instead of claiming success: if the new blob never
+	// reaches the network (or this machine's own copy), the OLD password
+	// keeps working there, which the operator must know about.
 	if adminKeyConfigured() {
-		_ = saveAdminKeyFile(akf)
+		if err := saveAdminKeyFile(akf); err != nil {
+			return fmt.Errorf("password NOT changed: could not save the admin key file: %w", err)
+		}
 	}
-	distributeSealedKey(akf)
+	if err := distributeSealedKey(akf); err != nil {
+		return fmt.Errorf("the new password is saved on this machine but was NOT distributed, so the old password still works on other nodes — retry: %w", err)
+	}
 	return nil
 }
 
