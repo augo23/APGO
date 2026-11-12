@@ -3,7 +3,7 @@ module overlay-desktop
 go 1.26.0
 
 require (
-	github.com/cloudflare/circl v1.5.0
+	github.com/cloudflare/circl v1.6.3
 	github.com/getlantern/systray v1.2.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	gopkg.in/yaml.v3 v3.0.1
@@ -18,5 +18,5 @@ require (
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
-	golang.org/x/sys v0.10.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
 )

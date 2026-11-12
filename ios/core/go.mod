@@ -5,7 +5,7 @@ module overlay-mobile-ios
 go 1.26.0
 
 require (
-	github.com/cloudflare/circl v1.5.0
+	github.com/cloudflare/circl v1.6.3
 	github.com/flynn/noise v1.1.0
 	github.com/pierrec/lz4/v4 v4.1.26
 	golang.org/x/crypto v0.52.0
