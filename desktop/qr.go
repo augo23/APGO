@@ -89,11 +89,17 @@ func handleQRPage(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, qrAuthForm(""))
 		return
 	}
+	if wait := desktopLoginWait(); wait > 0 {
+		fmt.Fprint(w, qrAuthForm(fmt.Sprintf("Too many attempts. Try again in %d seconds.", int(wait.Seconds())+1)))
+		return
+	}
 	_ = r.ParseForm()
 	if c, ok := loadCreds(); !ok || !c.matches(r.FormValue("username"), r.FormValue("password")) {
+		desktopLoginResult(false)
 		fmt.Fprint(w, qrAuthForm("Incorrect username or password."))
 		return
 	}
+	desktopLoginResult(true)
 
 	payload, jp, err := buildJoinPayload()
 	if err != nil || jp.NetworkName == "" || jp.PSK == "" {

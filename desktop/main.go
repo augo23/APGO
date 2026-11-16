@@ -658,17 +658,21 @@ func lastClientError() string {
 func nodeKeyPath() string     { return filepath.Join(appDir(), "node.key") }
 func adminPubKeyPath() string { return filepath.Join(appDir(), "admin-pubkey") }
 
-// clientBinary locates the overlay-client: $OVERLAY_CLIENT_BIN, then next to
-// this executable (inside the .app bundle), then $PATH.
+// clientBinary is the overlay-client shipped NEXT TO this executable (inside
+// the .app bundle / install folder), and nothing else.
+//
+// It used to honour $OVERLAY_CLIENT_BIN and fall back to $PATH. That binary is
+// copied and run AS ROOT/SYSTEM, while both overrides are controlled by
+// whatever launched this app: a program running as the user could start the
+// app with the variable pointing at its own binary, and the user's approval of
+// the admin prompt would install it as the boot daemon.
 func clientBinary() string {
-	if b := os.Getenv("OVERLAY_CLIENT_BIN"); b != "" {
-		return b
+	exe, err := os.Executable()
+	if err != nil {
+		return clientExeName
 	}
-	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), clientExeName)
-		if _, err := os.Stat(cand); err == nil {
-			return cand
-		}
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
 	}
-	return clientExeName
+	return filepath.Join(filepath.Dir(exe), clientExeName)
 }

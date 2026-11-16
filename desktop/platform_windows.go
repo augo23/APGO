@@ -44,7 +44,7 @@ func doConnect() {
 		return
 	}
 	script := prepareSysDirPS() + writeSysFilePS(connectLauncherPath(), bat) +
-		"Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('\"' + " + psQuote(connectLauncherPath()) + " + '\"') -WindowStyle Hidden\n"
+		"Start-Process -FilePath " + psQuote(system32("cmd.exe")) + " -ArgumentList '/c', ('\"' + " + psQuote(connectLauncherPath()) + " + '\"') -WindowStyle Hidden\n"
 	if bootStartEnabled() {
 		// Migrate a boot task left by an older version (it ran a batch in the
 		// user's profile as SYSTEM) — same prompt, no extra step for the user.
@@ -68,8 +68,8 @@ func doConnect() {
 
 func doDisconnect() {
 	// Killing an elevated process requires elevation, so run taskkill via RunAs.
-	ps := "Start-Process -FilePath 'taskkill' -ArgumentList '/IM','" + clientExeName + "','/F' -Verb RunAs -WindowStyle Hidden"
-	_ = exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+	ps := "Start-Process -FilePath " + psQuote(system32("taskkill.exe")) + " -ArgumentList '/IM','" + clientExeName + "','/F' -Verb RunAs -WindowStyle Hidden"
+	_ = exec.Command(psExe(), "-NoProfile", "-Command", ps).Run()
 	time.Sleep(400 * time.Millisecond)
 	refreshStatus()
 }
@@ -77,7 +77,7 @@ func doDisconnect() {
 func notify(msg string) {
 	ps := fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show(%s,'APGO')", psQuote(msg))
 	// Fire-and-forget so it doesn't block the tray loop.
-	_ = exec.Command("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps).Start()
+	_ = exec.Command(psExe(), "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps).Start()
 }
 
 // promptPassword shows a masked WinForms input box; "" if cancelled. The title
@@ -89,7 +89,7 @@ func promptPassword(title string) string {
 		`$t=New-Object Windows.Forms.TextBox;$t.UseSystemPasswordChar=$true;$t.Top=46;$t.Left=14;$t.Width=366;$f.Controls.Add($t);` +
 		`$b=New-Object Windows.Forms.Button;$b.Text='OK';$b.Top=84;$b.Left=296;$b.Width=84;$b.DialogResult='OK';$f.Controls.Add($b);$f.AcceptButton=$b;` +
 		`if($f.ShowDialog() -eq 'OK'){[Console]::Out.Write($t.Text)}`
-	cmd := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps)
+	cmd := exec.Command(psExe(), "-NoProfile", "-STA", "-Command", ps)
 	cmd.Env = append(os.Environ(), "APGO_PROMPT="+title)
 	out, err := cmd.Output()
 	if err != nil {
@@ -99,7 +99,7 @@ func promptPassword(title string) string {
 }
 
 func openBrowser(url string) {
-	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	_ = exec.Command(system32("rundll32.exe"), "url.dll,FileProtocolHandler", url).Start()
 }
 
 // --- elevated, protected launch -------------------------------------------
@@ -158,10 +158,10 @@ func prepareSysDirPS() string {
 		"if (Test-Path -LiteralPath $d) { $i = Get-Item -LiteralPath $d -Force; " +
 		"if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { $i.Delete() } }\n" +
 		"New-Item -ItemType Directory -Force -Path $bin | Out-Null\n" +
-		"& icacls.exe $d /setowner '*S-1-5-32-544' /T /C /Q | Out-Null\n" +
-		"& icacls.exe $d /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null\n" +
+		"& " + psQuote(system32("icacls.exe")) + " $d /setowner '*S-1-5-32-544' /T /C /Q | Out-Null\n" +
+		"& " + psQuote(system32("icacls.exe")) + " $d /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null\n" +
 		"if ($LASTEXITCODE -ne 0) { throw 'could not secure ' + $d }\n" +
-		"& icacls.exe (Join-Path $d '*') /reset /T /C /Q | Out-Null\n" +
+		"& " + psQuote(system32("icacls.exe")) + " (Join-Path $d '*') /reset /T /C /Q | Out-Null\n" +
 		"$src = " + psQuote(src) + "\n" +
 		"foreach ($f in @(" + psQuote(clientExeName) + ", 'wintun.dll')) {\n" +
 		"  $s = Join-Path $src $f\n" +
@@ -188,10 +188,10 @@ func runElevatedPS(script string) error {
 		raw = append(raw, byte(r), byte(r>>8))
 	}
 	enc := base64.StdEncoding.EncodeToString(raw)
-	outer := "$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru " +
+	outer := "$p = Start-Process -FilePath " + psQuote(psExe()) + " -Verb RunAs -WindowStyle Hidden -Wait -PassThru " +
 		"-ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','" + enc + "'; " +
 		"exit $p.ExitCode"
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", outer)
+	cmd := exec.Command(psExe(), "-NoProfile", "-NonInteractive", "-Command", outer)
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

@@ -149,7 +149,7 @@ func runSetupServerAndWait(sock string) {
 		}
 	}()
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute, IdleTimeout: 2 * time.Minute}
 	log.Printf("[setup] node not configured — open the admin dashboard to set the network name + PSK (waiting)…")
 	_ = srv.Serve(ln)
 }

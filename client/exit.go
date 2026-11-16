@@ -70,6 +70,7 @@ type exitInfo struct {
 
 func initExit(cfg *ClientConfig) {
 	amExit = cfg.ExitNode
+	exitWanted.Store(cfg.ExitNode)
 	exitAllowLAN = cfg.ExitAllowLAN
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("EXIT_ALLOW_LAN"))); v != "" {
 		exitAllowLAN = v == "1" || v == "true" || v == "yes" || v == "on"
@@ -91,6 +92,7 @@ func initExit(cfg *ClientConfig) {
 			amExit = false
 			exitNATErr = err.Error()
 			log.Printf("[exit] exit-node mode DISABLED — could not enable internet forwarding (NAT): %v", err)
+			startExitNATRetry()
 		} else {
 			log.Printf("[exit] exit-node mode ON — forwarding internet traffic for overlay clients")
 			if exitAllowLAN {
@@ -462,4 +464,49 @@ func exitForwardAllowed(dst string) bool {
 	var a [4]byte
 	copy(a[:], v4)
 	return pxIsPublicIPv4(a)
+}
+
+// exitWanted is whether this node SHOULD be an exit (local config, or the
+// admin's node config). amExit is whether it actually IS one, which needs the
+// NAT in place.
+var (
+	exitWanted     atomic.Bool
+	exitRetryMu    sync.Mutex
+	exitRetrying   bool
+	exitRetryEvery = 15 * time.Second
+)
+
+// startExitNATRetry keeps retrying the NAT setup while exit mode is wanted but
+// not active. The usual cause is starting before the network is up (at boot or
+// after wake, "network is unreachable"); without a retry the node stayed a
+// non-exit until the next restart.
+func startExitNATRetry() {
+	exitRetryMu.Lock()
+	if exitRetrying {
+		exitRetryMu.Unlock()
+		return
+	}
+	exitRetrying = true
+	exitRetryMu.Unlock()
+	go func() {
+		defer func() {
+			exitRetryMu.Lock()
+			exitRetrying = false
+			exitRetryMu.Unlock()
+		}()
+		for exitWanted.Load() && !amExit {
+			time.Sleep(exitRetryEvery)
+			if !exitWanted.Load() || amExit {
+				return
+			}
+			if err := setupExitNAT(); err != nil {
+				exitNATErr = err.Error()
+				continue
+			}
+			amExit = true
+			exitNATErr = ""
+			log.Printf("[exit] exit-node mode ON — internet forwarding enabled after retry")
+			return
+		}
+	}()
 }

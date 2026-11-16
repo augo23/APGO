@@ -137,7 +137,7 @@ func loginStartEnabled() bool {
 func setLoginStart(enable bool) error {
 	p := launchAgentPath()
 	if !enable {
-		_ = exec.Command("launchctl", "unload", p).Run()
+		_ = exec.Command("/bin/launchctl", "unload", p).Run()
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -166,6 +166,6 @@ func setLoginStart(enable bool) error {
 		return err
 	}
 	// Best-effort load so it's registered without requiring a re-login.
-	_ = exec.Command("launchctl", "load", p).Run()
+	_ = exec.Command("/bin/launchctl", "load", p).Run()
 	return nil
 }

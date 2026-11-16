@@ -62,6 +62,8 @@
   .dot{display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:7px; vertical-align:middle}
   .dot.relay{background:transparent;border:2px solid #e6b400;width:6px;height:6px}
   .relay-badge{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#e6b400;border:1px solid #e6b400;border-radius:6px;padding:1px 5px;margin-left:6px;opacity:.85}
+  .relay-retry{cursor:pointer;font:inherit;font-size:10px;border:1px solid currentColor;background:transparent;color:inherit;border-radius:4px;padding:0 4px}
+  .relay-retry:disabled{opacity:.6;cursor:wait}
 
   /* Traffic columns + the node detail sheet. */
   th.num, td.num{text-align:right; white-space:nowrap}
@@ -1027,7 +1029,7 @@ async function loadSessions(){
     <tr class="rowsel${nodeSel===s.remote?' active':''}" data-remote="${esc(s.remote)}">
       <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Internal exit node — devices on this network can route their internet through it">E</span>':''}${v6Badge(s, relayed)}${s.exit_failed?' <span class="exit-fail" title="This device has internal exit node enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active" title="This device\'s internet traffic currently egresses through this exit node">&#127760; exit</span>':''}</td>
       <td>${esc(s.name||"—")}</td>
-      <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge" title="Reachable through this node&#39;s relay - no direct session yet">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
+      <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <button type="button" class="relay-badge relay-retry" data-ip="${esc(s.overlay_ip||"")}" title="Relayed - no direct session yet. Click to retry a direct connection now.">relayed &#8635;</button>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
       <td style="text-align:center" title="Post-quantum encryption — change it in this node's Settings"><input type="checkbox" class="pqview" ${s.post_quantum?'checked':''} disabled tabindex="-1" aria-label="Post-quantum encryption"></td>
       <td class="num">${fmtRate(tr_.rx_bytes_per_sec, tr_.sampled)}</td>
@@ -1394,7 +1396,7 @@ function renderNodeModal(){
   set("nodeTitle", esc(s.name || s.overlay_ip || "Node"));
   set("nodeWho", esc(s.overlay_ip || s.remote || "") + (s.name ? " &middot; " + esc(s.name) : ""));
   set("nodeIp", esc(s.overlay_ip || "unknown") + (s.ip_derived ? ' <span class="tdim">(derived, not confirmed)</span>' : ''));
-  set("nodeEp", relayed ? 'via ' + esc(s.via || "mesh") + ' <span class="relay-badge">relayed</span>' : esc(s.remote || "—"));
+  set("nodeEp", relayed ? 'via ' + esc(s.via || "mesh") + ' <button type="button" class="relay-badge relay-retry" data-ip="' + esc(s.overlay_ip || "") + '" title="Click to retry a direct connection now">relayed &#8635;</button>' : esc(s.remote || "—"));
   set("nodeKey", '<span class="pill">' + esc(s.key_fp || "—") + '</span>');
   set("nodePath", esc(s.path || "unknown"));
   set("nodeState", s.approved === false
@@ -1621,7 +1623,7 @@ async function loadNetSessions(id){
       </td>
       <td class="mono"><span class="dot${relayed?' relay':''}"></span>${esc(s.overlay_ip||"unknown")}${pending?' <span class="pending">pending</span>':''}${s.exit?' <span class="exit-avail" title="Internal exit node on this network">E</span>':''}${s.exit_failed?' <span class="exit-fail" title="This device has internal exit node enabled but its NAT setup FAILED — open that device\'s dashboard or log for the exact error">E&#10007;</span>':''}${s.active_exit?' <span class="exit-active">&#127760; exit</span>':''}</td>
       <td>${esc(s.name||"—")}</td>
-      <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <span class="relay-badge">relayed</span>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
+      <td class="mono">${relayed?`via ${esc(s.via||"mesh")} <button type="button" class="relay-badge relay-retry" data-ip="${esc(s.overlay_ip||"")}" title="Click to retry a direct connection now">relayed &#8635;</button>`:(isOverlayAddr(s.remote)?`<span title="Reached THROUGH the mesh: this is the overlay address of the node that forwards to this peer (e.g. a Kubernetes pod published on that node&#39;s hostPort). The session is real and direct - the endpoint simply belongs to the forwarding node, not to the peer itself.">${esc(s.remote)} <span class="via-mesh">via mesh</span></span>`:esc(s.remote))}</td>
       <td><span class="pill">${esc(s.key_fp||"—")}</span></td>
       <td>${relayed?'—':rel(s.since_unix)}</td>
       <td>${rel(s.last_seen_unix)}</td>
@@ -2176,6 +2178,22 @@ document.getElementById("nodeSettings").addEventListener("click", ()=>{
   closeNodeModal();
   openCfgModal(s.pubkey, (s.overlay_ip || s.remote || "node") + (s.name ? " · " + s.name : ""));
 });
+
+// "relayed" badge: ask the local client to retry a direct connection now.
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest && ev.target.closest(".relay-retry");
+  if (!b) return;
+  ev.stopPropagation(); ev.preventDefault();
+  if (!b.dataset.ip || b.disabled) return;
+  b.disabled = true; const was = b.innerHTML; b.textContent = "retrying\u2026";
+  try {
+    const r = await fetch("/api/retry-direct", {method:"POST", headers:{...XRW,"Content-Type":"application/json"},
+      body: JSON.stringify({overlay_ip: b.dataset.ip})});
+    b.textContent = r.ok ? "retry sent" : "retry failed";
+    if (!r.ok) b.title = await r.text();
+  } catch (e) { b.textContent = "retry failed"; }
+  setTimeout(() => { b.disabled = false; b.innerHTML = was; }, 4000);
+}, true);
 </script>
 </body>
 </html>

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -33,9 +34,15 @@ func rendezvousAnnounce(server string, infoHash []byte, peerID, endpoint string)
 		"endpoint": endpoint,
 		"peer_id":  peerID,
 	})
+	req, err := http.NewRequest(http.MethodPost,
+		strings.TrimRight(server, "/")+"/api/rendezvous", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyRendezvousAuth(req)
 	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Post(strings.TrimRight(server, "/")+"/api/rendezvous",
-		"application/json", bytes.NewReader(reqBody))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -75,4 +82,32 @@ func announceRendezvous(servers []string, infoHash []byte, peerID, endpoint stri
 			go connectToPeer(p, kp, psk)
 		}
 	}
+}
+
+// gRendezvousCred is the rendezvous credential from Settings ("" = none).
+var gRendezvousCred string
+
+// applyRendezvousAuth adds the credential: "user:password" as HTTP Basic,
+// anything else as a bearer token. Same rule as the desktop client.
+//
+// Never over plain http to a public address: a phone on café Wi-Fi would hand
+// the password to anyone on the path. Plain http is allowed only to loopback,
+// private (LAN) and overlay addresses.
+func applyRendezvousAuth(req *http.Request) {
+	cred := strings.TrimSpace(gRendezvousCred)
+	if cred == "" {
+		return
+	}
+	if req.URL.Scheme != "https" {
+		ip := net.ParseIP(req.URL.Hostname())
+		if ip == nil || !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
+			log.Printf("[rendezvous] NOT sending the credential to %s over plain http — use an https:// URL", req.URL.Host)
+			return
+		}
+	}
+	if user, pass, isBasic := strings.Cut(cred, ":"); isBasic {
+		req.SetBasicAuth(user, pass)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
 }

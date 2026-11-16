@@ -71,7 +71,7 @@ func serveSettingsForm(initial mConfig) {
 		fmt.Fprint(w, settingsPage(initial))
 	})
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute, IdleTimeout: 2 * time.Minute}
 	go func() { _ = srv.Serve(ln) }()
 
 	url := fmt.Sprintf("http://%s/?t=%s", ln.Addr().String(), token)

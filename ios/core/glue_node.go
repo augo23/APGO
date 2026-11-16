@@ -40,8 +40,13 @@ func pxInternalExitReady() bool {
 
 var pxOnActive = func() {}
 
-// The mobile core carries no DHT; trackers are its public directory.
-func pxDiscoverDHT() []string { return nil }
+// The DHT is optional on phones (Settings); trackers stay the main directory.
+func pxDiscoverDHT() []string {
+	if gDHT == nil || !gDHT.enabled.Load() {
+		return nil
+	}
+	return gDHT.lookupPeers(pxDirectoryKey(), 0)
+}
 
 // handlePubExitPacket is the demux entry for PktPubExit datagrams: only the
 // client half exists here.

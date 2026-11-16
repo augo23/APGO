@@ -190,13 +190,14 @@ func buildRosterFrame() []byte {
 // authenticated, encrypted session from a network member — the same trust
 // level as PEX. Bounded and validated; an empty name/fp never overwrites a
 // known one (peers that haven't resolved a name yet shouldn't blank ours).
-func handleRoster(payload []byte) {
+func handleRoster(payload []byte, sender [32]byte) {
 	var entries []rosterEntry
 	if json.Unmarshal(payload, &entries) != nil {
 		return
 	}
 	now := time.Now()
 	sawNew := false
+	senderPK := base64.StdEncoding.EncodeToString(sender[:])
 	rosterMu.Lock()
 	for i, e := range entries {
 		if i >= rosterMaxEntries {
@@ -242,10 +243,17 @@ func handleRoster(payload []byte) {
 			// different rosters arrived. Entries expire on rosterTTL, so a
 			// capability that genuinely goes away still clears within a
 			// couple of minutes.
-			e.PQ = e.PQ || cur.PQ
-			e.Exit = e.Exit || cur.Exit
-			e.ExitErr = e.ExitErr || cur.ExitErr
-			e.V6 = e.V6 || cur.V6
+			//
+			// EXCEPT the node's own entry, which is the truth: take its flags
+			// as sent. Otherwise a flag that turned off (an exit whose NAT
+			// failed at boot and later succeeded) stayed on forever, because
+			// neighbours keep relaying the stale `true` and refreshing it.
+			if e.PK == "" || e.PK != senderPK {
+				e.PQ = e.PQ || cur.PQ
+				e.Exit = e.Exit || cur.Exit
+				e.ExitErr = e.ExitErr || cur.ExitErr
+				e.V6 = e.V6 || cur.V6
+			}
 		} else {
 			sawNew = true
 		}

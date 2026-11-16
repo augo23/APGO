@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Applies to the app's Java/Kotlin networking only (Play Billing, links).
+     The Go overlay core opens its own sockets and is not affected.
+     No cleartext, and only the system's certificate authorities: a CA the
+     user (or an MDM profile, or malware) installs is NOT trusted. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

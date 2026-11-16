@@ -41,7 +41,13 @@ struct OverlayConfig: Codable, Equatable {
     /// must read as "off", not as some other level.
     var logLevel: Int? = nil
     var stunServers: [String] = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
-    var rendezvousServers: [String] = []  // HTTPS discovery servers (from a join QR)
+    var rendezvousServers: [String] = []  // HTTPS discovery servers (join QR or Settings)
+    // Credential for rendezvous servers that require one: "user:password"
+    // (HTTP Basic) or a bearer token. Optional so older saved configs decode.
+    var rendezvousAuth: String? = nil
+    // Discover peers through the public BitTorrent DHT as well as trackers and
+    // rendezvous. Optional so older saved configs decode; nil = off.
+    var dht: Bool? = nil
     var mtu: Int = 1280
 
     /// The core's curated default trackers (keep in sync with
@@ -255,6 +261,8 @@ struct OverlayConfig: Codable, Equatable {
             "manage_trackers": trackersEdited ?? false,
             "stun_servers": stunServers,
             "rendezvous_servers": rendezvousServers,
+            "rendezvous_auth": (rendezvousAuth ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+            "dht": dht ?? false,
             "tun": ["mtu": mtu]
         ]
         if let fp = adminKeyFP?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {

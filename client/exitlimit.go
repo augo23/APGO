@@ -123,6 +123,7 @@ func exitLimitStatus() map[string]any {
 // client that selects it -- the same trap initExit guards against. So amExit is
 // only set once the NAT is actually in place.
 func setExitNodeEnabled(on bool) error {
+	exitWanted.Store(on)
 	if on == amExit {
 		return nil
 	}
@@ -147,6 +148,7 @@ func setExitNodeEnabled(on bool) error {
 	if err := setupExitNAT(); err != nil {
 		amExit = false
 		exitNATErr = err.Error()
+		startExitNATRetry()
 		return err
 	}
 	amExit = true

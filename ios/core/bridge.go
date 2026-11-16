@@ -35,23 +35,30 @@ type mobileConfig struct {
 	OverlayCIDR       string   `json:"overlay_cidr"`  // e.g. 10.22.55.0/24
 	Trackers          []string `json:"trackers"`
 	RendezvousServers []string `json:"rendezvous_servers"`
-	STUNServers       []string `json:"stun_servers"`
-	AdminPubKey       string   `json:"admin_public_key"`
+	// RendezvousAuth is the credential the rendezvous servers require, either
+	// "user:password" (HTTP Basic) or a bearer token. Empty = none.
+	RendezvousAuth string `json:"rendezvous_auth"`
+	// DHT turns on discovery through the public BitTorrent DHT, in addition to
+	// trackers and rendezvous. Pointer so an absent field keeps it OFF, the
+	// same default as the desktop client.
+	DHT         *bool    `json:"dht"`
+	STUNServers []string `json:"stun_servers"`
+	AdminPubKey string   `json:"admin_public_key"`
 	// AdminKeyFP pins the network admin key ("sha256:..."), carried in the
 	// join QR. With it, a peer can't seed a different admin key (adminpin.go).
 	AdminKeyFP string `json:"admin_key_fp"`
-	KeyPath           string   `json:"key_path"`  // writable path for the node key
-	UseExit           bool     `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
-	ExitPeer          string   `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest; "public" = public exits only
+	KeyPath    string `json:"key_path"`  // writable path for the node key
+	UseExit    bool   `json:"use_exit"`  // route ALL traffic via an exit (full VPN)
+	ExitPeer   string `json:"exit_peer"` // pin ONE exit (overlay IP / name / key); "" = fastest; "public" = public exits only
 	// UsePublicExits: fall back to public exit nodes (other APGO users
 	// sharing their connection) when no exit on this network is reachable.
 	UsePublicExits bool `json:"use_public_exits"`
 	// UseRelays: reach peers through a public relay when no direct path can be
 	// punched (symmetric NAT / CGNAT). Pointer so an ABSENT field keeps the
 	// default ON — an older app build must not silently turn relaying off.
-	UseRelays *bool `json:"use_public_relays"`
-	UDPPort           int      `json:"udp_listen_port"`
-	Cipher            string   `json:"cipher"`
+	UseRelays *bool  `json:"use_public_relays"`
+	UDPPort   int    `json:"udp_listen_port"`
+	Cipher    string `json:"cipher"`
 	// KeepaliveSeconds tunes the NAT keepalive (0 = default 10s).
 	KeepaliveSeconds int `json:"keepalive_seconds"`
 	// Quantum-safe settings are pointers so an ABSENT field defaults to ON —
@@ -170,6 +177,9 @@ func Start(tunFD int, configJSON string) error {
 		_ = os.Setenv("NETCONFIG_FILE", filepath.Join(dir, "netconfig.json"))
 		_ = os.Setenv("TRACKERS_FILE", filepath.Join(dir, "trackers.txt"))
 		_ = os.Setenv("POLICY_FILE", filepath.Join(dir, "policy.json"))
+		// The DHT keeps its routing table here so a reconnect rejoins the
+		// swarm at once instead of re-bootstrapping from the public routers.
+		_ = os.Setenv("DHT_STATE_FILE", filepath.Join(dir, "dht.dat"))
 	}
 
 	// User-managed tracker list (the app's Settings editor): persist it to the
@@ -384,6 +394,8 @@ func toClientConfig(mc mobileConfig) *ClientConfig {
 		STUNServers:       mc.STUNServers,
 		Trackers:          mc.Trackers,
 		RendezvousServers: mc.RendezvousServers,
+		RendezvousAuth:    strings.TrimSpace(mc.RendezvousAuth),
+		DHT:               mc.DHT != nil && *mc.DHT,
 		Cipher:            mc.Cipher,
 		KeepaliveSeconds:  mc.KeepaliveSeconds,
 		// Quantum-safe by default: absent flags mean ON.

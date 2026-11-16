@@ -1147,6 +1147,40 @@ func startControlServer(socketPath string) {
 
 	mux := http.NewServeMux()
 
+	// Retry a DIRECT connection to a relayed peer now, instead of waiting for
+	// the next periodic attempt (the admin panel's "relayed" badge calls this).
+	mux.HandleFunc("/api/retry-direct", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			OverlayIP string `json:"overlay_ip"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		ip := net.ParseIP(strings.TrimSpace(req.OverlayIP)).To4()
+		if ip == nil || overlayNet == nil || !overlayNet.Contains(ip) || ip.String() == myOverlayIP() {
+			http.Error(w, "overlay_ip must be another node's overlay address", http.StatusBadRequest)
+			return
+		}
+		cands := myConnectCandidates()
+		if cands == "" || myOverlayIP() == "" {
+			http.Error(w, "this node has no connect candidates yet", http.StatusServiceUnavailable)
+			return
+		}
+		dst := ip.String()
+		connectAttemptMu.Lock()
+		delete(connectAttempt, dst) // bypass the 15s throttle for this one
+		connectAttemptMu.Unlock()
+		shouldTryConnect(dst) // re-arm the throttle so a click burst sends one
+		sendControlToward(dst, buildConnectFrame('C', dst, myOverlayIP(), cands))
+		log.Printf("[connect] direct-connection retry to %s requested from the admin panel", dst)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"overlay_ip":      myOverlayIP(),

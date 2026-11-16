@@ -16,13 +16,18 @@ package main
 // wintun.dll live there; nothing privileged executes from a user-writable path.
 
 import (
-	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/windows"
 )
 
+// sysDir asks Windows for the real ProgramData folder. It must NOT read the
+// %ProgramData% environment variable: whatever launched this app controls
+// that, so a program running as the user could point it at a folder it can
+// write, and the elevated install would put the SYSTEM client there.
 func sysDir() string {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
+	pd, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
+	if err != nil || pd == "" {
 		pd = `C:\ProgramData`
 	}
 	return filepath.Join(pd, "APGO")
@@ -39,3 +44,18 @@ func bootLauncherPath() string    { return filepath.Join(sysDir(), "boot-launch.
 // and the client does not chown/chmod it there (secureControlSocket is a
 // no-op on Windows), so the socket path is never used to act on another file.
 func controlSocket() string { return filepath.Join(appDir(), "control.sock") }
+
+// system32 is the full path of a Windows system tool. Commands are never run
+// by bare name: PATH (and %SystemRoot%) come from whatever launched this app,
+// so a program running as the user could put its own "powershell.exe" first
+// in PATH, and the UAC prompt the user approves would elevate that instead.
+func system32(name string) string {
+	d, err := windows.GetSystemDirectory()
+	if err != nil || d == "" {
+		d = `C:\Windows\System32`
+	}
+	return filepath.Join(d, name)
+}
+
+// psExe is Windows PowerShell's full path.
+func psExe() string { return system32(`WindowsPowerShell\v1.0\powershell.exe`) }

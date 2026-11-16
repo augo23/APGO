@@ -399,7 +399,7 @@ The only residual is a brief (~1 RTT) window at session start where *data* is cl
 
 The overlay's security rests on two secrets and a handful of operational rules. Read this section before exposing anything real over the network.
 
-**1. Generate your own PSK — never ship the example one.** The PSK in `config/client.yaml` / `client/config.yaml.example` is a public example value. Anyone who has read this repo knows it. Replace it (`openssl rand -base64 32`) before first deployment. The PSK is mixed into the Noise prologue, so a peer without it cannot complete a handshake — but only if it's actually secret.
+**1. Generate your own PSK — never ship the example one.** `client/config.yaml.example` ships an invalid placeholder so a copied config won't start until you do; never reuse a PSK from any file in this repo or its history, because anyone who has read it knows it. Replace it (`openssl rand -base64 32`) before first deployment. The PSK is mixed into the Noise prologue, so a peer without it cannot complete a handshake — but only if it's actually secret.
 
 **2. Use a unique, unguessable `network_name`.** The tracker rendezvous point is `SHA1(network_name)`. A guessable name lets strangers *find* your nodes (the PSK still stops them from *joining*, and the tracker never sees traffic contents — but why advertise?). Include a random suffix, e.g. `myteam-overlay-$(openssl rand -hex 4)`.
 

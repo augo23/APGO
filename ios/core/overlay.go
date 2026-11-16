@@ -74,6 +74,8 @@ type ClientConfig struct {
 	Trackers                   []string  `yaml:"trackers"`
 	TrackerListFile            string    `yaml:"tracker_list_file"`
 	RendezvousServers          []string  `yaml:"rendezvous_servers"`
+	RendezvousAuth             string    `yaml:"rendezvous_auth"`
+	DHT                        bool      `yaml:"dht"`
 	ControllerURL              string    `yaml:"controller_url"`
 	MinAnnounceIntervalSeconds int       `yaml:"min_announce_interval_seconds"`
 	Compression                bool      `yaml:"compression"`
@@ -92,9 +94,9 @@ type ClientConfig struct {
 	// packets that aggressive firewalls may flag). Toggle per node with the
 	// PORT_PREDICTION environment variable. Only takes effect behind a
 	// symmetric NAT; port-stable NATs ignore it.
-	PortPrediction  bool `yaml:"port_prediction"`
-	TrackEncryption bool `yaml:"track_encryption"`
-	StaticPeers                []string  `yaml:"static_peers"`
+	PortPrediction  bool     `yaml:"port_prediction"`
+	TrackEncryption bool     `yaml:"track_encryption"`
+	StaticPeers     []string `yaml:"static_peers"`
 	// TrackerMode controls how this node participates in the tracker swarm.
 	//   "bootstrap" (default) — announces with the real UDP port so other
 	//                           nodes can discover this peer.
@@ -231,7 +233,6 @@ func sendControlToward(overlayIP string, frame []byte) {
 	}
 }
 
-
 // --- duplicate connect-signaling suppression -------------------------------
 //
 // sendControlToward BROADCASTS a connect frame to every established peer, and
@@ -239,7 +240,7 @@ func sendControlToward(overlayIP string, frame []byte) {
 // target therefore receives one copy per relay — routinely eight or more on a
 // modest mesh — and, before this, ran the FULL punch for each copy:
 //
-//   13:08:02 punch-ack from 10.22.22.117 (candidates: ...); punching   x8
+//	13:08:02 punch-ack from 10.22.22.117 (candidates: ...); punching   x8
 //
 // Eight duplicates times ten candidates is eighty handshake goroutines for a
 // single logical event, every fifteen seconds, per peer. It also poisons the
@@ -1066,7 +1067,6 @@ func punchCandidates(peerOverlayIP, candidateList string, kp keypair, psk []byte
 	}
 }
 
-
 // NOTE ON A FILTER THAT USED TO BE HERE
 //
 // This function once dropped any private candidate that was not on one of our
@@ -1090,7 +1090,6 @@ func punchCandidates(peerOverlayIP, candidateList string, kp keypair, psk []byte
 // bounded per tier, and duplicate connect frames are deduplicated in
 // shouldHandleConnect, so the noise this was meant to solve is solved where it
 // actually originated. Do not reintroduce a reachability heuristic here.
-
 
 // isPunchableAddr validates a punch candidate: well-formed host:port, not
 // loopback/unspecified/multicast — private LAN addresses allowed.
@@ -2733,4 +2732,3 @@ func subnetBroadcastAddrs() []net.IP {
 	}
 	return out
 }
-

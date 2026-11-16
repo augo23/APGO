@@ -295,6 +295,9 @@ data class UiConfig(
     // (symmetric NAT / CGNAT). On by default, like the core.
     val usePublicRelays: Boolean = true,
     val adminKeyFp: String = "",       // admin key pin from the join QR; "" = unpinned
+    // Discover peers through the public BitTorrent DHT too. Off by default,
+    // like the desktop client.
+    val dht: Boolean = false,
 ) {
     private fun prefix(): String {
         val net = overlayCidr.substringBefore('/')
@@ -328,6 +331,7 @@ data class UiConfig(
             put("key_path", keyPath)
             put("rendezvous_servers", JSONArray(rendezvousServers))
             put("rendezvous_auth", rendezvousAuth.trim())
+            put("dht", dht)
             if (adminKeyFp.isNotBlank()) put("admin_key_fp", adminKeyFp.trim())
             if (trackers.isNotEmpty()) put("trackers", JSONArray(trackers))
             // User-edited list is AUTHORITATIVE (persisted to the managed
@@ -395,10 +399,11 @@ class AppState {
     var usePublicExits by mutableStateOf(false)
     var usePublicRelays by mutableStateOf(true)
     var adminKeyFp by mutableStateOf("")
+    var dht by mutableStateOf(false)
 
     fun toUiConfig() = UiConfig(network, psk, friendly, cidr, octet, useExit, exitPeer,
         rendezvous, rendezvousAuth, postQuantum, pqAuth, ipv6, cipher, trackers, trackersEdited,
-        usePublicExits, usePublicRelays, adminKeyFp)
+        usePublicExits, usePublicRelays, adminKeyFp, dht)
 
     companion object {
         // The core's curated default trackers (keep in sync with
@@ -433,6 +438,7 @@ class AppState {
         put("trackers", JSONArray(trackers))
         put("trackersEdited", trackersEdited)
         put("adminKeyFp", adminKeyFp)
+        put("dht", dht)
     }
 
     /// Load a network profile into this state (missing keys = defaults).
@@ -457,6 +463,7 @@ class AppState {
             (0 until a.length()).map { a.getString(it) } } ?: emptyList()
         trackersEdited = o.optBoolean("trackersEdited", false)
         adminKeyFp = o.optString("adminKeyFp")
+        dht = o.optBoolean("dht", false)
     }
 }
 
@@ -753,7 +760,7 @@ fun MainScreen(
                     }
                 })
             }
-            Text("The relay carries ciphertext only — it holds no key. Off means peers with no direct path are unreachable. This app has no DHT switch: it finds peers, relays and public exits through trackers, rendezvous servers and peer exchange (the DHT runs on servers and desktops).",
+            Text("The relay carries ciphertext only — it holds no key. Off means peers with no direct path are unreachable.",
                 style = MaterialTheme.typography.bodySmall)
             // Full VPN captures ALL traffic, so until an exit is selected the
             // internet is deliberately paused (fail-closed, no leaks). Show the
@@ -1218,6 +1225,17 @@ fun SettingsScreen(
                 val u = rvUser.trim(); val p = rvPass.trim()
                 state.rendezvousAuth = if (p.isEmpty()) u else "$u:$p"
             }
+            HorizontalDivider()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("DHT")
+                    Text("Also find peers through the public BitTorrent DHT",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                Switch(checked = state.dht, onCheckedChange = { state.dht = it })
+            }
+            Text("Helps when trackers are blocked or slow; uses a little more data and battery. Reconnect to apply.",
+                style = MaterialTheme.typography.bodySmall)
             HorizontalDivider()
             Text("Rendezvous servers", style = MaterialTheme.typography.titleSmall)
             OutlinedTextField(

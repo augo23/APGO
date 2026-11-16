@@ -229,15 +229,18 @@ Endpoints: `/api/rendezvous` (announce + fetch), `/api/auth-check`, `/healthz`.
 ## 4. Desktop app (macOS / Windows)
 
 The tray/menu-bar app supervises a bundled `overlay-client` and serves the same
-dashboard locally. It has no command-line interface; it reads one variable:
+dashboard locally. It has no command-line interface and takes no settings
+from environment variables. It always runs the `overlay-client` installed next to it (inside
+`APGO.app/Contents/MacOS`, or the Windows install folder); there is no
+override, because that binary is installed to run as root/SYSTEM.
 
-| Variable | Meaning |
-|---|---|
-| `OVERLAY_CLIENT_BIN` | Path to the client binary to supervise, instead of the bundled one. |
-
-Everything lives in `~/.apgo` (`%USERPROFILE%\.apgo` on Windows): `node.key`,
-`client.yaml`, `control.sock`, `provisions.json`, `revocations.json`,
-`approvals.json`, `admin-key-sealed.json`, `overlay-client.log`.
+Settings and state live in `~/.apgo` (`%USERPROFILE%\.apgo` on Windows):
+`node.key`, `client.yaml`, `provisions.json`, `revocations.json`,
+`approvals.json`, `admin-key-sealed.json`. What the privileged client owns
+lives where only root/SYSTEM can modify it: on macOS
+`/Library/Application Support/APGO` (`control.sock`, `overlay-client.log`, the
+installed client), on Windows `%ProgramData%\APGO` (`overlay-client.log`, the
+installed client; `control.sock` stays in `.apgo`).
 
 **`node.key` is the machine's identity on the overlay.** Copy it before wiping a
 machine; without it, a reinstall rejoins as a new device.

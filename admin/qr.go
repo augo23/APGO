@@ -98,11 +98,20 @@ func handleQR(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, qrAuthForm(""))
 		return
 	}
+	// Same per-IP backoff as /login: this form checks the same password, so
+	// without it a stolen session could guess the password here unthrottled.
+	ip := clientIP(r)
+	if ok, wait := loginAllowed(ip); !ok {
+		fmt.Fprint(w, qrAuthForm(fmt.Sprintf("Too many attempts. Try again in %d seconds.", int(wait.Seconds())+1)))
+		return
+	}
 	_ = r.ParseForm()
 	if !checkLogin(r.FormValue("username"), r.FormValue("password")) {
+		loginFailed(ip)
 		fmt.Fprint(w, qrAuthForm("Incorrect username or password."))
 		return
 	}
+	loginSucceeded(ip)
 
 	payload, jp, err := buildJoinPayload()
 	if err != nil || jp.NetworkName == "" || jp.PSK == "" {

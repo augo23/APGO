@@ -60,6 +60,13 @@ android {
     }
 }
 
+// Pin every resolved dependency version in gradle.lockfile so builds are
+// reproducible and a dependency can't silently change underneath a release.
+// After changing dependencies: ./gradlew :app:dependencies --write-locks
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 dependencies {
     // The gomobile-built overlay core (app/libs/overlaymobile.aar), resolved via
     // the flatDir repo declared in settings.gradle.kts.

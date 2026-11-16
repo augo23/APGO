@@ -39,6 +39,11 @@ struct SettingsView: View {
     @State private var trackersText = ""
     @State private var trackersLoadedText = ""
 
+    // Rendezvous editor: one server URL per line, committed on Done/dismiss.
+    @State private var rendezvousText = ""
+    @State private var rendezvousUser = ""
+    @State private var rendezvousPass = ""
+
     var body: some View {
         NavigationStack {
             Form {
@@ -100,6 +105,26 @@ struct SettingsView: View {
                 Section("Transport") {
                     Toggle("IPv6 dual-stack", isOn: $config.ipv6)
                     Text("Connects directly over IPv6 where available (no NAT) — fixes hotspot/CGNAT reachability. The overlay stays IPv4. Reconnect to apply.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+
+                Section("Discovery") {
+                    Toggle("DHT", isOn: Binding(
+                        get: { config.dht ?? false },
+                        set: { config.dht = $0 }))
+                    Text("Also find peers through the public BitTorrent DHT, alongside trackers and rendezvous. Helps when trackers are blocked or slow; uses a little more data and battery. Reconnect to apply.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    TextEditor(text: $rendezvousText)
+                        .font(.footnote.monospaced())
+                        .frame(minHeight: 70)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    TextField("Rendezvous username or token (optional)", text: $rendezvousUser)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    SecureField("Rendezvous password (optional)", text: $rendezvousPass)
+                    Text("Rendezvous servers: one https:// URL per line. They find peers over plain HTTPS on networks that block BitTorrent. Leave the password empty to send the first field as a bearer token. Reconnect to apply.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
@@ -195,7 +220,7 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         config.applyLastOctet(octet)
-                        commitTrackers()
+                        commitTrackers(); commitRendezvous()
                         dismiss()
                     }
                 }
@@ -211,9 +236,18 @@ struct SettingsView: View {
                     : config.trackers
                 trackersText = list.joined(separator: "\n\n")
                 trackersLoadedText = trackersText
+                rendezvousText = config.rendezvousServers.joined(separator: "\n")
+                let cred = config.rendezvousAuth ?? ""
+                if let i = cred.firstIndex(of: ":") {
+                    rendezvousUser = String(cred[..<i])
+                    rendezvousPass = String(cred[cred.index(after: i)...])
+                } else {
+                    rendezvousUser = cred
+                    rendezvousPass = ""
+                }
                 refreshLogState()
             }
-            .onDisappear { commitTrackers() }   // swipe-down dismiss too
+            .onDisappear { commitTrackers(); commitRendezvous() }   // swipe-down dismiss too
         }
     }
 
@@ -237,6 +271,17 @@ struct SettingsView: View {
             }.value
             logExportURL = url
         }
+    }
+
+    /// Write the rendezvous editor back into the config (trim, skip blanks, dedupe).
+    private func commitRendezvous() {
+        var seen = Set<String>()
+        config.rendezvousServers = rendezvousText
+            .split(whereSeparator: { $0.isNewline || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+        let u = rendezvousUser.trimmingCharacters(in: .whitespaces)
+        config.rendezvousAuth = rendezvousPass.isEmpty ? u : "\(u):\(rendezvousPass)"
     }
 
     /// Parse the editor text (skip blanks, trim, dedupe) back into the config.
@@ -265,6 +310,12 @@ struct SettingsView: View {
         config.psk = jc.psk
         if let cidr = jc.overlay_cidr, !cidr.isEmpty { config.overlayCIDR = cidr }
         config.rendezvousServers = jc.rendezvous_servers ?? []
+        config.rendezvousAuth = jc.rendezvous_auth
+        rendezvousText = config.rendezvousServers.joined(separator: "\n")
+        let cred = jc.rendezvous_auth ?? ""
+        if let i = cred.firstIndex(of: ":") {
+            rendezvousUser = String(cred[..<i]); rendezvousPass = String(cred[cred.index(after: i)...])
+        } else { rendezvousUser = cred; rendezvousPass = "" }
         // Adopt this network's trackers (incl. any private tracker); the core
         // still unions in its curated defaults on top.
         if let t = jc.trackers, !t.isEmpty { config.trackers = t }

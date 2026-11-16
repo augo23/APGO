@@ -211,7 +211,7 @@ func runAdmin(cmd string) error {
 	esc := strings.ReplaceAll(cmd, "\\", "\\\\")
 	esc = strings.ReplaceAll(esc, "\"", "\\\"")
 	script := "do shell script \"" + esc + "\" with administrator privileges"
-	return exec.Command("osascript", "-e", script).Run()
+	return exec.Command("/usr/bin/osascript", "-e", script).Run()
 }
 
 // notify lives in notify_darwin.go: it posts through the app's OWN bundled
@@ -226,7 +226,7 @@ func promptPassword(title string) string {
 on error number -128
 	return "__CANCEL__"
 end try`, title)
-	out, err := exec.Command("osascript", "-e", as).Output()
+	out, err := exec.Command("/usr/bin/osascript", "-e", as).Output()
 	if err != nil {
 		return ""
 	}
@@ -237,7 +237,7 @@ end try`, title)
 	return s
 }
 
-func openBrowser(url string) { _ = exec.Command("open", url).Start() }
+func openBrowser(url string) { _ = exec.Command("/usr/bin/open", url).Start() }
 
 // q single-quotes a string for safe use in a /bin/sh command.
 func q(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

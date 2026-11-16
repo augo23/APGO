@@ -21,6 +21,8 @@ fi
 go mod tidy
 
 # Java package becomes org.apgo.overlaymobile, class Overlaymobile.
-gomobile bind -target=android -androidapi 24 -javapkg=org.apgo \
+# GOMOBILE_TARGET=android/amd64 builds only the x86_64 ABI (redroid, emulators):
+# about a quarter of the time of all four. Releases keep the default.
+gomobile bind -target="${GOMOBILE_TARGET:-android}" -androidapi 24 -javapkg=org.apgo \
   -o "$ANDROID_DIR/app/libs/overlaymobile.aar" .
 echo "Built android/app/libs/overlaymobile.aar"

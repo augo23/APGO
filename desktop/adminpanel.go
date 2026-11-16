@@ -128,6 +128,14 @@ func startAdminServer() {
 	}))
 	mux.HandleFunc("/api/info", apiAuth(func(w http.ResponseWriter, r *http.Request) { proxyCtl(w, "GET", "/api/info", nil) }))
 	mux.HandleFunc("/api/sessions", apiAuth(func(w http.ResponseWriter, r *http.Request) { proxyCtl(w, "GET", "/api/sessions", nil) }))
+	mux.HandleFunc("/api/retry-direct", apiAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Header.Get("X-Requested-With") != "overlay-admin" {
+			http.Error(w, "POST with X-Requested-With required", http.StatusBadRequest)
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		proxyCtl(w, "POST", "/api/retry-direct", body)
+	}))
 	mux.HandleFunc("/api/revocations", apiAuth(func(w http.ResponseWriter, r *http.Request) { proxyCtl(w, "GET", "/api/revocations", nil) }))
 	mux.HandleFunc("/api/logs", apiAuth(handleAdminLogs))
 	mux.HandleFunc("/api/revoke", apiAuth(handleAdminRevoke))
@@ -152,7 +160,7 @@ func startAdminServer() {
 	mux.HandleFunc("/api/node-config-get", apiAuth(handleAdminNodeConfigGet))
 	registerMultinetPanel(mux)
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute, IdleTimeout: 2 * time.Minute}
 	go func() { _ = srv.Serve(ln) }()
 }
 
@@ -276,12 +284,18 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost {
+		if desktopLoginWait() > 0 {
+			http.Redirect(w, r, "/login?e=1", http.StatusSeeOther)
+			return
+		}
 		_ = r.ParseForm()
 		if c, ok := loadCreds(); ok && c.matches(r.FormValue("username"), r.FormValue("password")) {
+			desktopLoginResult(true)
 			setSessionCookie(w)
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
+		desktopLoginResult(false)
 		http.Redirect(w, r, "/login?e=1", http.StatusSeeOther)
 		return
 	}
@@ -641,4 +655,48 @@ h1{font-size:18px}</style></head><body><h1>APGO admin key</h1>` + body + `</body
 func htmlEsc(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
 	return r.Replace(s)
+}
+
+// Failed-login backoff for the local dashboard and its join-QR page (both
+// check the same password). After 5 failures, attempts are REFUSED without
+// checking the password for 1s, doubling per further failure up to 30s, until
+// a login succeeds. Refusing (rather than sleeping before checking) is what
+// makes it hold against many attempts sent in parallel. Any local program can
+// reach this port, so without it one could guess the password as fast as it
+// likes. One shared counter: the panel only listens on 127.0.0.1, so there is
+// no per-source address worth keying on.
+var (
+	desktopLoginMu     sync.Mutex
+	desktopLoginFails  int
+	desktopLoginNextOK time.Time
+)
+
+// desktopLoginWait is how long until the next attempt may be checked (0 = now).
+func desktopLoginWait() time.Duration {
+	desktopLoginMu.Lock()
+	defer desktopLoginMu.Unlock()
+	if d := time.Until(desktopLoginNextOK); d > 0 {
+		return d
+	}
+	return 0
+}
+
+func desktopLoginResult(ok bool) {
+	desktopLoginMu.Lock()
+	defer desktopLoginMu.Unlock()
+	if ok {
+		desktopLoginFails = 0
+		desktopLoginNextOK = time.Time{}
+		return
+	}
+	if desktopLoginFails < 1000 {
+		desktopLoginFails++
+	}
+	if desktopLoginFails > 5 {
+		d := time.Second << uint(desktopLoginFails-6)
+		if d <= 0 || d > 30*time.Second {
+			d = 30 * time.Second
+		}
+		desktopLoginNextOK = time.Now().Add(d)
+	}
 }

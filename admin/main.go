@@ -73,6 +73,21 @@ func main() {
 	mux.HandleFunc("/api/info", requireAuthAPI(handleAPIInfo))
 	mux.HandleFunc("/api/config", requireAuthAPI(handleAPIConfig))
 	mux.HandleFunc("/api/sessions", requireAuthAPI(handleAPISessions))
+	mux.HandleFunc("/api/retry-direct", requireAuthAPI(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Header.Get("X-Requested-With") != "overlay-admin" {
+			http.Error(w, "POST with X-Requested-With required", http.StatusBadRequest)
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		code, resp, err := ctlPost("/api/retry-direct", body)
+		if err != nil {
+			http.Error(w, "client not reachable", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write(resp)
+	}))
 	mux.HandleFunc("/api/revocations", requireAuthAPI(handleAPIRevocations))
 	mux.HandleFunc("/api/revoke", requireAuthAPI(handleAPIRevoke))
 	mux.HandleFunc("/api/provision", requireAuthAPI(handleAPIProvision))

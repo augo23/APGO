@@ -22,14 +22,14 @@ const runKeyName = "APGO"
 func loginStartSupported() bool { return true }
 
 func loginStartEnabled() bool {
-	cmd := exec.Command("reg", "query", runKeyPath, "/v", runKeyName)
+	cmd := exec.Command(system32("reg.exe"), "query", runKeyPath, "/v", runKeyName)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Run() == nil
 }
 
 func setLoginStart(enable bool) error {
 	if !enable {
-		cmd := exec.Command("reg", "delete", runKeyPath, "/v", runKeyName, "/f")
+		cmd := exec.Command(system32("reg.exe"), "delete", runKeyPath, "/v", runKeyName, "/f")
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			// "delete" of a missing value is not an error we care about.
@@ -45,7 +45,7 @@ func setLoginStart(enable bool) error {
 		return err
 	}
 	// Quote the path so spaces in Program Files are handled at launch.
-	cmd := exec.Command("reg", "add", runKeyPath, "/v", runKeyName,
+	cmd := exec.Command(system32("reg.exe"), "add", runKeyPath, "/v", runKeyName,
 		"/t", "REG_SZ", "/d", `"`+exe+`"`, "/f")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Run()
@@ -66,7 +66,7 @@ func bootStartSupported() bool { return true }
 // lives in the protected %ProgramData%\\APGO, not the user profile.
 
 func bootStartEnabled() bool {
-	cmd := exec.Command("schtasks", "/Query", "/TN", bootTaskName)
+	cmd := exec.Command(system32("schtasks.exe"), "/Query", "/TN", bootTaskName)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Run() == nil
 }
@@ -93,7 +93,7 @@ func setBootStart(enable bool) error {
 // version that pointed at a batch in the user's profile.
 func bootTaskInstallPS(bat string) string {
 	return writeSysFilePS(bootLauncherPath(), bat) +
-		"$a = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c \"' + " + psQuote(bootLauncherPath()) + " + '\"')\n" +
+		"$a = New-ScheduledTaskAction -Execute " + psQuote(system32("cmd.exe")) + " -Argument ('/c \"' + " + psQuote(bootLauncherPath()) + " + '\"')\n" +
 		"$t = New-ScheduledTaskTrigger -AtStartup\n" +
 		"$pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\n" +
 		"Register-ScheduledTask -TaskName " + psQuote(bootTaskName) + " -Action $a -Trigger $t -Principal $pr -Force | Out-Null\n"

@@ -130,6 +130,18 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 
 	passive := cfg.TrackerMode == "passive"
 
+	// DHT discovery, off unless the user turns it on in Settings. Keyed by the
+	// PSK-blinded network key, like the desktop default, so outsiders who guess
+	// the network name cannot enumerate members. Set up BEFORE the read loop
+	// below starts, because that loop reads gDHT from its own goroutine.
+	gRendezvousCred = cfg.RendezvousAuth
+	gDHT = nil
+	if cfg.DHT {
+		startDHT(udpConn, dhtKey(cfg.NetworkName, psk), port, kp, psk, stop)
+	} else {
+		log.Printf("[dht] disabled by configuration")
+	}
+
 	// Decrypt path (UDP -> TUN)
 	go func() {
 		buf := make([]byte, 65535)
@@ -164,6 +176,14 @@ func run(tun io.ReadWriteCloser, cfg *ClientConfig, stop <-chan struct{}) error 
 			// overlay frames are 0x01-0x05, relay frames are 0x10. Sharing one
 			// socket is not a space optimisation — it is what makes the NAT
 			// mapping the relay keeps warm the SAME mapping peers punch to.
+			// DHT (dht.go): a KRPC message is always a bencode dict ('d'),
+			// which no overlay or relay frame starts with.
+			if buf[0] == 'd' {
+				if gDHT != nil {
+					dhtHandlePacket(append([]byte(nil), buf[:n]...), raddr)
+				}
+				continue
+			}
 			if pkt0 := buf[0]; pkt0 == PktRelay {
 				handleRelayPacket(append([]byte(nil), buf[:n]...), raddr)
 				continue

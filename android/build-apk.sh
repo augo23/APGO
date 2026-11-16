@@ -40,12 +40,20 @@ command -v git  >/dev/null 2>&1 || pm_install git git
 command -v unzip >/dev/null 2>&1 || pm_install unzip unzip
 say "Go: $(go version)"
 
-# JDK 17
-if ! /usr/libexec/java_home -v 17 >/dev/null 2>&1 && ! (command -v javac >/dev/null 2>&1 && javac -version 2>&1 | grep -q ' 17'); then
-  say "Installing JDK 17…"
-  if [ "$OS" = "Darwin" ]; then brew install openjdk@17; else sudo apt-get install -y openjdk-17-jdk; fi
+# JDK 17 or newer. Gradle 8.7, AGP 8.5 and Kotlin 1.9 all run on 17 or 21, and
+# the app still targets Java 17 bytecode (app/build.gradle.kts). Debian 13 no
+# longer packages 17, so take 21 where 17 is missing.
+javac_major() { javac -version 2>&1 | sed -nE 's/^javac (1\.)?([0-9]+).*/\2/p'; }
+if [ "$OS" = "Darwin" ]; then
+  /usr/libexec/java_home -v 17 >/dev/null 2>&1 || { say "Installing JDK 17…"; brew install openjdk@17; }
+  export JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+elif ! command -v javac >/dev/null 2>&1 || [ "$(javac_major)" -lt 17 ] 2>/dev/null; then
+  say "Installing a JDK (17, or 21 where 17 is no longer packaged)…"
+  sudo apt-get update -y
+  sudo apt-get install -y openjdk-17-jdk-headless 2>/dev/null \
+    || sudo apt-get install -y openjdk-21-jdk-headless
 fi
-if [ "$OS" = "Darwin" ]; then export JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"; fi
+say "Java: $(javac -version 2>&1)"
 
 # gomobile / gobind
 export PATH="$(go env GOPATH)/bin:$PATH"

@@ -2928,10 +2928,11 @@ func handleControl(body []byte, raddr *net.UDPAddr) {
 		// with names and addresses of its choosing — and an operator reading
 		// that list has no way to tell which rows came from a device they
 		// have not approved.
-		if s := GlobalSessions.GetByAddr(raddr); s == nil || !admissionOK(s.peerStatic, "roster") {
+		s := GlobalSessions.GetByAddr(raddr)
+		if s == nil || !admissionOK(s.peerStatic, "roster") {
 			return
 		}
-		handleRoster(body[1:])
+		handleRoster(body[1:], s.peerStatic)
 		return
 	case 'E':
 		// Peer advertises it's an internet exit node.
