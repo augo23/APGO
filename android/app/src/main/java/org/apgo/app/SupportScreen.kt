@@ -55,58 +55,80 @@ fun SupportScreen(billing: BillingManager, activity: Activity, onClose: () -> Un
                 style = MaterialTheme.typography.bodySmall
             )
 
-            Text("Monthly support", style = MaterialTheme.typography.titleSmall)
-            if (activeSub.isNotEmpty()) {
-                val current = subscriptions.firstOrNull { it.id == activeSub }
-                Text(
-                    "You give ${current?.price ?: "monthly"} — thank you! 💚",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                OutlinedButton(
-                    onClick = { openUrl(ctx, Support.manageSubsUrl) },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Manage or cancel") }
-            } else if (subscriptions.isEmpty()) {
-                Text("Loading monthly options…", style = MaterialTheme.typography.bodySmall)
-            } else {
-                subscriptions.forEach { p ->
-                    Button(onClick = { billing.sendGift(activity, p) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("${p.price} / month")
+            // Play gifts and subscriptions exist only in the Play build.
+            if (billing.available) {
+                Text("Monthly support", style = MaterialTheme.typography.titleSmall)
+                if (activeSub.isNotEmpty()) {
+                    val current = subscriptions.firstOrNull { it.id == activeSub }
+                    Text(
+                        "You give ${current?.price ?: "monthly"} — thank you! 💚",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    OutlinedButton(
+                        onClick = { openUrl(ctx, Support.manageSubsUrl) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Manage or cancel") }
+                } else if (subscriptions.isEmpty()) {
+                    Text("Loading monthly options…", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    subscriptions.forEach { p ->
+                        Button(onClick = { billing.sendGift(activity, p) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("${p.price} / month")
+                        }
+                    }
+                    Text(
+                        "Auto-renews monthly. Cancel anytime in Play Store → Subscriptions.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                Divider(Modifier.padding(vertical = 8.dp))
+
+                Text("One-time gift", style = MaterialTheme.typography.titleSmall)
+                if (products.isEmpty()) {
+                    Text("Loading support options…", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    products.forEach { p ->
+                        Button(onClick = { billing.sendGift(activity, p) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Gift ${p.price}")
+                        }
                     }
                 }
+                if (status.isNotEmpty()) {
+                    Text(status, style = MaterialTheme.typography.bodySmall)
+                }
+
+                Divider(Modifier.padding(vertical = 8.dp))
+            }
+
+            if (billing.available) {
+                // Play build: the website gift page (card / Google Pay).
+                Text("Any amount you like", style = MaterialTheme.typography.titleSmall)
+                Button(
+                    onClick = { openUrl(ctx, Support.giftUrl) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Choose your own amount on our website") }
                 Text(
-                    "Auto-renews monthly. Cancel anytime in Play Store → Subscriptions.",
+                    "Opens APGO's gift page — Google Pay, Apple Pay, or card; one-time or monthly; any amount.",
                     style = MaterialTheme.typography.bodySmall
                 )
-            }
-
-            Divider(Modifier.padding(vertical = 8.dp))
-
-            Text("One-time gift", style = MaterialTheme.typography.titleSmall)
-            if (products.isEmpty()) {
-                Text("Loading support options…", style = MaterialTheme.typography.bodySmall)
             } else {
-                products.forEach { p ->
-                    Button(onClick = { billing.sendGift(activity, p) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Gift ${p.price}")
-                    }
-                }
-            }
-            if (status.isNotEmpty()) {
-                Text(status, style = MaterialTheme.typography.bodySmall)
-            }
+                // F-Droid build: links out only — no payment flow in the app.
+                Text("GitHub Sponsors", style = MaterialTheme.typography.titleSmall)
+                Button(
+                    onClick = { openUrl(ctx, Support.githubSponsorsUrl) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Sponsor on GitHub") }
 
-            Divider(Modifier.padding(vertical = 8.dp))
+                Divider(Modifier.padding(vertical = 8.dp))
 
-            Text("Any amount you like", style = MaterialTheme.typography.titleSmall)
-            Button(
-                onClick = { openUrl(ctx, Support.giftUrl) },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Choose your own amount on our website") }
-            Text(
-                "Opens APGO's gift page — Google Pay, Apple Pay, or card; one-time or monthly; any amount.",
-                style = MaterialTheme.typography.bodySmall
-            )
+                Text("Venmo", style = MaterialTheme.typography.titleSmall)
+                Button(
+                    onClick = { openUrl(ctx, Support.venmoUrl) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Open ${Support.venmo} in Venmo") }
+                CopyRow(label = "Copy ${Support.venmo}", value = Support.venmo, ctx = ctx)
+            }
 
             Divider(Modifier.padding(vertical = 8.dp))
 

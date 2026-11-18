@@ -13,6 +13,9 @@
 #   * keeps Gradle's daemon and build cache warm between runs.
 # The APK it makes runs on x86_64 devices only. Releases use build-apk.sh.
 set -euo pipefail
+APGO_FLAVOR="${APGO_FLAVOR:-play}"
+case "$APGO_FLAVOR" in play|fdroid) ;; *) echo "APGO_FLAVOR must be play or fdroid" >&2; exit 1 ;; esac
+APGO_FLAVOR_CAP="$(printf %s "${APGO_FLAVOR:0:1}" | tr a-z A-Z)${APGO_FLAVOR:1}"
 
 say() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -20,7 +23,7 @@ die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ANDROID_DIR="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="$(cd "$ANDROID_DIR/../ios/core" && pwd)"
 AAR="$ANDROID_DIR/app/libs/overlaymobile.aar"
-APK="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+APK="$ANDROID_DIR/app/build/outputs/apk/$APGO_FLAVOR/debug/app-$APGO_FLAVOR-debug.apk"
 
 : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-$HOME/Android/sdk}}"
 export ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -45,7 +48,7 @@ fi
 say "Assembling the debug APK…"
 cd "$ANDROID_DIR"
 echo "sdk.dir=$ANDROID_HOME" > local.properties
-./gradlew --build-cache -PapgoVersion="${APGO_VERSION:-1.0.0}" :app:assembleDebug
+./gradlew --build-cache -PapgoVersion="${APGO_VERSION:-1.0.0}" :app:assemble${APGO_FLAVOR_CAP}Debug
 
 # --- install -------------------------------------------------------------------
 # The workspace's own adb, so the existing connection to redroid is kept

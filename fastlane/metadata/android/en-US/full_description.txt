@@ -1,0 +1,15 @@
+APGO (Another Pretty Good Overlay) joins your devices into one private, encrypted network, wherever they are. Phones, laptops, servers and routers find each other and talk directly, as if they were on the same LAN.
+
+<b>No central server. No VPN provider. No port forwarding. No static IP.</b>
+
+<ul>
+<li>Devices find each other through public BitTorrent trackers, rendezvous servers, the DHT and the local network. These only ever see addresses, never your traffic.</li>
+<li>Connections punch through home routers, phone hotspots and carrier-grade NAT, connect directly over IPv6 where available, and fall back to an encrypted relay only when no direct path exists.</li>
+<li>Every connection is end-to-end encrypted with the Noise protocol and a shared network key, with an additional post-quantum (ML-KEM-768) layer on by default.</li>
+<li>Optional full-VPN mode routes all of your internet traffic through a device on your own network that you choose as an exit.</li>
+<li>Network admins approve new devices, assign addresses and revoke lost devices; those decisions are signed and enforced by every device.</li>
+</ul>
+
+Join a network by scanning the QR code from any APGO admin panel, or enter the network name and key by hand.
+
+APGO is free software under the GNU GPL, version 3 or later.

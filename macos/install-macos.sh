@@ -63,6 +63,128 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Steps 2-4 (prerequisites + build) run BEFORE the old install is removed.
+# They only write to the temp build dir, and doing them first means a failed
+# build (a broken toolchain, a compile error) leaves the working APGO
+# installed and running instead of uninstalling it and stopping there.
+# ---------------------------------------------------------------------------
+# 2. Xcode Command Line Tools (needed to compile the Cocoa menu-bar app)
+# ---------------------------------------------------------------------------
+if ! xcode-select -p >/dev/null 2>&1; then
+  log "Installing Xcode Command Line Tools — complete the popup dialog…"
+  xcode-select --install >/dev/null 2>&1 || true
+  die "Finish the Command Line Tools install in the dialog, then re-run this script."
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Go toolchain
+# ---------------------------------------------------------------------------
+ensure_go() {
+  command -v go >/dev/null 2>&1 && return
+  if [[ -x /usr/local/go/bin/go ]]; then export PATH="/usr/local/go/bin:$PATH"; return; fi
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [[ -x "$b" ]]; then
+      log "Installing Go via Homebrew…"
+      "$b" install go
+      export PATH="$("$b" --prefix)/bin:$PATH"
+      return
+    fi
+  done
+  local ver="go1.26.11" arch tgz
+  case "$(uname -m)" in
+    arm64)  arch="arm64" ;;
+    x86_64) arch="amd64" ;;
+    *)      die "unsupported architecture: $(uname -m)" ;;
+  esac
+  tgz="${ver}.darwin-${arch}.tar.gz"
+  log "Downloading ${tgz}…"
+  curl -fsSL -o "${BUILD}/${tgz}" "https://go.dev/dl/${tgz}" || die "Go download failed."
+  log "Installing Go to /usr/local/go (may ask for your password)…"
+  sudo rm -rf /usr/local/go
+  sudo tar -C /usr/local -xzf "${BUILD}/${tgz}"
+  export PATH="/usr/local/go/bin:$PATH"
+}
+ensure_go
+command -v go >/dev/null 2>&1 || die "Go is still not on PATH."
+log "Using $(go version)"
+
+# ---------------------------------------------------------------------------
+# 4. Build (into the temp dir — nothing is left in the repo)
+# ---------------------------------------------------------------------------
+# Pick an SDK the active linker can read. Xcode and the Command Line Tools
+# update separately, and when the CLT ships a newer macOS SDK than the selected
+# Xcode's linker understands, every cgo link fails with "tapi error: malformed
+# file … unknown architecture arm64e.x1" (seen with Xcode 26.6 + the CLT's 27.2
+# SDK). Probe with a tiny Cocoa link; on failure, retry with each Xcode SDK,
+# newest first, and build against the first one that links.
+probe_link() {
+  printf 'int main(void){return 0;}\n' | \
+    xcrun clang -x c - -framework Cocoa -o "${BUILD}/linkprobe" >/dev/null 2>&1
+}
+if [[ -z "${SDKROOT:-}" ]] && ! probe_link; then
+  picked=""
+  dev="$(xcode-select -p 2>/dev/null || true)"
+  for sdkdir in \
+      "$dev/Platforms/MacOSX.platform/Developer/SDKs" \
+      /Library/Developer/CommandLineTools/SDKs; do
+    [[ -d "$sdkdir" ]] || continue
+    # Newest first, by version number in the file name (MacOSX26.5.sdk).
+    for sdk in $(ls -d "$sdkdir"/MacOSX[0-9]*.sdk 2>/dev/null | \
+                 awk -F/ '{n=$NF; sub(/\.sdk$/, "", n); print n "\t" $0}' | sort -Vr | cut -f2); do
+      export SDKROOT="$sdk"
+      if probe_link; then picked="$sdk"; break 2; fi
+    done
+  done
+  if [[ -z "$picked" ]]; then
+    unset SDKROOT
+    die "The C linker cannot link against any installed macOS SDK. Update Xcode (or run: sudo xcode-select -s /Library/Developer/CommandLineTools) and re-run."
+  fi
+  # Target the SDK's own version, so objects and the link agree.
+  v="$(basename "$picked" .sdk)"; v="${v#MacOSX}"
+  # Also through the cgo flags: Go's build cache keys on CGO_CFLAGS but not on
+  # MACOSX_DEPLOYMENT_TARGET, so without this, objects cached from an earlier
+  # build (targeting the newer OS) are reused and the link warns about them.
+  export MACOSX_DEPLOYMENT_TARGET="$v"
+  export CGO_CFLAGS="${CGO_CFLAGS:--O2 -g} -mmacosx-version-min=$v"
+  export CGO_LDFLAGS="${CGO_LDFLAGS:--O2 -g} -mmacosx-version-min=$v"
+  warn "The default macOS SDK does not link with the selected Xcode's linker; building against $(basename "$picked") instead."
+fi
+rm -f "${BUILD}/linkprobe"
+
+log "Building overlay-client…"
+( cd client && go mod tidy && go build -trimpath -o "${BUILD}/overlay-client" . )
+
+log "Building menu-bar app (shared desktop module, resolving deps)…"
+( cd desktop && go mod tidy && go build -trimpath -o "${BUILD}/APGO" . )
+
+log "Assembling APGO.app…"
+APP="${BUILD}/APGO.app"
+mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+cp "${BUILD}/APGO"           "${APP}/Contents/MacOS/APGO"
+cp "${BUILD}/overlay-client" "${APP}/Contents/MacOS/overlay-client"
+
+# App icon: compile the .iconset into AppIcon.icns (Finder / Launchpad / Dock).
+if [ -d "$REPO_ROOT/macos/AppIcon.iconset" ]; then
+  iconutil -c icns -o "${APP}/Contents/Resources/AppIcon.icns" "$REPO_ROOT/macos/AppIcon.iconset" \
+    || warn "iconutil failed; app will use the default icon."
+fi
+cat > "${APP}/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>APGO</string>
+  <key>CFBundleIdentifier</key><string>org.apgo.macos</string>
+  <key>CFBundleExecutable</key><string>APGO</string>
+  <key>CFBundleVersion</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+
 # ---------------------------------------------------------------------------
 # 1. Quit & uninstall any previous version
 # ---------------------------------------------------------------------------
@@ -306,84 +428,6 @@ chmod 700 "$USER_HOME/.apgo" 2>/dev/null || true
 
 log "Removing old install…"
 rm -rf "/Applications/APGO.app" 2>/dev/null || sudo rm -rf "/Applications/APGO.app"
-
-# ---------------------------------------------------------------------------
-# 2. Xcode Command Line Tools (needed to compile the Cocoa menu-bar app)
-# ---------------------------------------------------------------------------
-if ! xcode-select -p >/dev/null 2>&1; then
-  log "Installing Xcode Command Line Tools — complete the popup dialog…"
-  xcode-select --install >/dev/null 2>&1 || true
-  die "Finish the Command Line Tools install in the dialog, then re-run this script."
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Go toolchain
-# ---------------------------------------------------------------------------
-ensure_go() {
-  command -v go >/dev/null 2>&1 && return
-  if [[ -x /usr/local/go/bin/go ]]; then export PATH="/usr/local/go/bin:$PATH"; return; fi
-  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-    if [[ -x "$b" ]]; then
-      log "Installing Go via Homebrew…"
-      "$b" install go
-      export PATH="$("$b" --prefix)/bin:$PATH"
-      return
-    fi
-  done
-  local ver="go1.26.1" arch tgz
-  case "$(uname -m)" in
-    arm64)  arch="arm64" ;;
-    x86_64) arch="amd64" ;;
-    *)      die "unsupported architecture: $(uname -m)" ;;
-  esac
-  tgz="${ver}.darwin-${arch}.tar.gz"
-  log "Downloading ${tgz}…"
-  curl -fsSL -o "${BUILD}/${tgz}" "https://go.dev/dl/${tgz}" || die "Go download failed."
-  log "Installing Go to /usr/local/go (may ask for your password)…"
-  sudo rm -rf /usr/local/go
-  sudo tar -C /usr/local -xzf "${BUILD}/${tgz}"
-  export PATH="/usr/local/go/bin:$PATH"
-}
-ensure_go
-command -v go >/dev/null 2>&1 || die "Go is still not on PATH."
-log "Using $(go version)"
-
-# ---------------------------------------------------------------------------
-# 4. Build (into the temp dir — nothing is left in the repo)
-# ---------------------------------------------------------------------------
-log "Building overlay-client…"
-( cd client && go mod tidy && go build -trimpath -o "${BUILD}/overlay-client" . )
-
-log "Building menu-bar app (shared desktop module, resolving deps)…"
-( cd desktop && go mod tidy && go build -trimpath -o "${BUILD}/APGO" . )
-
-log "Assembling APGO.app…"
-APP="${BUILD}/APGO.app"
-mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
-cp "${BUILD}/APGO"           "${APP}/Contents/MacOS/APGO"
-cp "${BUILD}/overlay-client" "${APP}/Contents/MacOS/overlay-client"
-
-# App icon: compile the .iconset into AppIcon.icns (Finder / Launchpad / Dock).
-if [ -d "$REPO_ROOT/macos/AppIcon.iconset" ]; then
-  iconutil -c icns -o "${APP}/Contents/Resources/AppIcon.icns" "$REPO_ROOT/macos/AppIcon.iconset" \
-    || warn "iconutil failed; app will use the default icon."
-fi
-cat > "${APP}/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>APGO</string>
-  <key>CFBundleIdentifier</key><string>org.apgo.macos</string>
-  <key>CFBundleExecutable</key><string>APGO</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>LSUIElement</key><true/>
-</dict>
-</plist>
-PLIST
 
 # ---------------------------------------------------------------------------
 # 5. Install fresh copy to /Applications

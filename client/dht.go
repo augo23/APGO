@@ -856,7 +856,7 @@ func dhtStatePath() string {
 	if p := os.Getenv("DHT_STATE_FILE"); p != "" {
 		return p
 	}
-	if p := os.Getenv("NODE_SETTINGS_FILE"); p != "" {
+	if p := nodeSettingsPath(); p != "" {
 		return strings.TrimSuffix(p, ".json") + "-dht.dat"
 	}
 	return ""

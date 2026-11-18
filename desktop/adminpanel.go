@@ -157,6 +157,9 @@ func startAdminServer() {
 		proxyCtl(w, "GET", "/api/discovery", nil)
 	}))
 	mux.HandleFunc("/api/node-config", apiAuth(handleAdminNodeConfig))
+	// Full VPN panel on the main page: saved choice + live exit list, and
+	// the switch / exit picker (fullvpn.go).
+	mux.HandleFunc("/api/full-vpn", apiAuth(handlePanelFullVPN))
 	mux.HandleFunc("/api/node-config-get", apiAuth(handleAdminNodeConfigGet))
 	registerMultinetPanel(mux)
 

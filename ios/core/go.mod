@@ -2,7 +2,7 @@ module overlay-mobile-ios
 
 // go 1.24+ enables the `tool` directive that modern gomobile (Go 1.24/1.25/1.26)
 // needs to find golang.org/x/mobile in the module graph.
-go 1.26.0
+go 1.26.11
 
 require (
 	github.com/cloudflare/circl v1.6.3

@@ -91,25 +91,34 @@ func serveSettingsForm(initial mConfig) {
 // saveSettingsForm reads the settings form and persists the config. Shared by
 // the standalone Settings window and the "/settings" route in the admin panel.
 //
-// It returns a note for the user about Full VPN, which (unlike the other
-// settings) is applied to the running client immediately.
+// It returns a note for the user about the exit-node and public-exit
+// settings, which (unlike the others) are applied to the running client
+// immediately. Full VPN itself is set from the dashboard's main page.
 func saveSettingsForm(r *http.Request) (string, error) {
 	_ = r.ParseForm()
 	c := loadConfig()
-	prevUseExit, prevExitPeer, prevNet := c.UseExit, c.ExitPeer, c.NetworkName
+	prevNet := c.NetworkName
 	prevExitNode := c.ExitNode
-	prevPublicExit, prevUsePublic := c.PublicExit, c.UsePublicExits
+	prevPublicExit := c.PublicExit
 	prevPXLimits := [5]string{c.PublicExitUpLimit, c.PublicExitDownLimit, c.PublicExitQuota,
 		strconv.Itoa(c.PublicExitMaxClients), c.PublicExitPerClientLimit}
 	c.NetworkName = strings.TrimSpace(r.FormValue("network_name"))
+	if c.NetworkName != prevNet {
+		// A different network (including "+ Add Network", which starts from
+		// a blank form): the previous network's Full VPN choice and pinned
+		// exit mean nothing there. This form used to send use_exit unticked
+		// and so reset it implicitly; the Full VPN panel now owns it.
+		c.UseExit, c.ExitPeer = false, ""
+	}
 	c.PSK = strings.TrimSpace(r.FormValue("psk"))
 	c.FriendlyName = strings.TrimSpace(r.FormValue("friendly_name"))
 	// Post-quantum is controlled network-wide from the Security policy page
 	// (one place), not here — leave c.PostQuantum as loaded (default on).
 	c.IPv6 = r.FormValue("ipv6") == "on"
 	c.ExitNode = r.FormValue("exit_node") == "on"
-	c.UseExit = r.FormValue("use_exit") == "on"
-	c.UsePublicExits = r.FormValue("use_public_exits") == "on"
+	// Full VPN (use_exit, exit_peer, use_public_exits) is set from the Full
+	// VPN panel on the dashboard's main page (fullvpn.go), not this form, so
+	// the saved values are kept as loaded.
 	c.PublicExit = r.FormValue("public_exit") == "on"
 	c.PublicExitUpLimit = strings.TrimSpace(r.FormValue("public_exit_up"))
 	c.PublicExitDownLimit = strings.TrimSpace(r.FormValue("public_exit_down"))
@@ -135,7 +144,6 @@ func saveSettingsForm(r *http.Request) (string, error) {
 	if c.PublicExit && (!dht || !c.PublicRelay) {
 		return "", fmt.Errorf("a public exit node must also find peers through the DHT and be a public relay — tick both, or untick Public exit node")
 	}
-	c.ExitPeer = strings.TrimSpace(r.FormValue("exit_peer"))
 	c.OverlayCIDR = strings.TrimSpace(r.FormValue("overlay_cidr"))
 	if c.OverlayCIDR == "" {
 		c.OverlayCIDR = "10.22.55.0/24"
@@ -223,35 +231,15 @@ func saveSettingsForm(r *http.Request) (string, error) {
 	// new name + PSK and Save, then switch between them in the tray's
 	// "Networks" submenu.
 	registerCurrentProfileUI()
-	// Full VPN and exit-node mode apply live — but only to the network the
+	// Exit-node and public-exit modes apply live — but only to the network the
 	// client is running, and only when the running client isn't already
 	// doing what was saved.
 	if c.NetworkName != prevNet {
 		return "", nil
 	}
 	var notes []string
-	// Exit mode first when turning Full VPN off, last when turning it on, so
-	// the two are never both active in between.
-	pushExit := func() {
-		if exitNodeDiffers(c.ExitNode, prevExitNode) {
-			if n := applyExitNodeLive(c.ExitNode); n != "" {
-				notes = append(notes, n)
-			}
-		}
-	}
-	if !c.UseExit {
-		pushExit()
-	}
-	if fullVPNDiffers(c.UseExit, c.ExitPeer, prevUseExit, prevExitPeer) {
-		if n := applyFullVPNLive(c.UseExit, c.ExitPeer); n != "" {
-			notes = append(notes, n)
-		}
-	}
-	if c.UseExit {
-		pushExit()
-	}
-	if c.UsePublicExits != prevUsePublic || usePublicDiffers(c.UsePublicExits) {
-		if n := applyUsePublicExitsLive(c.UsePublicExits); n != "" {
+	if exitNodeDiffers(c.ExitNode, prevExitNode) {
+		if n := applyExitNodeLive(c.ExitNode); n != "" {
 			notes = append(notes, n)
 		}
 	}
@@ -292,10 +280,6 @@ func settingsPage(c mConfig) string {
 	if c.IPv6 {
 		ipv6Checked = "checked"
 	}
-	useExitChecked := ""
-	if c.UseExit {
-		useExitChecked = "checked"
-	}
 	exitNodeChecked := ""
 	if c.ExitNode {
 		exitNodeChecked = "checked"
@@ -327,9 +311,7 @@ func settingsPage(c mConfig) string {
 		"{{PSK}}", html.EscapeString(c.PSK),
 		"{{FRIENDLY}}", html.EscapeString(c.FriendlyName),
 		"{{IPV6CHECK}}", ipv6Checked,
-		"{{USEEXITCHECK}}", useExitChecked,
 		"{{EXITNODECHECK}}", exitNodeChecked,
-		"{{USEPUBLICEXITSCHECK}}", checkedIf(c.UsePublicExits),
 		"{{PUBLICEXITCHECK}}", checkedIf(c.PublicExit),
 		"{{PXUP}}", html.EscapeString(c.PublicExitUpLimit),
 		"{{PXDOWN}}", html.EscapeString(c.PublicExitDownLimit),
@@ -339,7 +321,6 @@ func settingsPage(c mConfig) string {
 		"{{DHTCHECK}}", dhtChecked,
 		"{{USERELAYSCHECK}}", useRelaysChecked,
 		"{{PUBLICRELAYCHECK}}", publicRelayChecked,
-		"{{EXITPEER}}", html.EscapeString(c.ExitPeer),
 		"{{CIDR}}", html.EscapeString(cidr),
 		"{{PORT}}", html.EscapeString(port),
 		"{{LASTOCTET}}", html.EscapeString(lastOctet),
@@ -357,8 +338,7 @@ func settingsPage(c mConfig) string {
 func adminSectionHTML() string {
 	if adminKeyAvailable() {
 		pub := currentNetworkAdminPub()
-		body := `<label>Network admin key</label>
-    <div class="hint">This network has an admin key. It's distributed (encrypted) to every device, so you can manage nodes from any device with the network admin password.</div>`
+		body := `<div class="hint">This network has an admin key. It's distributed (encrypted) to every device, so you can manage nodes from any device with the network admin password.</div>`
 		if pub != "" {
 			body += `
     <textarea readonly onclick="this.select()" style="width:100%;height:64px;margin-top:8px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:12px">ADMIN_PUBLIC_KEY=` + html.EscapeString(pub) + `</textarea>`
@@ -389,7 +369,7 @@ func dashboardSectionHTML() string {
 	if u == "" {
 		return ""
 	}
-	return `<label>Dashboard login</label>
+	return `<h2>Dashboard login</h2>
     <div class="hint">Change the username/password used to open THIS device's dashboard (separate from the network admin password). Leave blank to keep the current login.</div>
     <label for="dash_current_password">Current dashboard password</label>
     <input id="dash_current_password" name="dash_current_password" type="password" autocomplete="off">
@@ -411,109 +391,210 @@ const settingsTmpl = `<!DOCTYPE html>
     :root{ --bg:#fff; --panel:#f6f6f6; --fg:#0a0a0a; --muted:#5f6368; --line:#e2e2e2; --accent:#000; --field:#fff; }
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;padding:28px}
-  form{width:100%;max-width:460px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px}
-  h1{font-size:18px;margin:0 0 4px}
-  p.sub{margin:0 0 18px;color:var(--muted);font-size:13px}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;padding:28px 16px}
+  form{width:100%;max-width:640px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:0 26px 26px}
+  .top{position:sticky;top:0;background:var(--panel);padding:22px 0 0;z-index:2;border-bottom:1px solid var(--line);margin-bottom:6px}
+  .titlerow{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  h1{font-size:18px;margin:0;flex:1}
+  .tabs{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{flex:none;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:inherit;font-size:14px;font-weight:600;padding:9px 12px;cursor:pointer;white-space:nowrap}
+  .tab:hover{color:var(--fg)}
+  .tab[aria-selected=true]{color:var(--fg);border-bottom-color:var(--accent)}
+  .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:6px}
+  section[role=tabpanel]{padding-top:6px}
+  p.sub{margin:14px 0 4px;color:var(--muted);font-size:13px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:26px 0 0;padding-top:16px;border-top:1px solid var(--line)}
+  h2.first{border-top:0;padding-top:0;margin-top:18px}
   label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin:16px 0 6px}
-  input{width:100%;padding:11px 12px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:10px;font-size:15px;outline:none}
+  label.check{display:flex;align-items:flex-start;gap:10px;margin-top:16px;text-transform:none;letter-spacing:0;font-size:15px;color:var(--fg);cursor:pointer}
+  label.check input{width:auto;margin-top:4px;flex:none}
+  input,textarea{width:100%;padding:11px 12px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:10px;font-size:15px;outline:none}
   input:focus{border-color:var(--accent)}
   .pskrow{position:relative}
   .toggle{position:absolute;right:10px;top:9px;font-size:12px;color:var(--muted);background:none;border:0;cursor:pointer}
   .genbtn{margin-top:8px;padding:9px 14px;font-size:13px;font-weight:600;color:var(--fg);background:var(--field);border:1px solid var(--line);border-radius:10px;cursor:pointer}
   .genbtn:hover{border-color:var(--accent)}
   .hint{color:var(--muted);font-size:12px;margin-top:6px}
-  button.save{width:100%;margin-top:22px;padding:12px;border:0;border-radius:10px;background:var(--accent);color:var(--bg);font-size:15px;font-weight:600;cursor:pointer}
-  a.backtop{display:inline-block;margin:0 0 14px;color:var(--fg);font-size:13px;font-weight:600;text-decoration:none;border:1px solid var(--line);padding:7px 14px;border-radius:10px}
+  label.check + .hint{margin-left:24px}
+  .grid2{display:flex;gap:8px;flex-wrap:wrap}
+  .grid2 > div{flex:1;min-width:130px}
+  .callout{border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--muted);margin-top:16px}
+  .callout a{color:var(--fg)}
+  .links a{display:block;color:var(--fg);margin-top:8px;font-size:14px}
+  button.save{width:100%;margin-top:26px;padding:12px;border:0;border-radius:10px;background:var(--accent);color:var(--bg);font-size:15px;font-weight:600;cursor:pointer}
+  .savenote{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
+  a.backtop{color:var(--fg);font-size:13px;font-weight:600;text-decoration:none;border:1px solid var(--line);padding:7px 14px;border-radius:10px}
 </style></head>
 <body>
-  <form method="POST" autocomplete="off">
-    <a class="backtop" href="/">← Back</a>
-    <h1>APGO Settings</h1>
-    <p class="sub">Use the same values on every node in your network.</p>
-
-    <label for="network_name">Network name</label>
-    <input id="network_name" name="network_name" type="text" value="{{NETWORK}}" spellcheck="false" autocapitalize="off">
-
-    <label for="psk">Pre-shared key</label>
-    <div class="pskrow">
-      <input id="psk" name="psk" type="password" value="{{PSK}}" spellcheck="false" autocapitalize="off">
-      <button type="button" class="toggle" onclick="var p=document.getElementById('psk');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'">Show</button>
-    </div>
-    <button type="button" class="genbtn" onclick="var b=new Uint8Array(32);crypto.getRandomValues(b);document.getElementById('psk').value='base64:'+btoa(String.fromCharCode.apply(null,b))">Generate a random key</button>
-    <div class="hint">Click Generate to make a random key, or paste one. Use the SAME key on every device.</div>
-
-    <label for="friendly_name">This device's name (optional)</label>
-    <input id="friendly_name" name="friendly_name" type="text" value="{{FRIENDLY}}" spellcheck="false" autocapitalize="off">
-    <div class="hint">A friendly label shown next to this device in the admin panel.</div>
-
-    <label for="overlay_cidr">Overlay subnet (CIDR)</label>
-    <input id="overlay_cidr" name="overlay_cidr" type="text" value="{{CIDR}}" spellcheck="false">
-
-    <label for="last_octet">This node's overlay IP (optional)</label>
-    <div style="display:flex;align-items:center;gap:8px">
-      <span id="ipprefix" style="color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:nowrap">10.22.55.</span>
-      <input id="last_octet" name="last_octet" type="text" inputmode="numeric" maxlength="3" value="{{LASTOCTET}}" style="max-width:96px" spellcheck="false">
-    </div>
-    <div class="hint">Type just the last number (1–254). Blank = auto-assign (recommended). The prefix follows the subnet above. Other devices give a manual address to the first device that uses it; assign it to this device in the admin panel to make it permanent.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="exit_node" {{EXITNODECHECK}} style="width:auto"> Internal exit node — share this device's internet with devices on my network
-    </label>
-    <div class="hint">Devices on your own network in Full VPN mode can send their internet traffic out through this one (shown to them with a green <b style="color:#3fb950">E</b>). Works on Linux, macOS, and Windows. Applies immediately.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="use_exit" {{USEEXITCHECK}} style="width:auto"> Full VPN — route all traffic via an exit node
-    </label>
-    <div class="hint">Sends ALL of this device's internet traffic through an internal exit node on your network (any Linux, macOS, or Windows device with internal exit node on). Encrypted device→exit; traffic reaches the internet from the exit's IP. Applies immediately.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="use_public_exits" {{USEPUBLICEXITSCHECK}} style="width:auto"> Use public exit nodes when my network has none
-    </label>
-    <div class="hint">When Full VPN is on and no internal exit node is reachable, send internet traffic through a <b>public exit node</b> — another APGO user sharing their connection. It is encrypted to that node, which then sees your traffic's destinations like any VPN provider would (use HTTPS). It never reaches your network or your LAN. Applies immediately.</div>
-
-    <label for="exit_peer">Exit node (blank = fastest)</label>
-    <input id="exit_peer" name="exit_peer" type="text" value="{{EXITPEER}}" spellcheck="false" autocapitalize="off" placeholder="auto — fastest exit">
-    <div class="hint">Leave blank to auto-pick the fastest reachable internal exit (re-probed every ~5 min, switches if it goes down). Or pin ONE node — by overlay IP (e.g. 10.22.55.7), device name, or key fingerprint — to always go out there; traffic pauses rather than re-routing if it's offline. Type <b>public</b> to use public exit nodes only.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="ipv6" {{IPV6CHECK}} style="width:auto"> IPv6 dual-stack transport
-    </label>
-    <div class="hint">Connects directly over IPv6 where available (no NAT) — fixes hotspot/CGNAT reachability. The overlay stays IPv4. Applies on reconnect.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="dht" {{DHTCHECK}} style="width:auto"> Find peers through the BitTorrent DHT
-    </label>
-    <div class="hint">A second way to find your own nodes, independent of the tracker list — useful when trackers are blocked, rate-limited, or simply down. The DHT only ever carries endpoint addresses; it never sees traffic, and joining still requires your network's pre-shared key. Applies on reconnect.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="use_public_relays" {{USERELAYSCHECK}} style="width:auto"> Use public relays when a direct path fails
-    </label>
-    <div class="hint">Last-resort reachability: when two of your devices cannot punch through their NATs, they meet through a volunteer relay found in the DHT. The relay forwards ciphertext only — it holds no key and can read nothing. Applies on reconnect.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" name="public_relay" {{PUBLICRELAYCHECK}} style="width:auto"> Be a public relay for others
-    </label>
-    <div class="hint">Offers this device as one of those volunteer relays, for anyone — not just your own network. It carries opaque encrypted traffic for strangers and uses your bandwidth; the dashboard's node settings can cap the rate and set a monthly quota. Worth enabling only on a machine with a good connection that stays online. Applies on reconnect.</div>
-
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;text-transform:none;letter-spacing:0">
-      <input type="checkbox" id="public_exit" name="public_exit" {{PUBLICEXITCHECK}} style="width:auto"> Public exit node — share this device's internet with any APGO user
-    </label>
-    <div class="hint" id="public_exit_hint">Lets <b>anyone</b> running APGO use this connection for their internet traffic (Full VPN). They reach the <b>internet only</b>: your network, your LAN and this device itself stay blocked, outbound mail (port 25) is blocked, and every client is rate-limited. <b>Their traffic leaves from your IP address</b> — only enable this if you accept that. Requires <i>Find peers through the BitTorrent DHT</i> and <i>Be a public relay for others</i>.</div>
-    <div id="public_exit_limits" style="margin-left:24px">
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <div style="flex:1;min-width:120px"><label for="public_exit_up">Upload limit</label><input id="public_exit_up" name="public_exit_up" type="text" value="{{PXUP}}" placeholder="e.g. 20mbit" spellcheck="false"></div>
-        <div style="flex:1;min-width:120px"><label for="public_exit_down">Download limit</label><input id="public_exit_down" name="public_exit_down" type="text" value="{{PXDOWN}}" placeholder="e.g. 50mbit" spellcheck="false"></div>
+  <form method="POST" autocomplete="off" id="settingsForm">
+    <div class="top">
+      <div class="titlerow">
+        <h1>Settings</h1>
+        <a class="backtop" href="/">← Dashboard</a>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <div style="flex:1;min-width:120px"><label for="public_exit_quota">Monthly quota</label><input id="public_exit_quota" name="public_exit_quota" type="text" value="{{PXQUOTA}}" placeholder="e.g. 200GB" spellcheck="false"></div>
-        <div style="flex:1;min-width:120px"><label for="public_exit_max_clients">Max people at once</label><input id="public_exit_max_clients" name="public_exit_max_clients" type="number" min="1" max="1024" value="{{PXMAX}}" placeholder="16"></div>
-        <div style="flex:1;min-width:120px"><label for="public_exit_per_client">Per person</label><input id="public_exit_per_client" name="public_exit_per_client" type="text" value="{{PXPER}}" placeholder="10mbit" spellcheck="false"></div>
+      <div class="tabs" role="tablist" aria-label="Settings sections">
+        <button type="button" class="tab" role="tab" id="tab-device" aria-controls="pane-device" aria-selected="true">This device</button>
+        <button type="button" class="tab" role="tab" id="tab-network" aria-controls="pane-network" aria-selected="false" tabindex="-1">Network</button>
+        <button type="button" class="tab" role="tab" id="tab-discovery" aria-controls="pane-discovery" aria-selected="false" tabindex="-1">Discovery &amp; relays</button>
+        <button type="button" class="tab" role="tab" id="tab-sharing" aria-controls="pane-sharing" aria-selected="false" tabindex="-1">Sharing</button>
+        <button type="button" class="tab" role="tab" id="tab-admin" aria-controls="pane-admin" aria-selected="false" tabindex="-1">Admin &amp; login</button>
       </div>
-      <div class="hint">Separate from the relay and internal exit budgets. Blank = unlimited (per person defaults to 10 Mbit/s). Applies immediately once the DHT and public relay are running.</div>
     </div>
-    <script>
+
+    <!-- ===== This device ===== -->
+    <section role="tabpanel" id="pane-device" aria-labelledby="tab-device">
+      <p class="sub">Settings for this computer only.</p>
+
+      <label for="friendly_name">Device name</label>
+      <input id="friendly_name" name="friendly_name" type="text" value="{{FRIENDLY}}" spellcheck="false" autocapitalize="off" placeholder="e.g. austin-macbook">
+      <div class="hint">Shown next to this device in every dashboard.</div>
+
+      <label for="last_octet">Overlay IP</label>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="ipprefix" style="color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:nowrap">10.22.55.</span>
+        <input id="last_octet" name="last_octet" type="text" inputmode="numeric" maxlength="3" value="{{LASTOCTET}}" style="max-width:96px" spellcheck="false" placeholder="auto">
+      </div>
+      <div class="hint">Just the last number (1–254). Blank = assigned automatically (recommended). To make an address permanent, assign it to this device in the dashboard's node settings.</div>
+
+      <label for="port">UDP listen port</label>
+      <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535" placeholder="automatic">
+      <div class="hint">Blank = automatic. An automatic port is stable and unique to this device, so several devices behind one router never compete for the same port.</div>
+
+      <label class="check"><input type="checkbox" name="ipv6" {{IPV6CHECK}}> IPv6 transport</label>
+      <div class="hint">Connect directly over IPv6 where this computer has a public IPv6 address — no NAT in the way. The overlay itself stays IPv4. Applies on reconnect.</div>
+
+      <div class="callout">Full VPN and the choice of exit node are on the <a href="/">dashboard's main page</a>.</div>
+    </section>
+
+    <!-- ===== Network ===== -->
+    <section role="tabpanel" id="pane-network" aria-labelledby="tab-network" hidden>
+      <p class="sub">These must be the same on every device in the network.</p>
+
+      <label for="network_name">Network name</label>
+      <input id="network_name" name="network_name" type="text" value="{{NETWORK}}" spellcheck="false" autocapitalize="off">
+
+      <label for="psk">Pre-shared key</label>
+      <div class="pskrow">
+        <input id="psk" name="psk" type="password" value="{{PSK}}" spellcheck="false" autocapitalize="off">
+        <button type="button" class="toggle" onclick="var p=document.getElementById('psk');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'">Show</button>
+      </div>
+      <button type="button" class="genbtn" onclick="var b=new Uint8Array(32);crypto.getRandomValues(b);document.getElementById('psk').value='base64:'+btoa(String.fromCharCode.apply(null,b))">Generate a random key</button>
+      <div class="hint">Generate one, or paste the key your other devices use.</div>
+
+      <label for="overlay_cidr">Overlay subnet</label>
+      <input id="overlay_cidr" name="overlay_cidr" type="text" value="{{CIDR}}" spellcheck="false" placeholder="10.22.55.0/24">
+
+      <h2>Rendezvous servers</h2>
+      <label for="rendezvous">Server URLs (optional)</label>
+      <input id="rendezvous" name="rendezvous" type="text" value="{{RENDEZVOUS}}" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">
+      <div class="hint">For networks that block BitTorrent trackers. Comma-separated. Blank = trackers only.</div>
+      <div class="grid2">
+        <div><label for="rendezvous_user">Username or token</label>
+          <input id="rendezvous_user" name="rendezvous_user" type="text" value="{{RVUSER}}" spellcheck="false" autocapitalize="off" placeholder="blank if open"></div>
+        <div><label for="rendezvous_pass">Password</label>
+          <input id="rendezvous_pass" name="rendezvous_pass" type="password" value="{{RVPASS}}" placeholder="blank if using a token"></div>
+      </div>
+      <div class="hint">Username <b>and</b> password for HTTP Basic, or just a token in the first box. Included in the Join QR code, so phones that scan it need no typing.</div>
+
+      <h2>Network-wide policy</h2>
+      <div class="links">
+        <a href="/network">Security policy &amp; identity rotation →</a>
+        <a href="/trackers">Tracker list →</a>
+      </div>
+      <div class="hint">Settings for other devices (relay, exit, IPv6, name and address) are in each node's <b>Settings…</b> sheet on the dashboard.</div>
+    </section>
+
+    <!-- ===== Discovery & relays ===== -->
+    <section role="tabpanel" id="pane-discovery" aria-labelledby="tab-discovery" hidden>
+      <p class="sub">How this device finds your other devices, and what it does when a direct connection fails.</p>
+
+      <label class="check"><input type="checkbox" name="dht" {{DHTCHECK}}> Find peers through the BitTorrent DHT</label>
+      <div class="hint">A second way to find your devices when trackers are blocked or down. The DHT only carries addresses; joining still needs your pre-shared key. Applies on reconnect.</div>
+
+      <label class="check"><input type="checkbox" name="use_public_relays" {{USERELAYSCHECK}}> Use public relays when a direct path fails</label>
+      <div class="hint">Last resort when two devices can't connect through their routers: they meet through a volunteer relay, which only forwards encrypted data it cannot read. Applies on reconnect.</div>
+    </section>
+
+    <!-- ===== Sharing ===== -->
+    <section role="tabpanel" id="pane-sharing" aria-labelledby="tab-sharing" hidden>
+      <p class="sub">What this device offers to others. Each uses this computer's bandwidth.</p>
+
+      <label class="check"><input type="checkbox" name="exit_node" {{EXITNODECHECK}}> Internal exit node</label>
+      <div class="hint">Lets devices on <b>your</b> network send their internet traffic out through this computer (they see it with a green <b style="color:#3fb950">E</b>). Applies immediately.</div>
+
+      <label class="check"><input type="checkbox" name="public_relay" {{PUBLICRELAYCHECK}}> Be a public relay</label>
+      <div class="hint">Forwards encrypted traffic for <b>anyone's</b> devices that can't connect directly. It can read nothing. Best on a machine with a good connection that stays online. Applies on reconnect.</div>
+
+      <label class="check"><input type="checkbox" id="public_exit" name="public_exit" {{PUBLICEXITCHECK}}> Public exit node</label>
+      <div class="hint" id="public_exit_hint">Lets <b>any</b> APGO user send internet traffic out through this computer. They reach the internet only — never your network, your LAN or this computer — and outbound mail is blocked. <b>Their traffic leaves from your IP address.</b> Needs <i>Find peers through the BitTorrent DHT</i> (Discovery tab) and <i>Be a public relay</i>.</div>
+      <div id="public_exit_limits" style="margin-left:24px">
+        <div class="grid2">
+          <div><label for="public_exit_up">Upload limit</label><input id="public_exit_up" name="public_exit_up" type="text" value="{{PXUP}}" placeholder="e.g. 20mbit" spellcheck="false"></div>
+          <div><label for="public_exit_down">Download limit</label><input id="public_exit_down" name="public_exit_down" type="text" value="{{PXDOWN}}" placeholder="e.g. 50mbit" spellcheck="false"></div>
+        </div>
+        <div class="grid2">
+          <div><label for="public_exit_quota">Monthly quota</label><input id="public_exit_quota" name="public_exit_quota" type="text" value="{{PXQUOTA}}" placeholder="e.g. 200GB" spellcheck="false"></div>
+          <div><label for="public_exit_max_clients">Max people at once</label><input id="public_exit_max_clients" name="public_exit_max_clients" type="number" min="1" max="1024" value="{{PXMAX}}" placeholder="16"></div>
+          <div><label for="public_exit_per_client">Per person</label><input id="public_exit_per_client" name="public_exit_per_client" type="text" value="{{PXPER}}" placeholder="10mbit" spellcheck="false"></div>
+        </div>
+        <div class="hint">Blank = unlimited (per person defaults to 10 Mbit/s). Separate from the relay and internal exit budgets.</div>
+      </div>
+    </section>
+
+    <!-- ===== Admin & login ===== -->
+    <section role="tabpanel" id="pane-admin" aria-labelledby="tab-admin" hidden>
+      <h2 class="first">Network admin key</h2>
+      {{ADMINSECTION}}
+
+      {{DASHSECTION}}
+    </section>
+
+    <button class="save" type="submit">Save</button>
+    <div class="savenote">Saves every tab.</div>
+  </form>
+  <script>
     (function(){
+      // Tabs. All panes stay in ONE form so a single Save keeps every field;
+      // the tabs only show and hide them. The open tab is kept in the URL
+      // hash so a reload (or the redirect after an error) lands back on it.
+      var tabs=[].slice.call(document.querySelectorAll('[role=tab]'));
+      function show(id, focus){
+        tabs.forEach(function(t){
+          var on = t.id === id;
+          t.setAttribute('aria-selected', on ? 'true' : 'false');
+          t.tabIndex = on ? 0 : -1;
+          document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+          if (on && focus) t.focus();
+        });
+        try { history.replaceState(null, '', '#' + id.replace('tab-','')); } catch(e) {}
+      }
+      tabs.forEach(function(t, i){
+        t.addEventListener('click', function(){ show(t.id); });
+        t.addEventListener('keydown', function(e){
+          var n = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+          if (e.key === 'Home') { show(tabs[0].id, true); e.preventDefault(); }
+          else if (e.key === 'End') { show(tabs[tabs.length-1].id, true); e.preventDefault(); }
+          else if (n) { show(tabs[(i + n + tabs.length) % tabs.length].id, true); e.preventDefault(); }
+        });
+      });
+      var h = (location.hash || '').slice(1);
+      if (h && document.getElementById('tab-' + h)) show('tab-' + h);
+      // A field that fails validation on a hidden tab would block Save with
+      // no visible reason: switch to its tab so the browser can point at it.
+      document.getElementById('settingsForm').addEventListener('invalid', function(e){
+        var pane = e.target.closest('[role=tabpanel]');
+        if (pane && pane.hidden) show(pane.getAttribute('aria-labelledby'));
+      }, true);
+
+      // Overlay IP prefix follows the subnet (Network tab).
+      var cidr=document.getElementById('overlay_cidr'), pre=document.getElementById('ipprefix'), oct=document.getElementById('last_octet');
+      function upd(){ var p=((cidr.value||'10.22.55.0/24').split('/')[0]).split('.'); pre.textContent = p.length>=3 ? (p[0]+'.'+p[1]+'.'+p[2]+'.') : ''; }
+      cidr.addEventListener('input', upd);
+      oct.addEventListener('input', function(){ this.value=this.value.replace(/[^0-9]/g,'').slice(0,3); });
+      upd();
+
+      // Public exit needs the DHT and the public relay.
       var px=document.getElementById('public_exit'), lim=document.getElementById('public_exit_limits'), hint=document.getElementById('public_exit_hint');
       var dht=document.querySelector('input[name=dht]'), pr=document.querySelector('input[name=public_relay]');
       function sync(){
@@ -525,42 +606,6 @@ const settingsTmpl = `<!DOCTYPE html>
       }
       [px,dht,pr].forEach(function(e){ e.addEventListener('change', sync); });
       sync();
-    })();
-    </script>
-
-    <label for="port">UDP listen port</label>
-    <input id="port" name="port" type="number" value="{{PORT}}" min="1" max="65535" placeholder="automatic">
-    <div class="hint">Leave blank for automatic. A port picked automatically is stable for this device and unique to it, so several nodes behind one router never contend for the same external port &mdash; which is what makes a node reachable from outside without a port forward.</div>
-
-    <label for="rendezvous">Discovery (rendezvous) servers (optional)</label>
-    <input id="rendezvous" name="rendezvous" type="text" value="{{RENDEZVOUS}}" spellcheck="false" autocapitalize="off" placeholder="https://rv.example.com">
-    <div class="hint">For networks that block BitTorrent. Comma-separated HTTP(S) rendezvous URLs (see rendezvous/). Leave blank to use trackers.</div>
-
-    <label for="rendezvous_user">Rendezvous username or token (optional)</label>
-    <input id="rendezvous_user" name="rendezvous_user" type="text" value="{{RVUSER}}" spellcheck="false" autocapitalize="off" placeholder="leave blank if the server is open">
-    <label for="rendezvous_pass">Rendezvous password</label>
-    <input id="rendezvous_pass" name="rendezvous_pass" type="password" value="{{RVPASS}}" placeholder="blank if using a token">
-    <div class="hint">Only needed if your rendezvous server requires a credential. Enter a username <b>and</b> password (HTTP Basic), or just a token in the first box (Bearer). These are included in the Join QR, so phones that scan it get discovery working with no typing.</div>
-
-    {{ADMINSECTION}}
-
-    {{DASHSECTION}}
-
-    <button class="save" type="submit">Save</button>
-
-    <div style="border-top:1px solid var(--line);margin-top:22px;padding-top:16px">
-      <div class="hint" style="margin-bottom:8px">More:</div>
-      <a href="/network" style="color:var(--fg)">Security policy &amp; identity rotation →</a><br>
-      <a href="/trackers" style="color:var(--fg)">Trackers →</a><br>
-    </div>
-  </form>
-  <script>
-    (function(){
-      var cidr=document.getElementById('overlay_cidr'), pre=document.getElementById('ipprefix'), oct=document.getElementById('last_octet');
-      function upd(){ var p=((cidr.value||'10.22.55.0/24').split('/')[0]).split('.'); pre.textContent = p.length>=3 ? (p[0]+'.'+p[1]+'.'+p[2]+'.') : ''; }
-      cidr.addEventListener('input', upd);
-      oct.addEventListener('input', function(){ this.value=this.value.replace(/[^0-9]/g,'').slice(0,3); });
-      upd();
     })();
   </script>
 </body></html>`

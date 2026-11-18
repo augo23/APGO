@@ -1,0 +1,1 @@
+Private encrypted peer-to-peer network: no server, no VPN provider, no ports.

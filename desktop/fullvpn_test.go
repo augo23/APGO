@@ -30,7 +30,7 @@ func (f *fakeClient) got() []string {
 
 func startFakeClient(t *testing.T, status int, exits string) *fakeClient {
 	t.Helper()
-	_ = os.Remove(controlSocket())
+	isolateControlSocket(t)
 	ln, err := net.Listen("unix", controlSocket())
 	if err != nil {
 		t.Fatal(err)

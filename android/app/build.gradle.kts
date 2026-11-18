@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -7,8 +9,18 @@ plugins {
 // which in turn gets it from build-release.sh (i.e. from the newest git tag).
 // A bare `./gradlew assembleDebug` has no release to name, so it falls back to
 // the same 1.0.0 the rest of the toolchain uses before any tag exists.
+//
+// Second source: app/version.properties (versionName=X.Y.Z). It is not in the
+// private repo; push-github.sh writes it into the PUBLIC snapshot of each
+// release, because F-Droid builds from that snapshot with plain Gradle and
+// reads the version from it (see fdroid/org.apgo.app.yml).
+val apgoVersionFile: String? = file("version.properties").takeIf { it.isFile }?.let { f ->
+    Properties().apply { f.inputStream().use { load(it) } }
+        .getProperty("versionName")?.trim()?.takeIf { it.isNotBlank() }
+}
 val apgoVersion: String =
-    (findProperty("apgoVersion") as String?)?.takeIf { it.isNotBlank() } ?: "1.0.0"
+    (findProperty("apgoVersion") as String?)?.takeIf { it.isNotBlank() }
+        ?: apgoVersionFile ?: "1.0.0"
 // Tolerant of junk on purpose: a malformed version should still produce an APK
 // rather than failing the last step of a long release build.
 val apgoParts: List<Int> = apgoVersion.split(".").map { it.toIntOrNull() ?: 0 }
@@ -31,6 +43,15 @@ android {
             apgoParts.getOrElse(1) { 0 } * 100 +
             apgoParts.getOrElse(2) { 0 }
         versionName = apgoVersion
+    }
+
+    // Two builds from one source tree:
+    //   play   — Google Play: donations through Google Play Billing.
+    //   fdroid — F-Droid: no proprietary libraries; donation links only.
+    flavorDimensions += "store"
+    productFlavors {
+        create("play") { dimension = "store" }
+        create("fdroid") { dimension = "store" }
     }
 
     buildTypes {
@@ -67,6 +88,23 @@ dependencyLocking {
     lockAllConfigurations()
 }
 
+// Netty is not part of the app: it comes in only through the Android Gradle
+// Plugin's own test-device tooling (the _internal-unified-test-platform-*
+// configurations, via grpc-netty), which runs on the build machine and never
+// ships in an APK. AGP pins 4.1.93.Final, which carries known CVEs (request
+// smuggling, hostname-verification and DoS issues), so raise every netty
+// module together -- they must stay on one version -- to the patched 4.1 line.
+// netty 4.1.x is API-compatible within the line, so grpc-netty keeps working.
+val nettyVersion = "4.1.137.Final"
+configurations.configureEach {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "io.netty" && requested.name.startsWith("netty-")) {
+            useVersion(nettyVersion)
+            because("CVE fixes; netty is build tooling only (AGP test platform)")
+        }
+    }
+}
+
 dependencies {
     // The gomobile-built overlay core (app/libs/overlaymobile.aar), resolved via
     // the flatDir repo declared in settings.gradle.kts.
@@ -85,7 +123,7 @@ dependencies {
     implementation("androidx.fragment:fragment-ktx:1.8.4")
 
     // Google Play Billing for in-app gifts to the project.
-    implementation("com.android.billingclient:billing-ktx:7.1.1")
+    "playImplementation"("com.android.billingclient:billing-ktx:7.1.1")
 
     // ZXing embedded QR scanner (Scan QR to join).
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")

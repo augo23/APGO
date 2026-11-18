@@ -1,0 +1,54 @@
+# F-Droid build recipe for APGO. This file is the one to submit to
+# https://gitlab.com/fdroid/fdroiddata as metadata/org.apgo.app.yml
+# (see docs/fdroid.md). It builds the "fdroid" flavour: no Google Play Billing,
+# no proprietary libraries.
+Categories:
+  - Connectivity
+  - Internet
+License: GPL-3.0-or-later
+AuthorName: APGO
+WebSite: https://www.apgoverlay.com
+SourceCode: https://github.com/augo23/APGO
+IssueTracker: https://github.com/augo23/APGO/issues
+Donate: https://github.com/sponsors/augo23
+
+AutoName: APGO
+
+RepoType: git
+Repo: https://github.com/augo23/APGO.git
+
+Builds:
+  - versionName: 1.0.17
+    versionCode: 10017
+    commit: v1.0.17
+    subdir: android/app
+    sudo:
+      - apt-get update
+      - apt-get install -y curl
+      - curl -fsSL -o /tmp/go.tgz https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+      - echo '9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec  /tmp/go.tgz'
+        | sha256sum -c -
+      - rm -rf /usr/local/go
+      - tar -C /usr/local -xzf /tmp/go.tgz
+    gradle:
+      - fdroid
+    ndk: r26d
+    # The Go overlay core is compiled to app/libs/overlaymobile.aar here, in
+    # `build` rather than `prebuild`, so the source scan (which runs after
+    # prebuild) sees only source. gomobile is installed at the exact x/mobile
+    # version ios/core/go.mod pins.
+    build:
+      - export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH GOTOOLCHAIN=local
+      - export ANDROID_HOME=$$SDK$$ ANDROID_NDK_HOME=$$NDK$$
+      - cd ../../ios/core
+      - go install golang.org/x/mobile/cmd/gomobile@$(go list -m -f '{{.Version}}' golang.org/x/mobile)
+      - gomobile init
+      - bash ../../android/build-aar.sh
+
+AutoUpdateMode: Version
+# New releases are found by tag on the GitHub mirror; push-github.sh tags each
+# release snapshot and writes android/app/version.properties into it.
+UpdateCheckMode: Tags ^v[0-9]+\.[0-9]+\.[0-9]+$
+UpdateCheckData: android/app/version.properties|versionCode=(\d+)|.|versionName=(.+)
+CurrentVersion: 1.0.17
+CurrentVersionCode: 10017

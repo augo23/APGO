@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -120,7 +121,25 @@ func saveNodeRendezvous(servers []string, auth string) error {
 
 var nodeSettingsMu sync.Mutex
 
-func nodeSettingsPath() string { return os.Getenv("NODE_SETTINGS_FILE") }
+// nodeSettingsPath is where the per-node overrides live. NODE_SETTINGS_FILE
+// when set; otherwise node-settings.json beside the signed node-config file
+// (NODE_CONFIG_FILE, default /state/nodeconfig.json), when that directory
+// exists.
+//
+// The fallback matters. Without it, a node started without NODE_SETTINGS_FILE
+// (a hand-run podman container, say) accepted an admin's IPv6 or rendezvous
+// change, verified it, and then failed to store it with "invalid argument" --
+// so the dashboard said the change was sent and nothing ever happened.
+func nodeSettingsPath() string {
+	if p := os.Getenv("NODE_SETTINGS_FILE"); p != "" {
+		return p
+	}
+	dir := filepath.Dir(nodeConfigFilePath())
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		return filepath.Join(dir, "node-settings.json")
+	}
+	return ""
+}
 
 // loadNodeSettings reads the persisted overrides, if any.
 func loadNodeSettings() nodeSettings {

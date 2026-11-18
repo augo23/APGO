@@ -31,7 +31,7 @@ const sysDirPath = "/Library/Application Support/APGO"
 
 func sysDir() string          { return sysDirPath }
 func sysBinDir() string       { return filepath.Join(sysDir(), "bin") }
-func controlSocket() string   { return filepath.Join(sysDir(), "control.sock") }
+func defaultControlSocket() string { return filepath.Join(sysDir(), "control.sock") }
 func logPath() string         { return filepath.Join(sysDir(), "overlay-client.log") }
 func pidPath() string         { return filepath.Join(sysDir(), "client.pid") }
 func installedClient() string { return filepath.Join(sysBinDir(), clientExeName) }

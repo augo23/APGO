@@ -338,7 +338,7 @@ bash android/build-apk.sh    # installs every prerequisite, then builds a debug 
 bash android/build-aar.sh    # just the Go core → app/libs/overlaymobile.aar
 ```
 
-Output: `android/app/build/outputs/apk/debug/app-debug.apk`. `APGO_VERSION=`
+Output: `android/app/build/outputs/apk/play/debug/app-play-debug.apk`. `APGO_VERSION=`
 names the build (`build-release.sh` sets it from the newest git tag).
 
 ### iOS

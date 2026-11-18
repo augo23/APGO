@@ -5,8 +5,12 @@
 # assembles a debug APK. Works on macOS (Homebrew) and Debian/Ubuntu (apt).
 # Re-runnable: each step is skipped if already satisfied.
 #
-# Output: app/build/outputs/apk/debug/app-debug.apk
+# Output: app/build/outputs/apk/<flavor>/debug/app-<flavor>-debug.apk
+# APGO_FLAVOR=play (default, Google Play Billing) or fdroid (no proprietary libs).
 set -euo pipefail
+APGO_FLAVOR="${APGO_FLAVOR:-play}"
+case "$APGO_FLAVOR" in play|fdroid) ;; *) echo "APGO_FLAVOR must be play or fdroid" >&2; exit 1 ;; esac
+APGO_FLAVOR_CAP="$(printf %s "${APGO_FLAVOR:0:1}" | tr a-z A-Z)${APGO_FLAVOR:1}"
 
 say()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -113,8 +117,8 @@ else
 fi
 
 say "Assembling debug APK (version $APGO_VERSION)…"
-$GRADLE -PapgoVersion="$APGO_VERSION" :app:assembleDebug
+$GRADLE -PapgoVersion="$APGO_VERSION" :app:assemble${APGO_FLAVOR_CAP}Debug
 
-APK="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+APK="$ANDROID_DIR/app/build/outputs/apk/$APGO_FLAVOR/debug/app-$APGO_FLAVOR-debug.apk"
 say "Done. APK: $APK"
 echo "Install on a device with:  adb install -r \"$APK\""

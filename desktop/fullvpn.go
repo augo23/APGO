@@ -208,3 +208,99 @@ func applyPublicExitLive(c mConfig) string {
 		return "This computer is no longer a public exit node."
 	}
 }
+
+// handlePanelFullVPN backs the Full VPN panel on the dashboard's main page.
+//
+//	GET  -> {"use_exit", "exit_peer", "use_public_exits", "connected", "live"}
+//	        where "live" is the running client's /api/exits answer (the exit
+//	        list with latency, reachability and which one carries traffic),
+//	        or null while disconnected.
+//	POST {"use_exit"?, "exit_peer"?, "use_public_exits"?} -> {"ok", "note"}
+//	        saves the choice to this computer's config (so it survives a
+//	        restart) and applies it to the running client at once.
+//
+// exit_peer is "" for the fastest exit, a node (key fingerprint, overlay IP
+// or name) to pin, or "public" for public exit nodes only. The panel pins by
+// key fingerprint: an overlay IP can be reassigned to a different node, a
+// key cannot.
+func handlePanelFullVPN(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		c := loadConfig()
+		out := map[string]any{
+			"use_exit":         c.UseExit,
+			"exit_peer":        c.ExitPeer,
+			"use_public_exits": c.UsePublicExits,
+			"connected":        false,
+			"live":             nil,
+		}
+		if code, resp, err := ctlDo("GET", "/api/exits", nil); err == nil && code == http.StatusOK {
+			var live map[string]any
+			if json.Unmarshal(resp, &live) == nil {
+				out["connected"] = true
+				out["live"] = live
+			}
+		}
+		writeJSON(w, out)
+	case http.MethodPost:
+		if r.Header.Get("X-Requested-With") == "" {
+			http.Error(w, "missing X-Requested-With header", http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			UseExit        *bool   `json:"use_exit"`
+			ExitPeer       *string `json:"exit_peer"`
+			UsePublicExits *bool   `json:"use_public_exits"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		if json.Unmarshal(body, &req) != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		c := loadConfig()
+		if c.NetworkName == "" {
+			http.Error(w, "set up a network in Settings first", http.StatusBadRequest)
+			return
+		}
+		prevOn, prevPeer, prevPub := c.UseExit, c.ExitPeer, c.UsePublicExits
+		if req.UseExit != nil {
+			c.UseExit = *req.UseExit
+		}
+		if req.ExitPeer != nil {
+			p := strings.TrimSpace(*req.ExitPeer)
+			if len(p) > 128 || strings.ContainsAny(p, "\r\n\x00") {
+				http.Error(w, "invalid exit node", http.StatusBadRequest)
+				return
+			}
+			c.ExitPeer = p
+		}
+		if req.UsePublicExits != nil {
+			c.UsePublicExits = *req.UsePublicExits
+		}
+		if err := saveConfig(c); err != nil {
+			http.Error(w, "save: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		registerCurrentProfileUI()
+
+		var notes []string
+		// Public-exit permission first: turning Full VPN on with "public only"
+		// must not start before the client is allowed to use public exits.
+		if c.UsePublicExits != prevPub || usePublicDiffers(c.UsePublicExits) {
+			if n := applyUsePublicExitsLive(c.UsePublicExits); n != "" {
+				notes = append(notes, n)
+			}
+		}
+		if fullVPNDiffers(c.UseExit, c.ExitPeer, prevOn, prevPeer) {
+			if n := applyFullVPNLive(c.UseExit, c.ExitPeer); n != "" {
+				notes = append(notes, n)
+			}
+		}
+		if c.UseExit && (c.ExitNode || c.PublicExit) {
+			notes = append(notes, "While Full VPN is on, this computer can't reliably be an exit for other devices.")
+		}
+		writeJSON(w, map[string]any{"ok": true, "note": strings.Join(notes, " ")})
+	default:
+		http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+	}
+}

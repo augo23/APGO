@@ -119,6 +119,36 @@
     padding:9px 18px; font-size:14px; font-weight:600; cursor:pointer}
   .modal .ghost{background:transparent; color:var(--fg); border:1px solid var(--line);
     border-radius:9px; padding:9px 16px; font-size:14px; cursor:pointer}
+  /* Full VPN panel (main page). */
+  .vpn{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:22px}
+  .vpn-head{display:flex; align-items:center; gap:14px}
+  .vpn-head .grow{flex:1; min-width:0}
+  .vpn-head .t{font-size:15px; font-weight:600}
+  .vpn-head .s{color:var(--muted); font-size:12.5px}
+  .switch{position:relative; display:inline-block; width:46px; height:26px; flex:none}
+  .switch input{position:absolute; opacity:0; width:100%; height:100%; margin:0; cursor:pointer; z-index:1}
+  .switch span{position:absolute; inset:0; background:var(--chip); border:1px solid var(--line); border-radius:26px; transition:background .15s}
+  .switch span::before{content:""; position:absolute; width:20px; height:20px; left:2px; top:2px; background:var(--muted); border-radius:50%; transition:transform .15s}
+  .switch input:checked + span{background:#3fb950; border-color:#3fb950}
+  .switch input:checked + span::before{transform:translateX(20px); background:#fff}
+  .switch input:focus-visible + span{outline:2px solid var(--accent); outline-offset:2px}
+  .switch input:disabled{cursor:wait}
+  .vpn-modes{display:flex; gap:10px; flex-wrap:wrap; margin:14px 0 12px}
+  .vpn-modes label{flex:1 1 200px; border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer;
+    display:flex; gap:9px; align-items:flex-start; font-size:13.5px}
+  .vpn-modes label.on{border-color:var(--accent)}
+  .vpn-modes input{margin-top:3px}
+  .vpn-modes .lc{display:block; color:var(--muted); font-size:12px; margin-top:2px}
+  .vpn .panel{border-radius:10px}
+  .vpn th,.vpn td{padding:9px 12px}
+  .vpn tr.pick{cursor:pointer}
+  .vpn tr.pick:hover{background:rgba(127,127,127,.08)}
+  .vpn tr.pick.dis{cursor:default}
+  .vpn tr.pick.dis:hover{background:transparent}
+  .vpn .st-on{color:var(--ok)} .vpn .st-off{color:var(--muted)}
+  .vpn-foot{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; font-size:13px}
+  .vpn-foot label{display:flex; align-items:center; gap:8px; cursor:pointer}
+  .vpn .vmsg{color:var(--muted); font-size:12.5px; margin-top:8px; min-height:16px}
   details.sect{margin:26px 0 12px}
   details.sect > summary{font-size:13px; text-transform:uppercase; letter-spacing:.7px;
     color:var(--muted); cursor:pointer; list-style:none; user-select:none; margin-bottom:12px}
@@ -230,6 +260,39 @@
       <div class="card"><div class="k">Security</div><div class="v" id="cSecurity">—</div></div>
       <div class="card"><div class="k">NAT</div><div class="v" id="cNat" title="How this router allocates external ports. A symmetric NAT cannot be hole-punched by peers that are themselves behind NAT — they fall back to relaying.">—</div></div>
     </div>
+
+    <!-- Full VPN: send this device's internet traffic through an exit node,
+         and choose which one. Lives here rather than in Settings because it
+         is something people switch on and off, and the exit list is live. -->
+    <section class="vpn" id="vpnSect" aria-labelledby="vpnTitle">
+      <div class="vpn-head">
+        <div class="grow">
+          <div class="t" id="vpnTitle">Full VPN</div>
+          <div class="s" id="vpnSub">Send all of this device's internet traffic through an exit node on your network.</div>
+        </div>
+        <label class="switch" title="Full VPN on/off"><input type="checkbox" id="vpnOn" aria-labelledby="vpnTitle"><span></span></label>
+      </div>
+      <div id="vpnBody" hidden>
+        <div class="vpn-modes" role="radiogroup" aria-label="Which exit to use">
+          <label id="vpnModeAutoL"><input type="radio" name="vpnMode" value="auto">
+            <span><b>Fastest exit</b><span class="lc">Uses the quickest reachable exit and moves to another if it goes down.</span></span></label>
+          <label id="vpnModePinL"><input type="radio" name="vpnMode" value="pin">
+            <span><b>Pin one exit node</b><span class="lc">Always leaves through the node you pick. Internet pauses if it goes offline.</span></span></label>
+          <label id="vpnModePubL"><input type="radio" name="vpnMode" value="public">
+            <span><b>Public exits only</b><span class="lc">Another APGO user's shared connection. They can see which sites you reach.</span></span></label>
+        </div>
+        <div class="panel scroll">
+          <table>
+            <thead><tr><th style="width:28px"></th><th>Exit node</th><th>Overlay IP</th><th class="num">Latency</th><th>Status</th></tr></thead>
+            <tbody id="vpnRows"><tr><td class="empty" colspan="5">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="vpn-foot">
+          <label><input type="checkbox" id="vpnPublic"> Use public exit nodes when my network has none</label>
+        </div>
+      </div>
+      <div class="vmsg" id="vpnMsg" role="status" aria-live="polite"></div>
+    </section>
 
     <details class="sect" open id="nodesSect">
       <summary>Connected nodes<span class="cnt" id="nodesCnt"></span></summary>
@@ -345,6 +408,14 @@
         <em>Adds an ML-KEM layer under the existing handshake, so traffic captured
         today cannot be decrypted later by a quantum computer. Costs a little
         handshake time. Both ends must have it on.</em></span>
+      </label>
+
+      <label class="cfgrow">
+        <input type="checkbox" id="cfgIpv6">
+        <span><strong>IPv6 transport</strong>
+        <em>Use IPv6 for overlay traffic when the node has a public IPv6 address &mdash;
+        no NAT, so peers usually connect directly. Takes effect when that node next
+        restarts. <span id="cfgIpv6Note"></span></em></span>
       </label>
 
       <label class="cfgrow">
@@ -475,6 +546,8 @@
       <div class="msg" id="cfgMsg"></div>
       <div class="modal-actions wrapact">
         <button class="ghost" id="cfgCancel" type="button">Cancel</button>
+        <button class="edit-btn" id="cfgRefresh" type="button"
+          title="Forget relay decisions and retry back-offs, re-check the NAT and re-dial every peer. Live connections stay up.">Refresh routes&hellip;</button>
         <button class="primary" id="cfgApply" type="button">Apply&hellip;</button>
       </div>
     </div>
@@ -955,7 +1028,7 @@ async function loadInfo(){
       exSt.textContent = "⚠ Full VPN is on but no exit node is reachable — this device's internet is paused. " +
         "Turn on \"Internal exit node\" on a Linux, macOS, or Windows node of this network (it shows a green E)" +
         (pc.allowed ? (pc.searching ? ", or wait — looking for a public exit node now." : ".")
-                    : ", allow public exit nodes in Settings, or turn Full VPN off.");
+                    : ", allow public exit nodes in the Full VPN panel below, or turn Full VPN off.");
     } else {
       exSt.style.display = "none";
     }
@@ -1733,9 +1806,111 @@ document.getElementById("netApply").addEventListener("click", async ()=>{
   }catch(err){ msg.textContent = "Error: "+err; }
 });
 
+/* ---- Full VPN panel ---------------------------------------------------
+   GET /api/full-vpn gives the saved choice plus the running client's exit
+   list; POST saves and applies at once. exit_peer: "" = fastest, a key
+   fingerprint = pinned node, "public" = public exits only. */
+let vpnState = null, vpnBusy = false, vpnLocalPin = false;
+
+function vpnMode(){
+  const p = ((vpnState && vpnState.exit_peer) || "").trim();
+  if(p.toLowerCase() === "public") return "public";
+  return (p || vpnLocalPin) ? "pin" : "auto";
+}
+
+async function loadVPN(){
+  if(vpnBusy) return;
+  try{
+    const r = await fetch("/api/full-vpn", {headers:XRW});
+    if(!r.ok) return;
+    vpnState = await r.json();
+  }catch(e){ return; }
+  renderVPN();
+}
+
+function renderVPN(){
+  const j = vpnState; if(!j) return;
+  const on = !!j.use_exit, mode = vpnMode();
+  document.getElementById("vpnOn").checked = on;
+  document.getElementById("vpnBody").hidden = !on;
+  document.getElementById("vpnPublic").checked = !!j.use_public_exits;
+  for(const [v, id] of [["auto","vpnModeAutoL"],["pin","vpnModePinL"],["public","vpnModePubL"]]){
+    const l = document.getElementById(id);
+    l.classList.toggle("on", mode === v);
+    l.querySelector("input").checked = mode === v;
+  }
+  const live = j.live || {};
+  const exits = (live.exits || []).slice().sort((a,b) =>
+    (b.reachable - a.reachable) || ((a.rtt_ms < 0 ? 1e9 : a.rtt_ms) - (b.rtt_ms < 0 ? 1e9 : b.rtt_ms)));
+  const sub = document.getElementById("vpnSub");
+  const cur = exits.find(e => e.selected);
+  sub.textContent = !on ? "Send all of this device's internet traffic through an exit node on your network."
+    : cur ? "On — internet traffic leaves through " + (cur.name || cur.overlay_ip) + (cur.rtt_ms >= 0 ? " (" + cur.rtt_ms + " ms)." : ".")
+    : (live.public_exit && live.public_exit.active) ? "On — through a public exit node."
+    : "On — no exit is reachable right now, so this device's internet is paused.";
+  const tb = document.getElementById("vpnRows");
+  const pickable = mode === "pin";
+  if(!j.connected){
+    tb.innerHTML = '<tr><td class="empty" colspan="5">Connect to see this network\'s exit nodes. Your choice is saved and applies when you connect.</td></tr>';
+    return;
+  }
+  const rows = exits.map(e => {
+    const status = e.selected ? '<span class="st-on">● carrying traffic</span>'
+      : e.reachable ? '<span class="st-on">online</span>' : '<span class="st-off">offline</span>';
+    const pinned = pickable && e.pinned;
+    return `<tr class="pick${pickable ? "" : " dis"}" data-fp="${esc(e.key_fp)}">
+      <td><input type="radio" name="vpnExit" aria-label="Use ${esc(e.name || e.overlay_ip)}" ${pinned ? "checked" : ""} ${pickable ? "" : "disabled"}></td>
+      <td>${esc(e.name || "—")}${e.pinned ? ' <span class="exit-active">pinned</span>' : ""}</td>
+      <td class="mono">${esc(e.overlay_ip || "")}</td>
+      <td class="num">${e.rtt_ms >= 0 ? e.rtt_ms + " ms" : "—"}</td>
+      <td>${status}</td></tr>`;
+  });
+  const pin = (j.exit_peer || "").trim();
+  if(mode === "pin" && pin && !exits.some(e => e.pinned)){
+    rows.unshift(`<tr><td><input type="radio" checked disabled aria-label="Pinned node"></td>
+      <td colspan="3">${esc(pin)} <span class="exit-active">pinned</span></td>
+      <td><span class="st-off">not seen — internet paused until it is back</span></td></tr>`);
+  }
+  tb.innerHTML = rows.length ? rows.join("") :
+    '<tr><td class="empty" colspan="5">No exit nodes on this network yet. Turn on <b>Internal exit node</b> on a Linux, macOS or Windows device (Settings → This device).</td></tr>';
+}
+
+async function setVPN(patch){
+  const msg = document.getElementById("vpnMsg"), sw = document.getElementById("vpnOn");
+  vpnBusy = true; sw.disabled = true; msg.textContent = "Applying…";
+  try{
+    const r = await fetch("/api/full-vpn", {method:"POST",
+      headers:{...XRW, "Content-Type":"application/json"}, body: JSON.stringify(patch)});
+    if(r.ok){ const k = await r.json(); msg.textContent = k.note || "Saved."; }
+    else msg.textContent = "Could not apply: " + (await r.text());
+  }catch(e){ msg.textContent = "Could not apply: " + e; }
+  finally{ vpnBusy = false; sw.disabled = false; await loadVPN(); loadInfo(); }
+}
+
+document.getElementById("vpnOn").addEventListener("change", e => {
+  if(!e.target.checked) vpnLocalPin = false;
+  setVPN({use_exit: e.target.checked});
+});
+document.querySelectorAll('input[name="vpnMode"]').forEach(r => r.addEventListener("change", e => {
+  const v = e.target.value;
+  if(v === "auto"){ vpnLocalPin = false; setVPN({exit_peer: ""}); }
+  else if(v === "public"){ vpnLocalPin = false; setVPN({exit_peer: "public", use_public_exits: true}); }
+  else {
+    vpnLocalPin = true; renderVPN();
+    document.getElementById("vpnMsg").textContent = "Choose the exit node to pin.";
+  }
+}));
+document.getElementById("vpnRows").addEventListener("click", e => {
+  const tr = e.target.closest("tr.pick");
+  if(!tr || tr.classList.contains("dis") || !tr.dataset.fp || vpnMode() !== "pin") return;
+  vpnLocalPin = false;
+  setVPN({exit_peer: tr.dataset.fp});
+});
+document.getElementById("vpnPublic").addEventListener("change", e => setVPN({use_public_exits: e.target.checked}));
+
 async function tick(){
   try{
-    await Promise.all([loadInfo(), loadSessions(), loadRevocations(), loadLogs(), loadNetworks()]);
+    await Promise.all([loadInfo(), loadSessions(), loadRevocations(), loadLogs(), loadNetworks(), loadVPN()]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
     document.getElementById("status").classList.remove("stale");
   }catch(err){
@@ -1862,7 +2037,9 @@ async function openCfgModal(pubkey, label){
                    "cfgPubExitUp","cfgPubExitDown","cfgPubExitQuota","cfgPubExitMax"]){
     document.getElementById(id).value = "";
   }
-  for(const id of ["cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit","cfgPubExit",
+  cfgIpv6Was = null;
+  document.getElementById("cfgIpv6Note").textContent = "";
+  for(const id of ["cfgIpv6","cfgPq","cfgDht","cfgUseRelays","cfgPublicRelay","cfgExit","cfgPubExit",
                    "cfgSocks","cfgSocksOverlayOnly"]){
     document.getElementById(id).checked = false;
   }
@@ -1924,6 +2101,17 @@ async function openCfgModal(pubkey, label){
         : pxl.prerequisite && pxl.enabled ? ("Paused: " + pxl.prerequisite)
         : pxl.enabled ? ("Running now — " + (pxl.clients||0) + " user(s) connected.") : "";
     }
+    /* IPv6: null means nobody has set it for that node and it is not this
+       node, so its real state is unknown. Show the box unticked and send it
+       only if the admin actually ticks it -- sending an unchanged value would
+       sign a v3 record that older nodes cannot verify and would then ignore
+       entirely. */
+    if(d.ipv6 === true || d.ipv6 === false){
+      document.getElementById("cfgIpv6").checked = d.ipv6;
+      cfgIpv6Was = d.ipv6;
+    } else {
+      document.getElementById("cfgIpv6Note").textContent = "(current setting unknown — only sent if you change it)";
+    }
     document.getElementById("cfgRelayList").value  = (d.trackers||[]).join("\n");
     document.getElementById("cfgTrackersOn").checked = d.trackers_on !== false;
     document.getElementById("cfgRv").value      = d.rendezvous || "";
@@ -1982,9 +2170,35 @@ async function applyCfg(){
   } finally { btn.disabled = false; }
 }
 
+let cfgIpv6Was = null;
+
+/* Refresh routes. Signed and delivered exactly like Apply -- it IS an Apply,
+   carrying the sheet's current settings plus a one-shot refresh request. It has
+   to carry them: a node keeps one config record, and a record holding only
+   the refresh would replace (and so clear) every other setting on it. */
+async function refreshCfgRoutes(){
+  if(!cfgTarget) return;
+  const msg = document.getElementById("cfgMsg"), btn = document.getElementById("cfgRefresh");
+  const pxOn = document.getElementById("cfgPubExit").checked;
+  const pxMaxRaw = document.getElementById("cfgPubExitMax").value.trim();
+  const pxMax = pxMaxRaw === "" ? null : Number(pxMaxRaw);
+  msg.textContent = ""; btn.disabled = true;
+  const wide = document.getElementById("cfgScope").value === "network";
+  try{
+    const ok = await withAdminPassword({
+      title: "Refresh routes", who: wide ? "every node" : cfgTarget.label, ok: "Refresh",
+      working: "Signing + distributing…",
+    }, async (pass) => { const e = await applyCfgSigned(pass, pxOn, pxMax, {refresh:true}); if(e) msg.textContent = e; return e; });
+    if(!ok) return;
+    msg.textContent = "Refresh sent. The node re-checks its paths now; a peer that can be reached " +
+      "directly moves off the relay within a few seconds. Requires the new client build on that node.";
+  } finally { btn.disabled = false; }
+}
+
 /* The signed part of Apply. Returns null on success or the server's refusal,
    which the password dialog shows (so a mistyped password can be retried). */
-async function applyCfgSigned(pass, pxOn, pxMax){
+async function applyCfgSigned(pass, pxOn, pxMax, opts){
+  opts = opts || {};
   try{
     /* Identity first, as a separate admin-signed PROVISION. Name and overlay
        address are provisioned facts about a node, not runtime settings, and
@@ -2043,6 +2257,9 @@ async function applyCfgSigned(pass, pxOn, pxMax){
       body.public_exit_quota = cfgGBField("cfgPubExitQuota");
       if(pxMax !== null) body.public_exit_max_clients = pxMax;
     }
+    const v6 = document.getElementById("cfgIpv6").checked;
+    if(cfgIpv6Was === null ? v6 : v6 !== cfgIpv6Was) body.ipv6 = v6;
+    if(opts.refresh) body.refresh_routes = true;
     const sp = document.getElementById("cfgSocksPass").value;
     if(sp !== "") body.socks5_pass = sp;   // blank means "leave unchanged"
     const r = await fetch("/api/node-config", {method:"POST",
@@ -2051,6 +2268,7 @@ async function applyCfgSigned(pass, pxOn, pxMax){
        relay with the DHT off, a wrong password. Each needs a different fix. */
     if(!r.ok) return (await r.text()) || "Failed.";
     cfgPubExitWas = cfgPubExitWas || pxOn;
+    if("ipv6" in body) cfgIpv6Was = body.ipv6;
     return null;
   }catch(e){ return "request failed: " + e; }
 }
@@ -2136,6 +2354,7 @@ function cfgSyncSocks(){
 document.getElementById("cfgCancel").addEventListener("click", closeCfgModal);
 document.getElementById("cfgModal").addEventListener("click", (e)=>{ if(e.target.id==="cfgModal") closeCfgModal(); });
 document.getElementById("cfgApply").addEventListener("click", applyCfg);
+document.getElementById("cfgRefresh").addEventListener("click", refreshCfgRoutes);
 document.getElementById("cfgSeed").addEventListener("click", cfgSeedFromSelf);
 document.getElementById("cfgPublicRelay").addEventListener("change", cfgSyncLimits);
 document.getElementById("cfgExit").addEventListener("change", cfgSyncLimits);

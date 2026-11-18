@@ -206,6 +206,12 @@ type SignedNodeConfig struct {
 	PublicExitQuota      *int64 `json:"public_exit_quota_bytes,omitempty"`
 	PublicExitMaxClients *int64 `json:"public_exit_max_clients,omitempty"`
 
+	// Version-3 fields (OVLYNODECFG3), as in client/nodeconfig.go: the IPv6
+	// transport switch (applies on the target's next restart) and the one-shot
+	// "refresh routes" request (a timestamp the node acts on once).
+	IPv6          *bool  `json:"ipv6,omitempty"`
+	RefreshRoutes *int64 `json:"refresh_routes,omitempty"`
+
 	Epoch int64  `json:"epoch"`
 	Ts    int64  `json:"ts"`
 	Sig   string `json:"sig"`
@@ -253,6 +259,20 @@ func canonicalNodeConfig(c SignedNodeConfig) string {
 	// record keeps its exact signed string. It is a separately built, well
 	// formed string. Stripping the v2 fields from a v2 record (or adding them
 	// to a v1 one) changes the version and breaks the signature.
+	if c.IPv6 != nil || c.RefreshRoutes != nil {
+		// Version 3: everything v2 signs, plus the v3 fields. Only used when a
+		// v3 field is present, so v1/v2 records keep their exact signed string.
+		return strings.Join([]string{"OVLYNODECFG3",
+			c.PubKey, b(c.DHT), b(c.UseRelays), b(c.PublicRelay), b(c.ExitNode),
+			trackers, b(c.TrackersOn), str(c.Rendezvous), str(c.RendezvousAuth),
+			str(c.Socks5Listen), str(c.Socks5User), str(c.Socks5Pass), b(c.Socks5OverlayOnly),
+			i(c.RelayUp), i(c.RelayDown), i(c.RelayQuota),
+			i(c.ExitUp), i(c.ExitDown), i(c.ExitQuota),
+			b(c.PublicExit), i(c.PublicExitUp), i(c.PublicExitDown), i(c.PublicExitQuota), i(c.PublicExitMaxClients),
+			b(c.IPv6), i(c.RefreshRoutes),
+			fmt.Sprintf("%d", c.Epoch), fmt.Sprintf("%d", c.Ts),
+		}, "|")
+	}
 	if c.PublicExit == nil && c.PublicExitUp == nil && c.PublicExitDown == nil &&
 		c.PublicExitQuota == nil && c.PublicExitMaxClients == nil {
 		return v1

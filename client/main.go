@@ -4048,12 +4048,16 @@ func main() {
 	if id := os.Getenv("APGO_NET_CHILD"); id != "" {
 		log.SetPrefix("[net:" + id + "] ")
 	}
+	// Survive losing stdout/stderr (a dead conmon, a closed terminal): see
+	// logout.go. Must come before the first log line.
+	ignoreSIGPIPE()
+	log.SetOutput(newLogWriter(nil))
 	// Optional file logging: when LOG_FILE is set (the admin dashboard tails
 	// this shared file), mirror all log output to it in addition to stderr so
 	// `docker logs` still works.
 	if lf := os.Getenv("LOG_FILE"); lf != "" {
 		if f, ferr := os.OpenFile(lf, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
-			log.SetOutput(io.MultiWriter(os.Stderr, f))
+			log.SetOutput(newLogWriter(f))
 		} else {
 			log.Printf("[log] cannot open LOG_FILE %s: %v", lf, ferr)
 		}

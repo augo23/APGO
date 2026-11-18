@@ -43,7 +43,7 @@ func bootLauncherPath() string    { return filepath.Join(sysDir(), "boot-launch.
 // needs write access to the socket file for the (unelevated) tray to connect,
 // and the client does not chown/chmod it there (secureControlSocket is a
 // no-op on Windows), so the socket path is never used to act on another file.
-func controlSocket() string { return filepath.Join(appDir(), "control.sock") }
+func defaultControlSocket() string { return filepath.Join(appDir(), "control.sock") }
 
 // system32 is the full path of a Windows system tool. Commands are never run
 // by bare name: PATH (and %SystemRoot%) come from whatever launched this app,

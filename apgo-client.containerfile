@@ -1,9 +1,11 @@
 # APGO overlay client image. Build from the REPO ROOT as the context:
 #   podman build -f apgo-client.containerfile -t apgo-client:latest .
-# Go 1.26: golang.org/x/crypto v0.52 needs >= 1.25. The Windows Wintun dep (golang.zx2c4.com/wireguard/tun, resolved by
+# Go 1.26.11: the go.mod minimum (standard-library security fixes). The Windows Wintun dep (golang.zx2c4.com/wireguard/tun, resolved by
 # `go mod tidy` across all platforms) requires >= 1.23.1. It is only COMPILED on
 # Windows; on this Linux build it is resolved then excluded by build tags.
-FROM golang:1.26-alpine AS build
+# Pinned to the go.mod minimum (1.26.11): the official image runs with
+# GOTOOLCHAIN=local, so an older cached 1.26.x would refuse to build. Bump both together.
+FROM golang:1.26.11-alpine AS build
 RUN apk add --no-cache git gcc musl-dev
 WORKDIR /src
 COPY client/ ./
